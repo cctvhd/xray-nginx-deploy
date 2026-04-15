@@ -4,7 +4,6 @@ set -euo pipefail
 # ============================================================
 # xray-nginx-deploy 主入口
 # GitHub: https://github.com/cctvhd/xray-nginx-deploy
-# 再次运行: bash <(curl -fsSL https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/main/install.sh)
 # ============================================================
 
 BASE_URL="https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/main"
@@ -33,6 +32,31 @@ check_root() {
     fi
 }
 
+# ── 读取状态值（安全方式，不 source 文件）───────────────────
+get_state() {
+    local key="$1"
+    local default="${2:-}"
+    grep "^${key}=" "$STATE_FILE" 2>/dev/null | \
+        head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || \
+        echo "$default"
+}
+
+# ── 保存状态（转义特殊字符）─────────────────────────────────
+save_state() {
+    local key="$1"
+    local value="$2"
+
+    # 转义值中的特殊字符，用单引号包裹
+    local escaped
+    escaped=$(echo "$value" | sed "s/'/'\\\\''/g")
+
+    if grep -q "^${key}=" "$STATE_FILE" 2>/dev/null; then
+        sed -i "s|^${key}=.*|${key}='${escaped}'|" "$STATE_FILE"
+    else
+        echo "${key}='${escaped}'" >> "$STATE_FILE"
+    fi
+}
+
 # ── 初始化状态目录 ───────────────────────────────────────────
 init_state() {
     mkdir -p "$STATE_DIR"
@@ -40,58 +64,69 @@ init_state() {
 
     if [[ ! -f "$STATE_FILE" ]]; then
         cat > "$STATE_FILE" << 'ENV'
-# xray-nginx-deploy 状态文件
-OS_ID=""
-OS_NAME=""
-PKG_MANAGER=""
-PKG_UPDATE=""
-PKG_INSTALL=""
-BBR_VERSION=""
-XHTTP_DOMAIN=""
-GRPC_DOMAIN=""
-REALITY_DOMAIN=""
-ANYTLS_DOMAIN=""
-ALL_DOMAINS=""
-CDN_DOMAINS=""
-DIRECT_DOMAINS=""
-XHTTP_PATH=""
-XRAY_UUID=""
-XRAY_PUBLIC_KEY=""
-XRAY_PRIVATE_KEY=""
-REALITY_DEST=""
-REALITY_SNI=""
-REALITY_SHORT_ID=""
-REALITY_SPIDER_X=""
-SINGBOX_PASSWORD=""
-STEP_SYSTEM=0
-STEP_UNBOUND=0
-STEP_NGINX_INSTALL=0
-STEP_CERT=0
-STEP_NGINX_CONFIG=0
-STEP_XRAY=0
-STEP_SINGBOX=0
+OS_ID=''
+OS_NAME=''
+PKG_MANAGER=''
+BBR_VERSION=''
+XHTTP_DOMAIN=''
+GRPC_DOMAIN=''
+REALITY_DOMAIN=''
+ANYTLS_DOMAIN=''
+ALL_DOMAINS=''
+CDN_DOMAINS=''
+DIRECT_DOMAINS=''
+XHTTP_PATH=''
+XRAY_UUID=''
+XRAY_PUBLIC_KEY=''
+XRAY_PRIVATE_KEY=''
+REALITY_DEST=''
+REALITY_SNI=''
+REALITY_SHORT_ID=''
+REALITY_SPIDER_X=''
+SINGBOX_PASSWORD=''
+STEP_SYSTEM='0'
+STEP_UNBOUND='0'
+STEP_NGINX_INSTALL='0'
+STEP_CERT='0'
+STEP_NGINX_CONFIG='0'
+STEP_XRAY='0'
+STEP_SINGBOX='0'
 ENV
+        log_info "状态文件已创建: $STATE_FILE"
     fi
 
-    # 加载状态文件
-    set +u
-    source "$STATE_FILE"
-    set -u
+    # 读取基础变量（安全方式）
+    OS_ID=$(get_state "OS_ID")
+    OS_NAME=$(get_state "OS_NAME")
+    PKG_MANAGER=$(get_state "PKG_MANAGER")
+    XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
+    GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
+    REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    XHTTP_PATH=$(get_state "XHTTP_PATH")
+    XRAY_UUID=$(get_state "XRAY_UUID")
+    XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
+    SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
 }
 
-# ── 保存状态 ─────────────────────────────────────────────────
-save_state() {
-    local key="$1"
-    local value="$2"
+# ── 获取步骤状态 ─────────────────────────────────────────────
+get_step() {
+    get_state "$1" "0"
+}
 
-    if grep -q "^${key}=" "$STATE_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}=\"${value}\"|" "$STATE_FILE"
-    else
-        echo "${key}=\"${value}\"" >> "$STATE_FILE"
+# ── 检查步骤依赖 ─────────────────────────────────────────────
+check_step() {
+    local step_var="$1"
+    local step_name="$2"
+    local val
+    val=$(get_step "$step_var")
+
+    if [[ "$val" != "1" ]]; then
+        log_warn "建议先完成：${step_name}"
+        read -rp "是否继续？[y/N]: " c
+        [[ "${c,,}" != "y" ]] && return 1
     fi
-
-    # 立即更新当前环境变量
-    export "${key}=${value}"
+    return 0
 }
 
 # ── 加载模块 ─────────────────────────────────────────────────
@@ -108,27 +143,45 @@ load_module() {
     fi
 }
 
-# ── 检查步骤状态 ─────────────────────────────────────────────
-check_step() {
-    local step_var="$1"
-    local step_name="$2"
-    local current_val
-    current_val=$(grep "^${step_var}=" "$STATE_FILE" 2>/dev/null | \
-                  cut -d= -f2 | tr -d '"' || echo "0")
-
-    if [[ "$current_val" != "1" ]]; then
-        log_warn "建议先完成：${step_name}"
-        read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && return 1
+# ── 加载系统信息 ─────────────────────────────────────────────
+load_os_info() {
+    if [[ -n "$OS_ID" ]]; then
+        case "$OS_ID" in
+            ubuntu|debian)
+                PKG_UPDATE="apt-get update -y"
+                PKG_INSTALL="apt-get install -y"
+                ;;
+            centos|rhel|rocky|almalinux)
+                PKG_UPDATE="dnf makecache -y"
+                PKG_INSTALL="dnf install -y"
+                ;;
+        esac
+    else
+        load_module system
+        detect_os
     fi
-    return 0
 }
 
-# ── 读取步骤状态 ─────────────────────────────────────────────
-get_step() {
-    local step_var="$1"
-    grep "^${step_var}=" "$STATE_FILE" 2>/dev/null | \
-        cut -d= -f2 | tr -d '"' || echo "0"
+# ── 恢复域名数组 ─────────────────────────────────────────────
+restore_domain_arrays() {
+    local all_str cdn_str direct_str
+    all_str=$(get_state "ALL_DOMAINS")
+    cdn_str=$(get_state "CDN_DOMAINS")
+    direct_str=$(get_state "DIRECT_DOMAINS")
+
+    ALL_DOMAINS=()
+    CDN_DOMAINS=()
+    DIRECT_DOMAINS=()
+
+    [[ -n "$all_str"    ]] && read -ra ALL_DOMAINS    <<< "$all_str"
+    [[ -n "$cdn_str"    ]] && read -ra CDN_DOMAINS    <<< "$cdn_str"
+    [[ -n "$direct_str" ]] && read -ra DIRECT_DOMAINS <<< "$direct_str"
+
+    XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
+    GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
+    REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    XHTTP_PATH=$(get_state "XHTTP_PATH")
 }
 
 # ── 显示当前状态 ─────────────────────────────────────────────
@@ -151,7 +204,6 @@ show_status() {
         local name="${item##*:}"
         local val
         val=$(get_step "$key")
-
         if [[ "$val" == "1" ]]; then
             echo -e "  ${GREEN}[✓]${NC} ${name}"
         else
@@ -160,46 +212,17 @@ show_status() {
     done
 
     echo ""
-    [[ -n "${XHTTP_DOMAIN:-}"   ]] && \
+    [[ -n "$XHTTP_DOMAIN"   ]] && \
         echo -e "  xhttp 域名:   ${CYAN}${XHTTP_DOMAIN}${NC}"
-    [[ -n "${GRPC_DOMAIN:-}"    ]] && \
+    [[ -n "$GRPC_DOMAIN"    ]] && \
         echo -e "  gRPC  域名:   ${CYAN}${GRPC_DOMAIN}${NC}"
-    [[ -n "${REALITY_DOMAIN:-}" ]] && \
+    [[ -n "$REALITY_DOMAIN" ]] && \
         echo -e "  Reality 域名: ${CYAN}${REALITY_DOMAIN}${NC}"
-    [[ -n "${ANYTLS_DOMAIN:-}"  ]] && \
+    [[ -n "$ANYTLS_DOMAIN"  ]] && \
         echo -e "  AnyTLS 域名:  ${CYAN}${ANYTLS_DOMAIN}${NC}"
 
     echo -e "${BLUE}──────────────────────────────────────────${NC}"
     echo ""
-}
-
-# ── 加载系统信息 ─────────────────────────────────────────────
-load_os_info() {
-    local saved_os
-    saved_os=$(get_step "OS_ID")
-
-    if [[ -n "$saved_os" && "$saved_os" != "0" ]]; then
-        # 从状态文件恢复系统信息
-        OS_ID=$(grep "^OS_ID=" "$STATE_FILE" | cut -d= -f2 | tr -d '"')
-        OS_NAME=$(grep "^OS_NAME=" "$STATE_FILE" | cut -d= -f2 | tr -d '"')
-        PKG_MANAGER=$(grep "^PKG_MANAGER=" "$STATE_FILE" | \
-                      cut -d= -f2 | tr -d '"')
-
-        case "$OS_ID" in
-            ubuntu|debian)
-                PKG_UPDATE="apt-get update -y"
-                PKG_INSTALL="apt-get install -y"
-                ;;
-            centos|rhel|rocky|almalinux)
-                PKG_UPDATE="dnf makecache -y"
-                PKG_INSTALL="dnf install -y"
-                ;;
-        esac
-    else
-        # 重新检测
-        load_module system
-        detect_os
-    fi
 }
 
 # ── 主菜单 ───────────────────────────────────────────────────
@@ -255,14 +278,12 @@ main_menu() {
     esac
 }
 
-# ── 步骤完成后返回菜单 ───────────────────────────────────────
+# ── 步骤完成返回 ─────────────────────────────────────────────
 done_return() {
     echo ""
     read -rp "按回车返回菜单..." _
-    # 重新加载状态文件
-    set +u
-    source "$STATE_FILE"
-    set -u
+    # 重新读取状态
+    init_state
     main_menu
 }
 
@@ -289,7 +310,7 @@ step_system() {
 # ── 步骤2：Unbound ───────────────────────────────────────────
 step_unbound() {
     check_step "STEP_SYSTEM" "步骤1（系统初始化）" || \
-        { done_return; return; }
+        { main_menu; return; }
 
     load_os_info
     load_module unbound
@@ -302,7 +323,7 @@ step_unbound() {
 # ── 步骤3：安装 Nginx ────────────────────────────────────────
 step_nginx_install() {
     check_step "STEP_SYSTEM" "步骤1（系统初始化）" || \
-        { done_return; return; }
+        { main_menu; return; }
 
     load_os_info
     load_module nginx
@@ -320,7 +341,7 @@ step_nginx_install() {
 # ── 步骤4：申请 SSL 证书 ─────────────────────────────────────
 step_cert() {
     check_step "STEP_NGINX_INSTALL" "步骤3（安装 Nginx）" || \
-        { done_return; return; }
+        { main_menu; return; }
 
     load_os_info
     load_module cert
@@ -346,33 +367,10 @@ step_cert() {
 # ── 步骤5：配置 Nginx ────────────────────────────────────────
 step_nginx_config() {
     check_step "STEP_CERT" "步骤4（申请 SSL 证书）" || \
-        { done_return; return; }
+        { main_menu; return; }
 
     load_os_info
-
-    # 从状态文件恢复域名数组
-    local all_str cdn_str direct_str
-    all_str=$(grep "^ALL_DOMAINS=" "$STATE_FILE" | \
-              cut -d= -f2 | tr -d '"')
-    cdn_str=$(grep "^CDN_DOMAINS=" "$STATE_FILE" | \
-              cut -d= -f2 | tr -d '"')
-    direct_str=$(grep "^DIRECT_DOMAINS=" "$STATE_FILE" | \
-                 cut -d= -f2 | tr -d '"')
-
-    read -ra ALL_DOMAINS    <<< "$all_str"
-    read -ra CDN_DOMAINS    <<< "$cdn_str"
-    read -ra DIRECT_DOMAINS <<< "$direct_str"
-
-    XHTTP_DOMAIN=$(grep "^XHTTP_DOMAIN=" "$STATE_FILE" | \
-                   cut -d= -f2 | tr -d '"')
-    GRPC_DOMAIN=$(grep "^GRPC_DOMAIN=" "$STATE_FILE" | \
-                  cut -d= -f2 | tr -d '"')
-    REALITY_DOMAIN=$(grep "^REALITY_DOMAIN=" "$STATE_FILE" | \
-                     cut -d= -f2 | tr -d '"')
-    ANYTLS_DOMAIN=$(grep "^ANYTLS_DOMAIN=" "$STATE_FILE" | \
-                    cut -d= -f2 | tr -d '"')
-    XHTTP_PATH=$(grep "^XHTTP_PATH=" "$STATE_FILE" | \
-                 cut -d= -f2 | tr -d '"')
+    restore_domain_arrays
 
     load_module nginx
     generate_fallback_conf
@@ -387,19 +385,10 @@ step_nginx_config() {
 # ── 步骤6：安装配置 Xray ─────────────────────────────────────
 step_xray() {
     check_step "STEP_NGINX_CONFIG" "步骤5（配置 Nginx）" || \
-        { done_return; return; }
+        { main_menu; return; }
 
     load_os_info
-
-    # 恢复域名信息
-    XHTTP_DOMAIN=$(grep "^XHTTP_DOMAIN=" "$STATE_FILE" | \
-                   cut -d= -f2 | tr -d '"')
-    GRPC_DOMAIN=$(grep "^GRPC_DOMAIN=" "$STATE_FILE" | \
-                  cut -d= -f2 | tr -d '"')
-    REALITY_DOMAIN=$(grep "^REALITY_DOMAIN=" "$STATE_FILE" | \
-                     cut -d= -f2 | tr -d '"')
-    XHTTP_PATH=$(grep "^XHTTP_PATH=" "$STATE_FILE" | \
-                 cut -d= -f2 | tr -d '"')
+    restore_domain_arrays
 
     load_module xray
     install_xray
@@ -424,12 +413,10 @@ step_xray() {
 # ── 步骤7：安装配置 Sing-Box ─────────────────────────────────
 step_singbox() {
     check_step "STEP_XRAY" "步骤6（安装配置 Xray）" || \
-        { done_return; return; }
+        { main_menu; return; }
 
     load_os_info
-
-    ANYTLS_DOMAIN=$(grep "^ANYTLS_DOMAIN=" "$STATE_FILE" | \
-                    cut -d= -f2 | tr -d '"')
+    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
 
     load_module singbox
     install_singbox
@@ -498,17 +485,7 @@ full_install() {
     save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
     save_state "STEP_CERT"      "1"
 
-    local all_str cdn_str direct_str
-    all_str=$(grep "^ALL_DOMAINS=" "$STATE_FILE" | \
-              cut -d= -f2 | tr -d '"')
-    cdn_str=$(grep "^CDN_DOMAINS=" "$STATE_FILE" | \
-              cut -d= -f2 | tr -d '"')
-    direct_str=$(grep "^DIRECT_DOMAINS=" "$STATE_FILE" | \
-                 cut -d= -f2 | tr -d '"')
-    read -ra ALL_DOMAINS    <<< "$all_str"
-    read -ra CDN_DOMAINS    <<< "$cdn_str"
-    read -ra DIRECT_DOMAINS <<< "$direct_str"
-
+    restore_domain_arrays
     generate_fallback_conf
     generate_servers_conf
     generate_nginx_conf
@@ -536,8 +513,7 @@ full_install() {
 
     read -rp "是否安装配置 Sing-Box？[Y/n]: " install_sb_choice
     if [[ "${install_sb_choice,,}" != "n" ]]; then
-        ANYTLS_DOMAIN=$(grep "^ANYTLS_DOMAIN=" "$STATE_FILE" | \
-                        cut -d= -f2 | tr -d '"')
+        ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
         load_module singbox
         install_singbox
         generate_singbox_params
