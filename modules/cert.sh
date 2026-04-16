@@ -235,10 +235,10 @@ systemctl reload nginx 2>/dev/null || true
 HOOK
     chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
-    (crontab -l 2>/dev/null | grep -v certbot; \
-     echo "0 3 * * * certbot renew --quiet \
---deploy-hook 'systemctl reload nginx'") \
-     | crontab -
+    (crontab -l 2>/dev/null || true) | grep -v certbot > /tmp/crontab_new || true
+    echo "0 3 * * * certbot renew --quiet --deploy-hook 'systemctl reload nginx'" >> /tmp/crontab_new
+    crontab /tmp/crontab_new
+    rm -f /tmp/crontab_new
 
     log_info "自动续期配置完成（每天凌晨3点检查）"
 }
