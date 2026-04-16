@@ -127,7 +127,7 @@ collect_domains() {
         esac
 
         # 记录域名对应CF账号
-        if [[ "${CF_ACCOUNT_COUNT}" -gt 1 ]]; then
+        if [[ "${CF_ACCOUNT_COUNT:-1}" -gt 1 ]]; then
             read -rp "  使用第几个CF账号？[1-${CF_ACCOUNT_COUNT}]: " cf_idx
             DOMAIN_CF_ACCOUNT_KEYS+=("$domain")
             DOMAIN_CF_ACCOUNT_VALS+=("${cf_idx:-1}")
@@ -247,9 +247,9 @@ HOOK
 run_cert() {
     log_step "========== SSL 证书处理 =========="
 
-    # 初始化 CF 账号数（collect_domains 内部会用到）
-    CF_ACCOUNT_COUNT=${CF_ACCOUNT_COUNT:-1}
-    CF_INI_FILES=(${CF_INI_FILES[@]:-})
+    # 初始化变量，避免 set -u 报错
+    CF_ACCOUNT_COUNT=1
+    CF_INI_FILES=()
 
     # 第一步：域名分配（必须先做，后续才知道检查哪些证书）
     collect_domains
