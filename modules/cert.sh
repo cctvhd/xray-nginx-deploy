@@ -247,6 +247,10 @@ HOOK
 run_cert() {
     log_step "========== SSL 证书处理 =========="
 
+    # 初始化 CF 账号数（collect_domains 内部会用到）
+    CF_ACCOUNT_COUNT=${CF_ACCOUNT_COUNT:-1}
+    CF_INI_FILES=(${CF_INI_FILES[@]:-})
+
     # 第一步：域名分配（必须先做，后续才知道检查哪些证书）
     collect_domains
 
