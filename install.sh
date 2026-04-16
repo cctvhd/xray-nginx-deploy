@@ -345,11 +345,7 @@ step_cert() {
 
     load_os_info
     load_module cert
-    install_certbot
-    setup_cf_accounts
-    collect_domains
-    request_certificates
-    setup_auto_renew
+    run_cert
 
     save_state "XHTTP_DOMAIN"   "${XHTTP_DOMAIN:-}"
     save_state "GRPC_DOMAIN"    "${GRPC_DOMAIN:-}"
@@ -470,11 +466,7 @@ full_install() {
     save_state "STEP_NGINX_INSTALL" "1"
 
     load_module cert
-    install_certbot
-    setup_cf_accounts
-    collect_domains
-    request_certificates
-    setup_auto_renew
+    run_cert
     save_state "XHTTP_DOMAIN"   "${XHTTP_DOMAIN:-}"
     save_state "GRPC_DOMAIN"    "${GRPC_DOMAIN:-}"
     save_state "REALITY_DOMAIN" "${REALITY_DOMAIN:-}"

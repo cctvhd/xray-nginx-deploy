@@ -245,11 +245,43 @@ HOOK
 
 # ── 模块入口 ─────────────────────────────────────────────────
 run_cert() {
-    log_step "========== SSL 证书申请 =========="
-    install_certbot
-    setup_cf_accounts
+    log_step "========== SSL 证书处理 =========="
+
+    # 第一步：域名分配（必须先做，后续才知道检查哪些证书）
     collect_domains
-    request_certificates
-    setup_auto_renew
-    log_info "========== SSL 证书申请完成 =========="
+
+    # 第二步：判断证书是否已全部存在
+    if check_existing_certs; then
+        log_info "所有证书均已存在，跳过申请流程"
+        setup_auto_renew
+    else
+        install_certbot
+        setup_cf_accounts
+        request_certificates
+        setup_auto_renew
+    fi
+
+    log_info "========== SSL 证书处理完成 =========="
+}
+
+# ── 检测已有证书（返回0=全部已有，1=有缺失）─────────────────
+check_existing_certs() {
+    local missing=0
+    local -A checked_roots
+
+    for domain in "${ALL_DOMAINS[@]}"; do
+        local root
+        root=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+        [[ -n "${checked_roots[$root]:-}" ]] && continue
+        checked_roots["$root"]=1
+
+        if [[ -f "/etc/letsencrypt/live/${root}/fullchain.pem" ]]; then
+            log_info "证书已存在: *.${root} ✓"
+        else
+            log_warn "证书缺失: *.${root}"
+            missing=1
+        fi
+    done
+
+    return $missing
 }
