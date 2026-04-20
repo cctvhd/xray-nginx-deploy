@@ -4,8 +4,22 @@
 # Cloudflare DNS 证书申请模块
 # ============================================================
 
+# ── 检测 Certbot 是否已安装 ──────────────────────────────────
+check_certbot_installed() {
+    if command -v certbot &>/dev/null; then
+        log_info "Certbot 已安装: $(certbot --version 2>&1)"
+        return 0
+    fi
+    return 1
+}
+
 # ── 安装 Certbot + CF 插件 ───────────────────────────────────
 install_certbot() {
+    if check_certbot_installed; then
+        read -rp "Certbot 已安装，是否重新安装？[y/N]: " reinstall
+        [[ "${reinstall,,}" != "y" ]] && return
+    fi
+
     log_step "安装 Certbot + Cloudflare 插件..."
 
     case "$OS_ID" in
@@ -16,14 +30,18 @@ install_certbot() {
             pip3 install certbot certbot-dns-cloudflare >/dev/null 2>&1
             ;;
         centos|rhel|rocky|almalinux)
+            $PKG_INSTALL python3-pip -y >/dev/null 2>&1
+            pip3 install certbot certbot-dns-cloudflare \
+                >/dev/null 2>&1 || \
             $PKG_INSTALL certbot python3-certbot-dns-cloudflare \
-                -y >/dev/null 2>&1 || {
-                $PKG_INSTALL python3-pip -y >/dev/null 2>&1
-                pip3 install certbot certbot-dns-cloudflare \
-                    >/dev/null 2>&1
-            }
+                -y >/dev/null 2>&1
             ;;
     esac
+
+    if ! command -v certbot &>/dev/null; then
+        log_error "Certbot 安装失败"
+        exit 1
+    fi
 
     log_info "Certbot 安装完成: $(certbot --version 2>&1)"
 }
@@ -33,6 +51,27 @@ setup_cf_accounts() {
     echo ""
     log_step "配置 Cloudflare 账号"
     echo ""
+
+    # 检查是否已有账号配置
+    if ls /etc/cloudflare/cf_account_*.ini &>/dev/null 2>&1; then
+        log_info "发现已有 CF 账号配置："
+        ls /etc/cloudflare/cf_account_*.ini | while read -r f; do
+            echo "  $f"
+        done
+        echo ""
+        read -rp "是否重新配置 CF 账号？[y/N]: " reconf
+        if [[ "${reconf,,}" != "y" ]]; then
+            # 读取已有账号数量
+            CF_ACCOUNT_COUNT=$(ls /etc/cloudflare/cf_account_*.ini \
+                2>/dev/null | wc -l)
+            CF_INI_FILES=()
+            for i in $(seq 1 "$CF_ACCOUNT_COUNT"); do
+                CF_INI_FILES+=("/etc/cloudflare/cf_account_${i}.ini")
+            done
+            log_info "使用已有 ${CF_ACCOUNT_COUNT} 个CF账号配置"
+            return
+        fi
+    fi
 
     read -rp "你有几个 Cloudflare 账号？[默认1]: " CF_ACCOUNT_COUNT
     CF_ACCOUNT_COUNT=${CF_ACCOUNT_COUNT:-1}
@@ -64,7 +103,6 @@ collect_domains() {
     log_step "配置域名信息"
     echo ""
 
-    # 使用普通变量，兼容所有 bash 版本
     ALL_DOMAINS=()
     CDN_DOMAINS=()
     DIRECT_DOMAINS=()
@@ -73,15 +111,15 @@ collect_domains() {
     REALITY_DOMAIN=""
     ANYTLS_DOMAIN=""
 
-    # 用普通数组存储域名对应的CF账号
+    # 域名→CF账号映射（用两个平行数组）
     DOMAIN_CF_ACCOUNT_KEYS=()
     DOMAIN_CF_ACCOUNT_VALS=()
 
-    echo "域名用途说明："
-    echo "  1. xhttp-CDN   - VLESS+XHTTP 经 CF CDN 中转"
-    echo "  2. gRPC-CDN    - VLESS+gRPC 经 CF CDN 中转"
-    echo "  3. Reality     - VLESS+Reality 直连（需要伪装域名）"
-    echo "  4. AnyTLS      - Sing-Box AnyTLS 直连"
+    echo "  域名用途说明："
+    echo "    1. xhttp-CDN   - VLESS+XHTTP 经 CF CDN 中转（开启CF代理）"
+    echo "    2. gRPC-CDN    - VLESS+gRPC 经 CF CDN 中转（开启CF代理）"
+    echo "    3. Reality     - VLESS+Reality 直连伪装域名（关闭CF代理）"
+    echo "    4. AnyTLS      - Sing-Box AnyTLS 直连（关闭CF代理）"
     echo ""
 
     read -rp "共需要配置几个域名？: " domain_count
@@ -93,59 +131,70 @@ collect_domains() {
         domain="${domain,,}"
 
         echo "  用途选择："
-        echo "    1. xhttp-CDN（开启CF代理）"
-        echo "    2. gRPC-CDN（开启CF代理）"
-        echo "    3. Reality 伪装域名（直连，关闭CF代理）"
-        echo "    4. AnyTLS（直连，关闭CF代理）"
+        echo "    1. xhttp-CDN"
+        echo "    2. gRPC-CDN"
+        echo "    3. Reality 伪装域名"
+        echo "    4. AnyTLS"
         read -rp "  请选择 [1-4]: " usage_choice
 
         case "$usage_choice" in
             1)
                 XHTTP_DOMAIN="$domain"
                 CDN_DOMAINS+=("$domain")
-                log_info "域名 $domain 配置完成（xhttp/cdn）"
+                log_info "域名 $domain → xhttp-CDN"
                 ;;
             2)
                 GRPC_DOMAIN="$domain"
                 CDN_DOMAINS+=("$domain")
-                log_info "域名 $domain 配置完成（grpc/cdn）"
+                log_info "域名 $domain → gRPC-CDN"
                 ;;
             3)
                 REALITY_DOMAIN="$domain"
                 DIRECT_DOMAINS+=("$domain")
-                log_info "域名 $domain 配置完成（reality/direct）"
+                log_info "域名 $domain → Reality"
                 ;;
             4)
                 ANYTLS_DOMAIN="$domain"
                 DIRECT_DOMAINS+=("$domain")
-                log_info "域名 $domain 配置完成（anytls/direct）"
+                log_info "域名 $domain → AnyTLS"
                 ;;
             *)
-                log_warn "无效选择，跳过域名 $domain"
+                log_warn "无效选择，跳过 $domain"
                 continue
                 ;;
         esac
 
-        # 记录域名对应CF账号
+        # 记录对应CF账号
         if [[ "${CF_ACCOUNT_COUNT:-1}" -gt 1 ]]; then
-            read -rp "  使用第几个CF账号？[1-${CF_ACCOUNT_COUNT}]: " cf_idx
-            DOMAIN_CF_ACCOUNT_KEYS+=("$domain")
-            DOMAIN_CF_ACCOUNT_VALS+=("${cf_idx:-1}")
+            echo ""
+            for j in $(seq 1 "$CF_ACCOUNT_COUNT"); do
+                echo "    账号${j}: $(grep 'api_token' \
+                    "/etc/cloudflare/cf_account_${j}.ini" | \
+                    awk '{print $3}' | cut -c1-12)..."
+            done
+            read -rp "  域名 $domain 使用第几个CF账号？\
+[1-${CF_ACCOUNT_COUNT}]: " cf_idx
+            cf_idx="${cf_idx:-1}"
         else
-            DOMAIN_CF_ACCOUNT_KEYS+=("$domain")
-            DOMAIN_CF_ACCOUNT_VALS+=("1")
+            cf_idx="1"
         fi
 
+        DOMAIN_CF_ACCOUNT_KEYS+=("$domain")
+        DOMAIN_CF_ACCOUNT_VALS+=("$cf_idx")
         ALL_DOMAINS+=("$domain")
     done
 
-    # 汇总显示
+    # 汇总确认
     echo ""
     log_info "域名配置汇总："
-    [[ -n "$XHTTP_DOMAIN"   ]] && echo "  xhttp CDN:  $XHTTP_DOMAIN"
-    [[ -n "$GRPC_DOMAIN"    ]] && echo "  gRPC  CDN:  $GRPC_DOMAIN"
-    [[ -n "$REALITY_DOMAIN" ]] && echo "  Reality:    $REALITY_DOMAIN"
-    [[ -n "$ANYTLS_DOMAIN"  ]] && echo "  AnyTLS:     $ANYTLS_DOMAIN"
+    [[ -n "$XHTTP_DOMAIN"   ]] && \
+        echo "  xhttp CDN:  $XHTTP_DOMAIN"
+    [[ -n "$GRPC_DOMAIN"    ]] && \
+        echo "  gRPC  CDN:  $GRPC_DOMAIN"
+    [[ -n "$REALITY_DOMAIN" ]] && \
+        echo "  Reality:    $REALITY_DOMAIN"
+    [[ -n "$ANYTLS_DOMAIN"  ]] && \
+        echo "  AnyTLS:     $ANYTLS_DOMAIN"
     echo ""
 
     read -rp "确认以上配置？[Y/n]: " confirm
@@ -155,7 +204,7 @@ collect_domains() {
     fi
 }
 
-# ── 获取域名对应的CF账号索引 ────────────────────────────────
+# ── 获取域名对应CF账号索引 ───────────────────────────────────
 get_domain_cf_idx() {
     local domain="$1"
     for i in "${!DOMAIN_CF_ACCOUNT_KEYS[@]}"; do
@@ -167,13 +216,48 @@ get_domain_cf_idx() {
     echo "1"
 }
 
+# ── 检查已有证书 ─────────────────────────────────────────────
+check_existing_certs() {
+    log_step "检查已有证书..."
+
+    local all_exist=true
+    local checked_roots=()
+
+    for domain in "${ALL_DOMAINS[@]}"; do
+        local root_domain
+        root_domain=$(echo "$domain" | \
+            awk -F. '{print $(NF-1)"."$NF}')
+
+        # 避免重复检查同一根域名
+        local already=false
+        for r in "${checked_roots[@]:-}"; do
+            [[ "$r" == "$root_domain" ]] && already=true && break
+        done
+        $already && continue
+        checked_roots+=("$root_domain")
+
+        if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
+            local expiry
+            expiry=$(openssl x509 \
+                -enddate \
+                -noout \
+                -in "/etc/letsencrypt/live/${root_domain}/fullchain.pem" \
+                2>/dev/null | cut -d= -f2)
+            log_info "证书已存在: *.${root_domain} (到期: ${expiry})"
+        else
+            log_warn "证书不存在: *.${root_domain}"
+            all_exist=false
+        fi
+    done
+
+    $all_exist && return 0 || return 1
+}
+
 # ── 申请证书 ─────────────────────────────────────────────────
 request_certificates() {
     log_step "开始申请 SSL 证书..."
 
-    mkdir -p /etc/letsencrypt
-
-    # 收集所有根域名避免重复申请
+    # 已检查过的根域名
     declare -A ROOT_DOMAIN_DONE
 
     for domain in "${ALL_DOMAINS[@]}"; do
@@ -181,26 +265,25 @@ request_certificates() {
         cf_idx=$(get_domain_cf_idx "$domain")
         local ini_file="${CF_INI_FILES[$((cf_idx-1))]}"
 
-        # 提取根域名
         local root_domain
-        root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+        root_domain=$(echo "$domain" | \
+            awk -F. '{print $(NF-1)"."$NF}')
 
-        # 同一根域名只申请一次通配符证书
-        if [[ -n "${ROOT_DOMAIN_DONE[$root_domain]:-}" ]]; then
-            log_info "根域名 $root_domain 证书已申请，跳过 $domain"
-            continue
-        fi
+        # 同根域名只申请一次
+        [[ -n "${ROOT_DOMAIN_DONE[$root_domain]:-}" ]] && \
+            { log_info "*.${root_domain} 已处理，跳过 $domain"
+              continue; }
 
-        log_info "申请证书: *.${root_domain} (使用 CF账号${cf_idx})"
-
-        # 检查证书是否已存在
+        # 已有证书则跳过
         if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
-            log_warn "证书已存在: $root_domain 跳过"
+            log_info "证书已存在，跳过: *.${root_domain}"
             ROOT_DOMAIN_DONE["$root_domain"]="1"
             continue
         fi
 
-        # 申请通配符证书
+        log_info "申请证书: *.${root_domain} (CF账号${cf_idx})"
+        log_info "使用配置: $ini_file"
+
         certbot certonly \
             --dns-cloudflare \
             --dns-cloudflare-credentials "$ini_file" \
@@ -214,78 +297,63 @@ request_certificates() {
                 echo "  $line"
             done
 
-        if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
+        if [[ -f \
+            "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
             log_info "证书申请成功: *.${root_domain}"
             ROOT_DOMAIN_DONE["$root_domain"]="1"
         else
             log_error "证书申请失败: ${root_domain}"
+            log_warn "请检查："
+            echo "  1. 域名是否在该CF账号下"
+            echo "  2. API Token 是否有 Zone:DNS:Edit 权限"
+            echo "  3. 域名是否已添加到CF"
         fi
     done
-
-    log_info "所有证书申请完成"
 }
 
 # ── 配置自动续期 ─────────────────────────────────────────────
 setup_auto_renew() {
     log_step "配置证书自动续期..."
 
+    # 续期 hook
+    mkdir -p /etc/letsencrypt/renewal-hooks/deploy
     cat > /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh << 'HOOK'
 #!/bin/bash
 systemctl reload nginx 2>/dev/null || true
 HOOK
-    chmod +x /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
+    chmod +x \
+        /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
-    (crontab -l 2>/dev/null || true) | grep -v certbot > /tmp/crontab_new || true
-    echo "0 3 * * * certbot renew --quiet --deploy-hook 'systemctl reload nginx'" >> /tmp/crontab_new
-    crontab /tmp/crontab_new
-    rm -f /tmp/crontab_new
+    # cron 任务
+    (crontab -l 2>/dev/null | grep -v certbot; \
+     echo "0 3 * * * certbot renew --quiet \
+--deploy-hook 'systemctl reload nginx'") | crontab -
 
     log_info "自动续期配置完成（每天凌晨3点检查）"
 }
 
 # ── 模块入口 ─────────────────────────────────────────────────
 run_cert() {
-    log_step "========== SSL 证书处理 =========="
+    log_step "========== SSL 证书申请 =========="
 
-    # 初始化变量，避免 set -u 报错
-    CF_ACCOUNT_COUNT=1
-    CF_INI_FILES=()
+    # 1. 安装 certbot
+    install_certbot
 
-    # 第一步：域名分配（必须先做，后续才知道检查哪些证书）
+    # 2. 配置CF账号（先设账号再填域名）
+    setup_cf_accounts
+
+    # 3. 收集域名信息
     collect_domains
 
-    # 第二步：判断证书是否已全部存在
+    # 4. 检查已有证书，有则跳过申请
     if check_existing_certs; then
-        log_info "所有证书均已存在，跳过申请流程"
-        setup_auto_renew
+        log_info "所有域名证书已存在，跳过申请"
     else
-        install_certbot
-        setup_cf_accounts
         request_certificates
-        setup_auto_renew
     fi
 
-    log_info "========== SSL 证书处理完成 =========="
-}
+    # 5. 配置自动续期
+    setup_auto_renew
 
-# ── 检测已有证书（返回0=全部已有，1=有缺失）─────────────────
-check_existing_certs() {
-    local missing=0
-    local -A checked_roots
-
-    for domain in "${ALL_DOMAINS[@]}"; do
-        local root
-        root=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-        [[ -n "${checked_roots[$root]:-}" ]] && continue
-        checked_roots["$root"]=1
-
-        if [[ -f "/etc/letsencrypt/live/${root}/fullchain.pem" ]]; then
-            log_info "证书已存在: *.${root} ✓"
-        else
-            log_warn "证书缺失: *.${root}"
-            missing=1
-        fi
-    done
-
-    return $missing
+    log_info "========== SSL 证书模块完成 =========="
 }
