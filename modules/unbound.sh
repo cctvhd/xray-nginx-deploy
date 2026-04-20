@@ -4,7 +4,23 @@
 # Unbound 本地递归 DNS 安装配置
 # ============================================================
 
+# ── 检测是否已安装 ───────────────────────────────────────────
+check_unbound_installed() {
+    if command -v unbound &>/dev/null && \
+       systemctl is-active --quiet unbound 2>/dev/null; then
+        log_info "Unbound 已安装且运行中: $(unbound -V 2>&1 | head -1)"
+        return 0
+    fi
+    return 1
+}
+
+# ── 安装 Unbound ─────────────────────────────────────────────
 install_unbound() {
+    if check_unbound_installed; then
+        read -rp "Unbound 已安装并运行，是否重新安装？[y/N]: " reinstall
+        [[ "${reinstall,,}" != "y" ]] && return 0
+    fi
+
     log_step "安装 Unbound..."
 
     case "$OS_ID" in
@@ -29,10 +45,11 @@ install_unbound() {
     log_info "Unbound 安装成功: $(unbound -V 2>&1 | head -1)"
 }
 
+# ── 禁用 systemd-resolved ────────────────────────────────────
 disable_systemd_resolved() {
     log_step "处理 systemd-resolved 冲突..."
 
-    if systemctl is-active --quiet systemd-resolved; then
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
         systemctl stop systemd-resolved
         systemctl disable systemd-resolved
         log_info "已禁用 systemd-resolved"
@@ -46,6 +63,7 @@ disable_systemd_resolved() {
     fi
 }
 
+# ── 下载根域名服务器列表 ─────────────────────────────────────
 download_root_hints() {
     log_step "下载根域名服务器列表..."
 
@@ -55,8 +73,8 @@ download_root_hints() {
         -o /var/lib/unbound/root.hints 2>/dev/null || true
 
     if [[ ! -s /var/lib/unbound/root.hints ]]; then
-        log_warn "下载失败，使用内置根域名服务器列表..."
-        cat > /var/lib/unbound/root.hints << 'HINTS'
+        log_warn "下载失败，使用内置列表..."
+        cat > /var/lib/unbound/root.hints << 'HINTS_EOF'
 .                        3600000      NS    A.ROOT-SERVERS.NET.
 A.ROOT-SERVERS.NET.      3600000      A     198.41.0.4
 A.ROOT-SERVERS.NET.      3600000      AAAA  2001:503:ba3e::2:30
@@ -84,19 +102,20 @@ K.ROOT-SERVERS.NET.      3600000      A     193.0.14.129
 L.ROOT-SERVERS.NET.      3600000      A     199.7.83.42
 .                        3600000      NS    M.ROOT-SERVERS.NET.
 M.ROOT-SERVERS.NET.      3600000      A     202.12.27.33
-HINTS
+HINTS_EOF
     fi
 
     chown unbound:unbound /var/lib/unbound/root.hints 2>/dev/null || true
     log_info "根域名服务器列表准备完成"
 }
 
+# ── 初始化 DNSSEC trust anchor ───────────────────────────────
 init_trust_anchor() {
     log_step "初始化 DNSSEC trust anchor..."
 
     mkdir -p /var/lib/unbound
 
-    # 检查系统是否已有 root.key（Debian/Ubuntu 自带）
+    # 检查系统已有的 root.key
     local system_key=""
     for path in \
         /var/lib/unbound/root.key \
@@ -116,14 +135,14 @@ init_trust_anchor() {
             log_info "root.key 已存在，跳过初始化"
         fi
     else
-        # 使用 unbound-anchor 初始化
+        # 用 unbound-anchor 初始化
         unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
 
-        # 如果仍然失败或为空则手动写入
+        # 仍然失败则写入内置 DS 记录
         if [[ ! -s /var/lib/unbound/root.key ]]; then
-            log_warn "手动写入 trust anchor..."
-            cat > /var/lib/unbound/root.key << 'KEY'
-. IN DNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+sqqls3eNbuv7pr+eoZG+SrDK6nWeL3c6H5Apxz7LjVc1uTIdsIXxuOLYA4/ilBmSVIi4eIo5T8JB3GgEJmjfp0eiKX6Y45F3a0fqXVMhA6WKJ3RZ4q4Z2CKEY
+            log_warn "手动写入 trust anchor DS 记录..."
+            printf '. IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n' \
+                > /var/lib/unbound/root.key
         fi
     fi
 
@@ -131,6 +150,7 @@ init_trust_anchor() {
     log_info "DNSSEC trust anchor 初始化完成"
 }
 
+# ── 计算线程数 ───────────────────────────────────────────────
 get_thread_count() {
     local cores
     cores=$(nproc)
@@ -143,6 +163,7 @@ get_thread_count() {
     fi
 }
 
+# ── 生成配置 ─────────────────────────────────────────────────
 generate_unbound_config() {
     log_step "生成 Unbound 配置..."
 
@@ -165,11 +186,9 @@ generate_unbound_config() {
             local conf_dir="/etc/unbound/unbound.conf.d"
             mkdir -p "$conf_dir"
             target_conf="${conf_dir}/local-recursive.conf"
-
-            # 确保主配置包含 conf.d
             local main_conf="/etc/unbound/unbound.conf"
             if [[ -f "$main_conf" ]] && \
-               ! grep -q "include.*unbound.conf.d" "$main_conf"; then
+               ! grep -q "unbound.conf.d" "$main_conf"; then
                 echo 'include: "/etc/unbound/unbound.conf.d/*.conf"' \
                     >> "$main_conf"
             fi
@@ -181,7 +200,7 @@ generate_unbound_config() {
             ;;
     esac
 
-    cat > "$target_conf" << CONF
+    cat > "$target_conf" << CONF_EOF
 # ----------------------------------------------------------------------
 # Unbound 本地递归 DNS 配置
 # 自动生成 - $(date)
@@ -261,43 +280,44 @@ remote-control:
     server-cert-file: "/etc/unbound/unbound_server.pem"
     control-key-file: "/etc/unbound/unbound_control.key"
     control-cert-file: "/etc/unbound/unbound_control.pem"
-CONF
+CONF_EOF
 
     log_info "Unbound 配置生成完成: $target_conf"
 }
 
+# ── 初始化 unbound-control 证书 ──────────────────────────────
 init_unbound_control() {
     log_step "初始化 unbound-control 证书..."
     unbound-control-setup 2>/dev/null || true
     log_info "unbound-control 证书初始化完成"
 }
 
+# ── 配置 resolv.conf ─────────────────────────────────────────
 setup_resolv_conf() {
     log_step "配置 /etc/resolv.conf..."
 
-    # 解除锁定（如果之前锁定过）
     chattr -i /etc/resolv.conf 2>/dev/null || true
 
     [[ -f /etc/resolv.conf ]] && \
         cp /etc/resolv.conf \
-           "/etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+           "/etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)" \
+           2>/dev/null || true
 
-    cat > /etc/resolv.conf << 'RESOLV'
+    cat > /etc/resolv.conf << 'RESOLV_EOF'
 # 本地 Unbound 递归 DNS
 nameserver 127.0.0.1
 nameserver ::1
 options ndots:3 timeout:2 attempts:3
-RESOLV
+RESOLV_EOF
 
-    # 锁定防止被覆盖
     chattr +i /etc/resolv.conf 2>/dev/null || true
     log_info "/etc/resolv.conf 配置完成并已锁定"
 }
 
+# ── 启动 Unbound ─────────────────────────────────────────────
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
-    # 验证配置
     if ! unbound-checkconf 2>&1; then
         log_error "Unbound 配置验证失败"
         exit 1
@@ -315,19 +335,19 @@ start_unbound() {
     fi
 }
 
+# ── 验证递归解析 ─────────────────────────────────────────────
 verify_unbound() {
     log_step "验证本地递归解析..."
     sleep 1
 
-    local test_domains=("google.com" "github.com" "cloudflare.com")
     local failed=0
-
-    for domain in "${test_domains[@]}"; do
-        if dig @127.0.0.1 "$domain" +short +time=5 >/dev/null 2>&1; then
+    for domain in google.com github.com cloudflare.com; do
+        if dig @127.0.0.1 "$domain" +short +time=5 \
+           >/dev/null 2>&1; then
             log_info "解析成功: $domain"
         else
             log_warn "解析失败: $domain"
-            ((failed++)) || true
+            (( failed++ )) || true
         fi
     done
 
@@ -338,8 +358,10 @@ verify_unbound() {
     fi
 }
 
+# ── 模块入口 ─────────────────────────────────────────────────
 run_unbound() {
     log_step "========== Unbound 安装配置 =========="
+
     install_unbound
     disable_systemd_resolved
     download_root_hints
@@ -349,6 +371,7 @@ run_unbound() {
     setup_resolv_conf
     start_unbound
     verify_unbound
+
     log_info "========== Unbound 安装配置完成 =========="
     echo ""
     log_info "本地递归 DNS: 127.0.0.1:53"
