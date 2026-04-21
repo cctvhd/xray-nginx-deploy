@@ -4,11 +4,10 @@
 # Unbound 本地递归 DNS 安装配置
 # ============================================================
 
-# ── 检测是否已安装 ───────────────────────────────────────────
+# ── 检测是否已安装且运行 ─────────────────────────────────────
 check_unbound_installed() {
     if command -v unbound &>/dev/null && \
        systemctl is-active --quiet unbound 2>/dev/null; then
-        log_info "Unbound 已安装且运行中: $(unbound -V 2>&1 | head -1)"
         return 0
     fi
     return 1
@@ -16,11 +15,6 @@ check_unbound_installed() {
 
 # ── 安装 Unbound ─────────────────────────────────────────────
 install_unbound() {
-    if check_unbound_installed; then
-        read -rp "Unbound 已安装并运行，是否重新安装？[y/N]: " reinstall
-        [[ "${reinstall,,}" != "y" ]] && return 0
-    fi
-
     log_step "安装 Unbound..."
 
     case "$OS_ID" in
@@ -135,10 +129,7 @@ init_trust_anchor() {
             log_info "root.key 已存在，跳过初始化"
         fi
     else
-        # 用 unbound-anchor 初始化
         unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
-
-        # 仍然失败则写入内置 DS 记录
         if [[ ! -s /var/lib/unbound/root.key ]]; then
             log_warn "手动写入 trust anchor DS 记录..."
             printf '. IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n' \
@@ -154,13 +145,23 @@ init_trust_anchor() {
 get_thread_count() {
     local cores
     cores=$(nproc)
-    if [[ $cores -ge 4 ]]; then
-        echo 4
-    elif [[ $cores -ge 2 ]]; then
-        echo 2
-    else
-        echo 1
+    if [[ $cores -ge 4 ]]; then echo 4
+    elif [[ $cores -ge 2 ]]; then echo 2
+    else echo 1
     fi
+}
+
+# ── 检测主配置里已有的 auto-trust-anchor-file ────────────────
+get_main_conf_anchor() {
+    # 找到主配置里已声明的 trust anchor 路径
+    grep -r "auto-trust-anchor-file" \
+        /etc/unbound/unbound.conf \
+        /etc/unbound/conf.d/ \
+        /etc/unbound/unbound.conf.d/ \
+        2>/dev/null | \
+        grep -v "local-recursive.conf" | \
+        head -1 | \
+        grep -oP '"\K[^"]+' || echo ""
 }
 
 # ── 生成配置 ─────────────────────────────────────────────────
@@ -180,7 +181,6 @@ generate_unbound_config() {
     [[ $mem_gb -ge 8 ]] && msg_cache="512m"  && rrset_cache="1024m"
 
     local target_conf=""
-
     case "$OS_ID" in
         ubuntu|debian)
             local conf_dir="/etc/unbound/unbound.conf.d"
@@ -199,6 +199,36 @@ generate_unbound_config() {
             target_conf="${conf_dir}/local-recursive.conf"
             ;;
     esac
+
+    # 检测主配置是否已有 auto-trust-anchor-file
+    # 如果有则不在我们的配置里重复声明
+    local anchor_line=""
+    local existing_anchor
+    existing_anchor=$(get_main_conf_anchor)
+
+    if [[ -z "$existing_anchor" ]]; then
+        anchor_line="    auto-trust-anchor-file: \"/var/lib/unbound/root.key\""
+    else
+        log_info "主配置已有 trust anchor: $existing_anchor，跳过重复声明"
+        anchor_line="    # auto-trust-anchor-file 已在主配置声明，此处跳过"
+    fi
+
+    # 检测主配置是否已有 root-hints
+    local hints_line=""
+    local existing_hints
+    existing_hints=$(grep -r "root-hints" \
+        /etc/unbound/unbound.conf \
+        /etc/unbound/conf.d/ \
+        /etc/unbound/unbound.conf.d/ \
+        2>/dev/null | \
+        grep -v "local-recursive.conf" | head -1)
+
+    if [[ -z "$existing_hints" ]]; then
+        hints_line="    root-hints: \"/var/lib/unbound/root.hints\""
+    else
+        log_info "主配置已有 root-hints，跳过重复声明"
+        hints_line="    # root-hints 已在主配置声明，此处跳过"
+    fi
 
     cat > "$target_conf" << CONF_EOF
 # ----------------------------------------------------------------------
@@ -241,8 +271,8 @@ server:
     msg-buffer-size: 65552
     jostle-timeout: 200
 
-    auto-trust-anchor-file: "/var/lib/unbound/root.key"
-    root-hints: "/var/lib/unbound/root.hints"
+${anchor_line}
+${hints_line}
     harden-dnssec-stripped: no
     val-clean-additional: yes
     val-log-level: 1
@@ -362,15 +392,66 @@ verify_unbound() {
 run_unbound() {
     log_step "========== Unbound 安装配置 =========="
 
-    install_unbound
-    disable_systemd_resolved
-    download_root_hints
-    init_trust_anchor
-    generate_unbound_config
-    init_unbound_control
-    setup_resolv_conf
-    start_unbound
-    verify_unbound
+    # 已安装且运行中，询问是否跳过
+    if check_unbound_installed; then
+        log_info "Unbound 已安装且运行中: $(unbound -V 2>&1 | head -1)"
+        echo ""
+        echo "  选择操作："
+        echo "    1. 跳过（保持现有配置）"
+        echo "    2. 重新配置（不重装，只更新配置文件）"
+        echo "    3. 完整重装（重新安装+配置）"
+        read -rp "  请选择 [1-3，默认1]: " unbound_choice
+
+        case "${unbound_choice:-1}" in
+            1)
+                log_info "跳过 Unbound，使用现有配置"
+                log_info "========== Unbound 跳过 =========="
+                return 0
+                ;;
+            2)
+                # 只更新配置
+                disable_systemd_resolved
+                download_root_hints
+                init_trust_anchor
+                generate_unbound_config
+                init_unbound_control
+                setup_resolv_conf
+                systemctl restart unbound
+                sleep 2
+                if systemctl is-active --quiet unbound; then
+                    log_info "Unbound 重新配置成功"
+                else
+                    log_error "Unbound 启动失败"
+                    journalctl -u unbound -n 20 --no-pager
+                    exit 1
+                fi
+                verify_unbound
+                ;;
+            3)
+                # 完整重装
+                install_unbound
+                disable_systemd_resolved
+                download_root_hints
+                init_trust_anchor
+                generate_unbound_config
+                init_unbound_control
+                setup_resolv_conf
+                start_unbound
+                verify_unbound
+                ;;
+        esac
+    else
+        # 未安装，走完整安装流程
+        install_unbound
+        disable_systemd_resolved
+        download_root_hints
+        init_trust_anchor
+        generate_unbound_config
+        init_unbound_control
+        setup_resolv_conf
+        start_unbound
+        verify_unbound
+    fi
 
     log_info "========== Unbound 安装配置完成 =========="
     echo ""
