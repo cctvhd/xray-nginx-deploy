@@ -89,7 +89,7 @@ upgrade_kernel() {
                 https://www.elrepo.org/RPM-GPG-KEY-elrepo.org \
                 2>/dev/null || true
             $PKG_INSTALL \
-                https://www.elrepo.org/elrepo-release-$(rpm -E %rhel).noarch.rpm \
+                https://www.elrepo.org/elrepo-release-$(rpm -E %rhel).el$(rpm -E %rhel).elrepo.noarch.rpm \
                 2>/dev/null || true
             $PKG_INSTALL --enablerepo=elrepo-kernel kernel-ml
             grub2-set-default 0
