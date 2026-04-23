@@ -85,13 +85,15 @@ upgrade_kernel() {
             ;;
         centos|rhel|rocky|almalinux)
             log_step "安装 elrepo mainline 内核..."
+            local rhel_ver
+            rhel_ver=$(rpm -E %rhel)
+            local elrepo_url="https://www.elrepo.org/elrepo-release-${rhel_ver}.el${rhel_ver}.elrepo.noarch.rpm"
+            log_info "elrepo URL: ${elrepo_url}"
             rpm --import \
                 https://www.elrepo.org/RPM-GPG-KEY-elrepo.org \
                 2>/dev/null || true
-            $PKG_INSTALL \
-                https://www.elrepo.org/elrepo-release-$(rpm -E %rhel).el$(rpm -E %rhel).elrepo.noarch.rpm \
-                2>/dev/null || true
-            $PKG_INSTALL --enablerepo=elrepo-kernel kernel-ml
+            dnf install -y "${elrepo_url}" 2>/dev/null || true
+            dnf install -y --enablerepo=elrepo-kernel kernel-ml
             grub2-set-default 0
             ;;
     esac
