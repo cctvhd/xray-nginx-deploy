@@ -220,6 +220,160 @@ CONF
     log_info "Cloudflare 真实IP配置生成完成"
 }
 
+# ── 安装 Cloudflare IP 自动更新脚本 ──────────────────────────
+install_cf_ip_updater() {
+    log_step "安装 Cloudflare IP 自动更新脚本..."
+
+    mkdir -p /usr/local/bin /var/backups/nginx /var/log/nginx
+
+    cat > /usr/local/bin/update_cf_ip.sh << 'SCRIPT_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CF_CONF="/etc/nginx/cloudflare_real_ip.conf"
+TMP_CF_CONF="/tmp/real_ip.conf.tmp"
+BACKUP_DIR="/var/backups/nginx"
+LOG_FILE="/var/log/nginx/cloudflare_ip_update.log"
+
+RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'; NC='\033[0m'
+
+log()        { echo -e "[$(date '+%Y-%m-%d %H:%M:%S')] $1" | tee -a "$LOG_FILE"; }
+error_exit() { log "${RED}ERROR: $1${NC}"; exit 1; }
+
+mkdir -p "$BACKUP_DIR" "$(dirname "$LOG_FILE")"
+
+command -v nginx >/dev/null 2>&1 || error_exit "未找到 nginx 命令"
+[[ -f "$CF_CONF" ]] || error_exit "未找到目标配置文件: $CF_CONF"
+
+log "${YELLOW}开始更新 Cloudflare IP 地址段...${NC}"
+
+get_cloudflare_ips() {
+    local retries=3 delay=5
+    for i in $(seq 1 "$retries"); do
+        CF_IPV4=$(curl -fsSL --connect-timeout 10 --max-time 20 https://www.cloudflare.com/ips-v4)
+        CF_IPV6=$(curl -fsSL --connect-timeout 10 --max-time 20 https://www.cloudflare.com/ips-v6)
+        [[ -n "${CF_IPV4:-}" && -n "${CF_IPV6:-}" ]] && {
+            log "成功获取 Cloudflare IP (第 $i 次)"
+            return 0
+        }
+        log "获取失败，重试 $i/$retries，等待 ${delay}s..."
+        sleep "$delay"
+    done
+    error_exit "无法获取 Cloudflare IP 地址段"
+}
+
+validate_ips() {
+    local v4 v6
+    v4=$(echo "$CF_IPV4" | grep -v '^$' | wc -l)
+    v6=$(echo "$CF_IPV6" | grep -v '^$' | wc -l)
+    (( v4 >= 10 && v6 >= 5 )) || error_exit "IP 数量异常 (IPv4: $v4, IPv6: $v6)"
+    log "IP 验证通过 (IPv4: $v4, IPv6: $v6)"
+}
+
+get_cloudflare_ips
+validate_ips
+
+cat > "$TMP_CF_CONF" << HEREDOC
+# ======================================================================
+# Cloudflare Real IP 配置
+# 自动生成，请勿手动编辑 | 更新时间: $(date '+%Y-%m-%d %H:%M:%S')
+# ======================================================================
+
+# ── 信任本地环回（stream → nginx 的本地转发必须信任）────────────────
+set_real_ip_from 127.0.0.1;
+set_real_ip_from ::1;
+
+# ── 信任 Cloudflare 官方节点（IPv4）──────────────────────────────────
+$(echo "$CF_IPV4" | sed 's/^/set_real_ip_from /;s/$/;/')
+
+# ── 信任 Cloudflare 官方节点（IPv6）──────────────────────────────────
+$(echo "$CF_IPV6" | sed 's/^/set_real_ip_from /;s/$/;/')
+
+# ── 核心：从 Stream 层传来的 PROXY Protocol 中提取物理连接 IP ─────────
+# 注意：不能用 CF-Connecting-IP，该 Header 可被任意伪造
+real_ip_header    proxy_protocol;
+real_ip_recursive on;
+
+# ── 判断物理 IP 是否属于 CF 官方节点 ─────────────────────────────────
+geo \$remote_addr \$from_cf {
+    default 0;
+    127.0.0.1 0;
+    ::1 0;
+$(echo "$CF_IPV4" | sed 's/^/    /;s/$/ 1;/')
+$(echo "$CF_IPV6" | sed 's/^/    /;s/$/ 1;/')
+}
+
+# ── 健壮型真实 IP 映射 ────────────────────────────────────────────────
+map "\$from_cf:\$http_cf_connecting_ip" \$final_real_ip {
+    "1:"       \$remote_addr;
+    "~^1:.+"   \$http_cf_connecting_ip;
+    default    \$remote_addr;
+}
+HEREDOC
+
+BACKUP_FILE=""
+if [[ -f "$CF_CONF" ]]; then
+    BACKUP_FILE="$BACKUP_DIR/real_ip.conf.$(date +%Y%m%d-%H%M%S)"
+    cp "$CF_CONF" "$BACKUP_FILE"
+fi
+
+mv "$TMP_CF_CONF" "$CF_CONF"
+chmod 644 "$CF_CONF"
+
+if nginx -t >/dev/null 2>&1; then
+    command -v restorecon >/dev/null 2>&1 && restorecon "$CF_CONF" || true
+    if systemctl reload nginx 2>/dev/null; then
+        log "${GREEN}Cloudflare IP 更新成功，Nginx 已平滑重载${NC}"
+    else
+        log "${YELLOW}Nginx 重载失败，但配置已更新${NC}"
+    fi
+else
+    log "${RED}nginx -t 未通过，正在从备份恢复旧配置...${NC}"
+    if [[ -n "$BACKUP_FILE" && -f "$BACKUP_FILE" ]]; then
+        cp "$BACKUP_FILE" "$CF_CONF"
+        log "${YELLOW}已恢复旧配置：$BACKUP_FILE${NC}"
+    else
+        log "${RED}无可用备份，请手动检查 $CF_CONF${NC}"
+    fi
+    rm -f "$TMP_CF_CONF"
+    error_exit "新配置 nginx -t 未通过，已回滚，现有配置保持不变"
+fi
+
+find "$BACKUP_DIR" -name "real_ip.conf.*" -type f | sort -r | tail -n +11 | xargs -r rm -f || true
+log "${GREEN}Cloudflare IP 更新完成${NC}"
+SCRIPT_EOF
+
+    chmod +x /usr/local/bin/update_cf_ip.sh
+    log_info "Cloudflare IP 更新脚本已安装: /usr/local/bin/update_cf_ip.sh"
+}
+
+# ── 配置 Cloudflare IP 自动更新任务 ─────────────────────────
+setup_cf_ip_updater() {
+    log_step "配置 Cloudflare IP 自动更新任务..."
+
+    cat > /etc/cron.weekly/update_cf_ip << 'CRON_EOF'
+#!/usr/bin/env bash
+/usr/local/bin/update_cf_ip.sh
+CRON_EOF
+    chmod +x /etc/cron.weekly/update_cf_ip
+
+    (crontab -l 2>/dev/null | grep -v "update_cf_ip.sh"; \
+     echo "23 4 * * 0 /usr/local/bin/update_cf_ip.sh >/dev/null 2>&1") | crontab -
+
+    log_info "已配置每周自动更新 Cloudflare IP"
+}
+
+# ── 立即执行一次 Cloudflare IP 更新 ─────────────────────────
+run_cf_ip_updater() {
+    log_step "刷新 Cloudflare 官方 IP 地址段..."
+
+    if /usr/local/bin/update_cf_ip.sh; then
+        log_info "Cloudflare IP 地址段已刷新"
+    else
+        log_warn "Cloudflare IP 自动更新失败，保留当前静态模板配置"
+    fi
+}
+
 # ── 生成 ssl/common.conf ─────────────────────────────────────
 generate_ssl_conf() {
     log_step "生成 SSL 通用配置..."
@@ -850,5 +1004,8 @@ run_nginx() {
     generate_servers_conf
     generate_nginx_conf
     reload_nginx
+    install_cf_ip_updater
+    setup_cf_ip_updater
+    run_cf_ip_updater
     log_info "========== Nginx 安装配置完成 =========="
 }

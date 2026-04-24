@@ -561,6 +561,9 @@ do_conf_nginx() {
     generate_servers_conf
     generate_nginx_conf
     reload_nginx
+    install_cf_ip_updater
+    setup_cf_ip_updater
+    run_cf_ip_updater
 
     save_state "CONF_NGINX" "1"
     done_return
