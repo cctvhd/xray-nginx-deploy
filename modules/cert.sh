@@ -13,6 +13,98 @@ check_certbot_installed() {
     return 1
 }
 
+# ── 判断是否使用 Snap 安装的 Certbot ─────────────────────────
+certbot_uses_snap() {
+    command -v snap &>/dev/null && snap list certbot >/dev/null 2>&1
+}
+
+# ── 安装并启用 snapd ─────────────────────────────────────────
+install_snapd() {
+    log_step "安装 snapd..."
+
+    case "$OS_ID" in
+        ubuntu|debian)
+            $PKG_INSTALL snapd -y >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            $PKG_INSTALL epel-release -y >/dev/null 2>&1 || true
+            $PKG_INSTALL snapd -y >/dev/null 2>&1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+
+    systemctl enable --now snapd.socket >/dev/null 2>&1
+    systemctl enable --now snapd.seeded.service >/dev/null 2>&1 || true
+    [[ -e /snap ]] || ln -s /var/lib/snapd/snap /snap
+
+    for _ in {1..10}; do
+        if command -v snap &>/dev/null; then
+            return 0
+        fi
+        sleep 1
+    done
+
+    return 1
+}
+
+# ── 移除旧版 Certbot 包 ─────────────────────────────────────
+remove_legacy_certbot() {
+    case "$OS_ID" in
+        ubuntu|debian)
+            apt-get remove -y certbot python3-certbot-dns-cloudflare \
+                >/dev/null 2>&1 || true
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            dnf remove -y certbot python3-certbot-dns-cloudflare \
+                >/dev/null 2>&1 || true
+            yum remove -y certbot python3-certbot-dns-cloudflare \
+                >/dev/null 2>&1 || true
+            ;;
+    esac
+}
+
+# ── 使用 Snap 安装 Certbot + CF 插件 ────────────────────────
+install_certbot_snap() {
+    install_snapd || return 1
+
+    log_step "使用 Snap 安装最新 Certbot..."
+    remove_legacy_certbot
+
+    snap install core >/dev/null 2>&1 || true
+    snap refresh core >/dev/null 2>&1 || true
+    snap install --classic certbot >/dev/null 2>&1 || \
+        snap refresh certbot >/dev/null 2>&1
+    snap set certbot trust-plugin-with-root=ok >/dev/null 2>&1 || true
+    snap install certbot-dns-cloudflare >/dev/null 2>&1 || \
+        snap refresh certbot-dns-cloudflare >/dev/null 2>&1
+
+    ln -sfn /snap/bin/certbot /usr/local/bin/certbot
+    command -v certbot &>/dev/null
+}
+
+# ── 旧方案回退安装 ───────────────────────────────────────────
+install_certbot_legacy() {
+    log_warn "Snap 安装失败，回退到系统/PIP 方式安装 Certbot"
+
+    case "$OS_ID" in
+        ubuntu|debian)
+            $PKG_INSTALL python3-pip python3-venv -y >/dev/null 2>&1
+            pip3 install certbot certbot-dns-cloudflare \
+                --break-system-packages >/dev/null 2>&1 || \
+            pip3 install certbot certbot-dns-cloudflare >/dev/null 2>&1
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            $PKG_INSTALL python3-pip -y >/dev/null 2>&1
+            pip3 install certbot certbot-dns-cloudflare \
+                >/dev/null 2>&1 || \
+            $PKG_INSTALL certbot python3-certbot-dns-cloudflare \
+                -y >/dev/null 2>&1
+            ;;
+    esac
+}
+
 # ── 安装 Certbot + CF 插件 ───────────────────────────────────
 install_certbot() {
     if check_certbot_installed; then
@@ -22,21 +114,9 @@ install_certbot() {
 
     log_step "安装 Certbot + Cloudflare 插件..."
 
-    case "$OS_ID" in
-        ubuntu|debian)
-            $PKG_INSTALL python3-pip python3-venv -y >/dev/null 2>&1
-            pip3 install certbot certbot-dns-cloudflare \
-                --break-system-packages >/dev/null 2>&1 || \
-            pip3 install certbot certbot-dns-cloudflare >/dev/null 2>&1
-            ;;
-        centos|rhel|rocky|almalinux)
-            $PKG_INSTALL python3-pip -y >/dev/null 2>&1
-            pip3 install certbot certbot-dns-cloudflare \
-                >/dev/null 2>&1 || \
-            $PKG_INSTALL certbot python3-certbot-dns-cloudflare \
-                -y >/dev/null 2>&1
-            ;;
-    esac
+    if ! install_certbot_snap; then
+        install_certbot_legacy
+    fi
 
     if ! command -v certbot &>/dev/null; then
         log_error "Certbot 安装失败"
@@ -44,6 +124,11 @@ install_certbot() {
     fi
 
     log_info "Certbot 安装完成: $(certbot --version 2>&1)"
+    if certbot_uses_snap; then
+        log_info "当前使用 Snap 版 Certbot（官方推荐）"
+    else
+        log_warn "当前未使用 Snap 版 Certbot，后续仍可能受系统 Python 版本影响"
+    fi
 }
 
 # ── 配置 Cloudflare 账号 ─────────────────────────────────────
@@ -324,12 +409,16 @@ HOOK
     chmod +x \
         /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
-    # cron 任务
-    (crontab -l 2>/dev/null | grep -v certbot; \
-     echo "0 3 * * * certbot renew --quiet \
---deploy-hook 'systemctl reload nginx'") | crontab -
-
-    log_info "自动续期配置完成（每天凌晨3点检查）"
+    if certbot_uses_snap; then
+        crontab -l 2>/dev/null | grep -v certbot | crontab - || true
+        log_info "自动续期配置完成（使用 Snap 自带 timer）"
+        log_info "可用 systemctl list-timers | grep certbot 查看续期计划"
+    else
+        # cron 任务
+        (crontab -l 2>/dev/null | grep -v certbot; \
+         echo "0 3 * * * certbot renew --quiet") | crontab -
+        log_info "自动续期配置完成（每天凌晨3点检查）"
+    fi
 }
 
 # ── 模块入口 ─────────────────────────────────────────────────
