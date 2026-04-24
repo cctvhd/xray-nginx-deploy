@@ -177,29 +177,28 @@ calc_net_params() {
         bw_mbps=${bw%m}
     fi
 
-    # 根据带宽计算 rmem/wmem
-    # BDP = bandwidth * RTT，保守估计 RTT=300ms
-    # rmem_max = bw_mbps * 1024 * 1024 / 8 * 0.3
+    # 根据带宽计算缓冲区上限
+    # TCP 继续按带宽分档；同时为 QUIC/Hysteria2 保留 16MB 的低档位下限
     if [[ $bw_mbps -ge 10000 ]]; then
         # 10G+
-        NET_RMEM_MAX=67108864   # 64MB
-        NET_WMEM_MAX=67108864
+        NET_CORE_RMEM_MAX=67108864   # 64MB
+        NET_CORE_WMEM_MAX=67108864
         NET_RMEM="4096 87380 67108864"
         NET_WMEM="4096 65536 67108864"
         XRAY_PADDING="100-1000"
         XRAY_WINDOW_CLAMP=0
     elif [[ $bw_mbps -ge 1000 ]]; then
         # 1G
-        NET_RMEM_MAX=16777216   # 16MB
-        NET_WMEM_MAX=16777216
+        NET_CORE_RMEM_MAX=16777216   # 16MB
+        NET_CORE_WMEM_MAX=16777216
         NET_RMEM="4096 87380 16777216"
         NET_WMEM="4096 65536 16777216"
         XRAY_PADDING="100-1000"
         XRAY_WINDOW_CLAMP=1200
     else
         # 100M 及以下
-        NET_RMEM_MAX=8388608    # 8MB
-        NET_WMEM_MAX=8388608
+        NET_CORE_RMEM_MAX=16777216   # 16MB, 兼顾 QUIC/Hysteria2 的缓冲区下限
+        NET_CORE_WMEM_MAX=16777216
         NET_RMEM="4096 87380 8388608"
         NET_WMEM="4096 65536 8388608"
         XRAY_PADDING="100-1000"
@@ -215,22 +214,26 @@ calc_mem_params() {
         SYSCTL_SOMAXCONN=65535
         SYSCTL_NETDEV_BACKLOG=65536
         SYSCTL_NF_CONNTRACK=2000000
+        SYSCTL_TCP_MAX_TW_BUCKETS=2000000
         NOFILE_LIMIT=1048576
     elif [[ $mem_gb -ge 4 ]]; then
         SYSCTL_SOMAXCONN=32768
         SYSCTL_NETDEV_BACKLOG=32768
         SYSCTL_NF_CONNTRACK=1000000
+        SYSCTL_TCP_MAX_TW_BUCKETS=1000000
         NOFILE_LIMIT=1048576
     elif [[ $mem_gb -ge 2 ]]; then
         SYSCTL_SOMAXCONN=16384
         SYSCTL_NETDEV_BACKLOG=16384
         SYSCTL_NF_CONNTRACK=500000
+        SYSCTL_TCP_MAX_TW_BUCKETS=500000
         NOFILE_LIMIT=524288
     else
         # 1GB 及以下
         SYSCTL_SOMAXCONN=8192
         SYSCTL_NETDEV_BACKLOG=8192
         SYSCTL_NF_CONNTRACK=262144
+        SYSCTL_TCP_MAX_TW_BUCKETS=262144
         NOFILE_LIMIT=262144
     fi
 
@@ -354,9 +357,11 @@ fs.file-max                         = ${FILE_MAX_LIMIT}
 net.core.default_qdisc              = fq
 net.ipv4.tcp_congestion_control     = bbr
 
-# ── TCP 缓冲区 ────────────────────────────────────────────────
-net.core.rmem_max                   = ${NET_RMEM_MAX}
-net.core.wmem_max                   = ${NET_WMEM_MAX}
+# ── TCP / QUIC 缓冲区 ────────────────────────────────────────
+# net.core.* 作为系统套接字上限，同时照顾 TCP 与 QUIC/Hysteria2
+# tcp_* 继续按 TCP 自动调优范围控制，避免低配机器过度放大缓冲
+net.core.rmem_max                   = ${NET_CORE_RMEM_MAX}
+net.core.wmem_max                   = ${NET_CORE_WMEM_MAX}
 net.core.rmem_default               = 262144
 net.core.wmem_default               = 262144
 net.ipv4.tcp_rmem                   = ${NET_RMEM}
@@ -368,7 +373,7 @@ net.core.somaxconn                  = ${SYSCTL_SOMAXCONN}
 net.core.netdev_max_backlog         = ${SYSCTL_NETDEV_BACKLOG}
 net.ipv4.ip_local_port_range        = 1024 65535
 net.ipv4.tcp_max_syn_backlog        = ${SYSCTL_SOMAXCONN}
-net.ipv4.tcp_max_tw_buckets         = 2000000
+net.ipv4.tcp_max_tw_buckets         = ${SYSCTL_TCP_MAX_TW_BUCKETS}
 # 仅保留 loopback 的 TIME-WAIT 复用，避免对公网连接过度激进
 net.ipv4.tcp_tw_reuse               = 2
 net.ipv4.tcp_fin_timeout            = 30
