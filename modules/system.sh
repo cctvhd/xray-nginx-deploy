@@ -52,28 +52,25 @@ detect_kernel() {
     KERNEL_MINOR=$(uname -r | cut -d. -f2)
     log_info "内核版本: $KERNEL_VERSION"
 
-    if [[ $KERNEL_MAJOR -gt 6 ]] || \
-       [[ $KERNEL_MAJOR -eq 6 && $KERNEL_MINOR -ge 4 ]]; then
-        BBR_VERSION="bbrv3"
-        log_info "BBR 支持: BBRv3 (内核 >= 6.4)"
-    elif [[ $KERNEL_MAJOR -ge 5 ]]; then
+    if [[ $KERNEL_MAJOR -gt 4 ]] || \
+       [[ $KERNEL_MAJOR -eq 4 && $KERNEL_MINOR -ge 9 ]]; then
         BBR_VERSION="bbr"
-        log_info "BBR 支持: BBR (内核 >= 5.x)"
+        log_info "BBR 支持: mainline BBR (内核 >= 4.9)"
     else
         BBR_VERSION="none"
-        log_warn "内核版本过低，建议升级到 5.x 以上"
+        log_warn "内核版本过低，建议升级到支持 BBR 的较新内核"
     fi
 }
 
 # ── 升级内核（可选）─────────────────────────────────────────
 upgrade_kernel() {
-    if [[ "$BBR_VERSION" == "bbrv3" ]]; then
-        log_info "当前内核已支持 BBRv3，无需升级"
+    if [[ "$BBR_VERSION" == "bbr" ]]; then
+        log_info "当前内核已支持 BBR，无需为了系统优化强制升级"
         return
     fi
 
     echo ""
-    read -rp "当前内核不支持 BBRv3，是否升级内核？[y/N]: " upgrade
+    read -rp "当前内核过低，是否升级到较新的通用内核以启用 BBR？[y/N]: " upgrade
     [[ "${upgrade,,}" != "y" ]] && return
 
     case "$OS_ID" in
@@ -189,7 +186,7 @@ calc_net_params() {
         NET_WMEM_MAX=67108864
         NET_RMEM="4096 87380 67108864"
         NET_WMEM="4096 65536 67108864"
-        XRAY_PADDING="512-4096"
+        XRAY_PADDING="100-1000"
         XRAY_WINDOW_CLAMP=0
     elif [[ $bw_mbps -ge 1000 ]]; then
         # 1G
@@ -197,7 +194,7 @@ calc_net_params() {
         NET_WMEM_MAX=16777216
         NET_RMEM="4096 87380 16777216"
         NET_WMEM="4096 65536 16777216"
-        XRAY_PADDING="128-2048"
+        XRAY_PADDING="100-1000"
         XRAY_WINDOW_CLAMP=1200
     else
         # 100M 及以下
@@ -205,7 +202,7 @@ calc_net_params() {
         NET_WMEM_MAX=8388608
         NET_RMEM="4096 87380 8388608"
         NET_WMEM="4096 65536 8388608"
-        XRAY_PADDING="128-1024"
+        XRAY_PADDING="100-1000"
         XRAY_WINDOW_CLAMP=600
     fi
 }
@@ -236,6 +233,8 @@ calc_mem_params() {
         SYSCTL_NF_CONNTRACK=262144
         NOFILE_LIMIT=262144
     fi
+
+    FILE_MAX_LIMIT=$(( NOFILE_LIMIT * 2 ))
 }
 
 # ── 根据磁盘类型计算 vm 参数 ─────────────────────────────────
@@ -347,8 +346,9 @@ net.ipv6.conf.default.disable_ipv6 = 1"
 
 # ── 文件描述符 ────────────────────────────────────────────────
 # 必须在 limits.d 设置之前确保 nr_open >= nofile hard limit
+# file-max 适当高于单进程 nofile，避免系统总 FD 上限过紧
 fs.nr_open                          = ${NOFILE_LIMIT}
-fs.file-max                         = ${NOFILE_LIMIT}
+fs.file-max                         = ${FILE_MAX_LIMIT}
 
 # ── TCP 拥塞控制 ──────────────────────────────────────────────
 net.core.default_qdisc              = fq
@@ -361,7 +361,7 @@ net.core.rmem_default               = 262144
 net.core.wmem_default               = 262144
 net.ipv4.tcp_rmem                   = ${NET_RMEM}
 net.ipv4.tcp_wmem                   = ${NET_WMEM}
-net.ipv4.tcp_mem                    = 786432 1048576 $(( NET_RMEM_MAX * 2 ))
+# tcp_mem 由内核按总内存自动计算，避免手工页数配置失准
 
 # ── 网络连接优化 ──────────────────────────────────────────────
 net.core.somaxconn                  = ${SYSCTL_SOMAXCONN}
@@ -369,7 +369,8 @@ net.core.netdev_max_backlog         = ${SYSCTL_NETDEV_BACKLOG}
 net.ipv4.ip_local_port_range        = 1024 65535
 net.ipv4.tcp_max_syn_backlog        = ${SYSCTL_SOMAXCONN}
 net.ipv4.tcp_max_tw_buckets         = 2000000
-net.ipv4.tcp_tw_reuse               = 1
+# 仅保留 loopback 的 TIME-WAIT 复用，避免对公网连接过度激进
+net.ipv4.tcp_tw_reuse               = 2
 net.ipv4.tcp_fin_timeout            = 30
 net.ipv4.tcp_syncookies             = 1
 
@@ -391,7 +392,8 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 30
 vm.swappiness                       = ${VM_SWAPPINESS}
 vm.dirty_ratio                      = ${VM_DIRTY_RATIO}
 vm.dirty_background_ratio           = ${VM_DIRTY_BACKGROUND_RATIO}
-vm.overcommit_memory                = 1
+# 典型代理机保持内核默认的 heuristic overcommit 模式
+vm.overcommit_memory                = 0
 
 # ── IPv6 配置 ─────────────────────────────────────────────────
 ${ipv6_conf}
