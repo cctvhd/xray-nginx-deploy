@@ -108,6 +108,7 @@ REALITY_SPIDER_X=''
 
 # Sing-Box 参数
 SINGBOX_PASSWORD=''
+WARP_PROXY_PORT='40000'
 
 # 安装状态
 INST_SYSTEM='0'
@@ -116,11 +117,13 @@ INST_NGINX='0'
 INST_CERT='0'
 INST_XRAY='0'
 INST_SINGBOX='0'
+INST_WARP='0'
 
 # 配置状态
 CONF_NGINX='0'
 CONF_XRAY='0'
 CONF_SINGBOX='0'
+CONF_WARP='0'
 ENV
         log_info "状态文件已创建: $STATE_FILE"
     fi
@@ -144,6 +147,7 @@ ENV
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XRAY_PADDING=$(get_state "XRAY_PADDING")
     XRAY_WINDOW_CLAMP=$(get_state "XRAY_WINDOW_CLAMP")
+    WARP_PROXY_PORT=$(get_state "WARP_PROXY_PORT" "40000")
 }
 
 # ── 加载模块 ─────────────────────────────────────────────────
@@ -213,6 +217,7 @@ show_status() {
         "INST_CERT:SSL 证书"
         "INST_XRAY:Xray"
         "INST_SINGBOX:Sing-Box"
+        "INST_WARP:Cloudflare WARP"
     )
 
     echo -e "  ${CYAN}[ 安装 ]${NC}"
@@ -234,6 +239,7 @@ show_status() {
         "CONF_NGINX:Nginx 配置"
         "CONF_XRAY:Xray 配置"
         "CONF_SINGBOX:Sing-Box 配置"
+        "CONF_WARP:WARP 配置"
     )
     for item in "${conf_items[@]}"; do
         local key="${item%%:*}"
@@ -296,6 +302,7 @@ main_menu() {
     echo -e "  │  ${CYAN}=== 其他 ===${NC}                           │"
     echo "  │  a. 生成客户端连接链接                  │"
     echo "  │  b. 查看当前状态                        │"
+    echo "  │  w. 安装/配置 Cloudflare WARP          │"
     echo "  ├─────────────────────────────────────────┤"
     echo "  │  0. 全量一键安装 (步骤 1-6)             │"
     echo "  │  q. 退出                                │"
@@ -320,6 +327,7 @@ main_menu() {
         b|B) show_status
              read -rp "按回车返回菜单..." _
              main_menu ;;
+        w|W) do_warp ;;
         0) do_full_install ;;
         q|Q) exit 0 ;;
         *) log_error "无效选择"
@@ -624,6 +632,20 @@ do_conf_singbox() {
 do_client() {
     load_module client
     run_client
+    done_return
+}
+
+# ── w. 安装/配置 Cloudflare WARP ─────────────────────────────
+do_warp() {
+    load_os_info
+    load_module warp
+    WARP_PROXY_PORT=$(get_state "WARP_PROXY_PORT" "40000")
+    run_warp
+
+    save_state "WARP_PROXY_PORT" "${WARP_PROXY_PORT:-40000}"
+    save_state "INST_WARP"       "1"
+    save_state "CONF_WARP"       "1"
+
     done_return
 }
 
