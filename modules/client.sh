@@ -202,7 +202,7 @@ gen_anytls_url() {
         return
     fi
 
-    if [[ "${SINGBOX_PASSWORD}" =~ [#\?&] ]]; then
+    if [[ "${SINGBOX_PASSWORD}" == *"#"* || "${SINGBOX_PASSWORD}" == *"?"* || "${SINGBOX_PASSWORD}" == *"&"* ]]; then
         log_warn "AnyTLS 密码包含 URI 保留字符，若客户端导入失败请直接使用输出文件中的原始密码"
     fi
 

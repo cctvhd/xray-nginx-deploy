@@ -104,7 +104,7 @@ generate_singbox_params() {
     fi
 
     log_info "AnyTLS 密码: ${SINGBOX_PASSWORD}"
-    if [[ "${SINGBOX_PASSWORD}" =~ [#\?&] ]]; then
+    if [[ "${SINGBOX_PASSWORD}" == *"#"* || "${SINGBOX_PASSWORD}" == *"?"* || "${SINGBOX_PASSWORD}" == *"&"* ]]; then
         log_warn "当前 AnyTLS 密码包含 URI 保留字符，部分客户端导入链接时可能需要手动填写原始密码"
     fi
 }
