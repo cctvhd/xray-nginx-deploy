@@ -549,6 +549,14 @@ do_conf_nginx() {
     fi
 
     load_module nginx
+    create_nginx_dirs
+    generate_fake_site "/var/www/html" "Welcome"
+    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
+        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
+    fi
+    generate_cf_realip_conf
+    generate_ssl_conf
+    generate_upstreams_conf
     generate_fallback_conf
     generate_servers_conf
     generate_nginx_conf
@@ -611,6 +619,18 @@ do_conf_singbox() {
     # 检查依赖
     if [[ "$(get_step INST_SINGBOX)" != "1" ]]; then
         log_warn "请先完成步骤6（安装 Sing-Box）"
+        read -rp "是否继续？[y/N]: " c
+        [[ "${c,,}" != "y" ]] && main_menu && return
+    fi
+
+    if [[ "$(get_step INST_CERT)" != "1" ]]; then
+        log_warn "建议先完成步骤4（申请 SSL 证书）"
+        read -rp "是否继续？[y/N]: " c
+        [[ "${c,,}" != "y" ]] && main_menu && return
+    fi
+
+    if [[ "$(get_step CONF_NGINX)" != "1" ]]; then
+        log_warn "建议先完成步骤7（配置 Nginx），AnyTLS 依赖 443 SNI 分流"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi

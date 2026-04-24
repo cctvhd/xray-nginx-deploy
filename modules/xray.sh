@@ -133,20 +133,18 @@ collect_reality_params() {
 generate_xray_config() {
     log_step "生成 Xray 配置文件..."
 
-    # 根据网口速度调整参数
-    local net_speed
-    net_speed=$(cat /sys/class/net/eth0/speed 2>/dev/null || echo "1000")
+    local x_padding="${XRAY_PADDING:-}"
+    case "${x_padding}" in
+        ""|"128-2048"|"128-1024")
+            x_padding="100-1000"
+            ;;
+    esac
 
-    # xPaddingBytes 根据网口速度
-    local x_padding="128-2048"
-    [[ "${net_speed}" -ge 10000 ]] && x_padding="512-4096"
+    local window_clamp="${XRAY_WINDOW_CLAMP:-1200}"
+    local user_timeout=30000
 
-    # tcpWindowClamp 根据网口速度
-    local window_clamp=1200
-    [[ "${net_speed}" -ge 10000 ]] && window_clamp=0
-
-    # tcpUserTimeout
-    local user_timeout=300000
+    XRAY_PADDING="${x_padding}"
+    XRAY_WINDOW_CLAMP="${window_clamp}"
 
     # 构建 Reality serverNames JSON 数组
     local sn_json=""
@@ -210,15 +208,6 @@ generate_xray_config() {
         "rules": [
             {
                 "type": "field",
-                "inboundTag": [
-                    "vless-xhttp-cdn",
-                    "vless-grpc-cdn",
-                    "reality-direct"
-                ],
-                "outboundTag": "direct"
-            },
-            {
-                "type": "field",
                 "ip": ["geoip:private"],
                 "outboundTag": "block"
             },
@@ -255,18 +244,11 @@ generate_xray_config() {
                     "host": "${XHTTP_DOMAIN:-}",
                     "extra": {
                         "enc": "packet",
-                        "xPaddingBytes": "${x_padding}"
+                        "xPaddingBytes": "${x_padding}",
+                        "headers": {"User-Agent": "chrome"}
                     }
                 },
                 "sockopt": {
-                    "tcpFastOpen":          true,
-                    "tcpCongestion":        "bbr",
-                    "tcpUserTimeout":       ${user_timeout},
-                    "tcpMaxSeg":            1460,
-                    "tcpKeepAliveIdle":     60,
-                    "tcpKeepAliveInterval": 30,
-                    "tcpKeepAliveCount":    3,
-                    "tcpMptcp":             true,
                     "trustedXForwardedFor": ["127.0.0.1", "::1"]
                 }
             },
@@ -292,21 +274,8 @@ generate_xray_config() {
                 "network": "grpc",
                 "security": "none",
                 "grpcSettings": {
-                    "serviceName":         "grpc.Service",
-                    "multiMode":           true,
-                    "idle_timeout":        60,
-                    "permitWithoutStream": true
-                },
-                "sockopt": {
-                    "tcpFastOpen":          true,
-                    "tcpCongestion":        "bbr",
-                    "tcpUserTimeout":       ${user_timeout},
-                    "tcpMaxSeg":            1460,
-                    "tcpWindowClamp":       ${window_clamp},
-                    "tcpKeepAliveIdle":     60,
-                    "tcpKeepAliveInterval": 30,
-                    "tcpKeepAliveCount":    3,
-                    "tcpMptcp":             true
+                    "serviceName": "grpc.Service",
+                    "multiMode": true
                 }
             },
             "sniffing": {
@@ -346,14 +315,7 @@ generate_xray_config() {
                     "spiderX":    "${REALITY_SPIDER_X}"
                 },
                 "sockopt": {
-                    "tcpFastOpen":          true,
-                    "tcpCongestion":        "bbr",
-                    "tcpUserTimeout":       ${user_timeout},
-                    "tcpMaxSeg":            1460,
-                    "tcpKeepAliveIdle":     300,
-                    "tcpKeepAliveInterval": 30,
-                    "acceptProxyProtocol":  true,
-                    "tcpMptcp":             true
+                    "acceptProxyProtocol":  true
                 }
             },
             "sniffing": {
@@ -373,13 +335,9 @@ generate_xray_config() {
             },
             "streamSettings": {
                 "sockopt": {
-                    "tcpFastOpen":          true,
-                    "tcpCongestion":        "bbr",
                     "tcpUserTimeout":       ${user_timeout},
-                    "tcpMaxSeg":            1460,
                     "tcpKeepAliveIdle":     300,
-                    "tcpKeepAliveInterval": 30,
-                    "tcpMptcp":             true
+                    "tcpKeepAliveInterval": 30
                 }
             }
         },
@@ -391,14 +349,7 @@ generate_xray_config() {
             "tag":      "warp",
             "protocol": "socks",
             "settings": {
-                "servers": [{"address": "127.0.0.1", "port": 40000}]
-            },
-            "streamSettings": {
-                "sockopt": {
-                    "tcpFastOpen":          true,
-                    "tcpKeepAliveInterval": 30,
-                    "tcpMptcp":             true
-                }
+                "servers": [{"address": "127.0.0.1", "port": ${WARP_PROXY_PORT:-40000}}]
             }
         }
     ]
@@ -411,6 +362,12 @@ CONF
 # ── 启动 Xray ────────────────────────────────────────────────
 start_xray() {
     log_step "启动 Xray 服务..."
+
+    if ! xray run -test -config /usr/local/etc/xray/config.json; then
+        log_error "Xray 配置验证失败"
+        exit 1
+    fi
+
     systemctl enable --now xray
 
     sleep 2

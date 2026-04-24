@@ -6,19 +6,40 @@
 
 # ── 读取已有配置参数 ─────────────────────────────────────────
 load_existing_params() {
+    local state_file="/etc/xray-deploy/config.env"
     local xray_config="/usr/local/etc/xray/config.json"
     local sb_config="/etc/sing-box/config.json"
 
+    read_state_value() {
+        local key="$1"
+        grep "^${key}=" "$state_file" 2>/dev/null | \
+            head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//"
+    }
+
+    XRAY_UUID=$(read_state_value "XRAY_UUID")
+    XHTTP_PATH=$(read_state_value "XHTTP_PATH")
+    XHTTP_DOMAIN=$(read_state_value "XHTTP_DOMAIN")
+    GRPC_DOMAIN=$(read_state_value "GRPC_DOMAIN")
+    XRAY_PUBLIC_KEY=$(read_state_value "XRAY_PUBLIC_KEY")
+    REALITY_SNI=$(read_state_value "REALITY_SNI")
+    REALITY_SHORT_ID=$(read_state_value "REALITY_SHORT_ID")
+    REALITY_SPIDER_X=$(read_state_value "REALITY_SPIDER_X")
+    ANYTLS_DOMAIN=$(read_state_value "ANYTLS_DOMAIN")
+    SINGBOX_PASSWORD=$(read_state_value "SINGBOX_PASSWORD")
+
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
-        XRAY_UUID=$(grep -oP '"id":\s*"\K[^"]+' "$xray_config" | head -1)
-        XHTTP_PATH=$(grep -oP '"path":\s*"\K[^"]+' "$xray_config" | head -1)
-        XHTTP_DOMAIN=$(grep -oP '"host":\s*"\K[^"]+' "$xray_config" | head -1)
-        XRAY_PUBLIC_KEY=$(grep -oP '"privateKey":\s*"\K[^"]+' "$xray_config" | head -1)
+        [[ -n "${XRAY_UUID:-}" ]] || \
+            XRAY_UUID=$(grep -oP '"id":\s*"\K[^"]+' "$xray_config" | head -1)
+        [[ -n "${XHTTP_PATH:-}" ]] || \
+            XHTTP_PATH=$(grep -oP '"path":\s*"\K[^"]+' "$xray_config" | head -1)
+        [[ -n "${XHTTP_DOMAIN:-}" ]] || \
+            XHTTP_DOMAIN=$(grep -oP '"host":\s*"\K[^"]+' "$xray_config" | head -1)
         REALITY_DEST=$(grep -oP '"dest":\s*"\K[^"]+' "$xray_config" | head -1)
+        XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1)
 
         # 读取第一个非空 shortId
-        REALITY_SHORT_ID=$(python3 -c "
+        [[ -n "${REALITY_SHORT_ID:-}" ]] || REALITY_SHORT_ID=$(python3 -c "
 import json
 with open('${xray_config}') as f:
     c = json.load(f)
@@ -30,7 +51,7 @@ for inb in c['inbounds']:
 " 2>/dev/null || echo "")
 
         # 读取第一个 serverName
-        REALITY_SNI=$(python3 -c "
+        [[ -n "${REALITY_SNI:-}" ]] || REALITY_SNI=$(python3 -c "
 import json
 with open('${xray_config}') as f:
     c = json.load(f)
@@ -41,22 +62,44 @@ for inb in c['inbounds']:
         break
 " 2>/dev/null || echo "")
 
+        [[ -n "${REALITY_SPIDER_X:-}" ]] || REALITY_SPIDER_X=$(python3 -c "
+import json
+with open('${xray_config}') as f:
+    c = json.load(f)
+for inb in c['inbounds']:
+    if inb.get('streamSettings', {}).get('security') == 'reality':
+        print(inb['streamSettings']['realitySettings'].get('spiderX', ''))
+        break
+" 2>/dev/null || echo "")
+
         # 公钥需要从私钥推导
-        if [[ -n "${XRAY_PUBLIC_KEY:-}" ]]; then
+        if [[ -z "${XRAY_PUBLIC_KEY:-}" ]]; then
+            local reality_privkey
+            reality_privkey=$(grep -oP '"privateKey":\s*"\K[^"]+' "$xray_config" | head -1)
+            if [[ -n "${reality_privkey:-}" ]]; then
+                local keypair
+                keypair=$(xray x25519 -i "$reality_privkey" 2>/dev/null)
+                XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
+            fi
+        elif [[ "${XRAY_PUBLIC_KEY}" != "$(grep -oP '"privateKey":\s*"\K[^"]+' "$xray_config" | head -1)" ]]; then
+            :
+        else
             local keypair
             keypair=$(xray x25519 -i "$XRAY_PUBLIC_KEY" 2>/dev/null)
             XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
         fi
 
         # gRPC 域名从 nginx 配置读取
-        GRPC_DOMAIN=$(grep -oP 'server_name\s+\K\S+' \
-            /etc/nginx/conf.d/servers.conf 2>/dev/null | \
-            grep -v "^\." | sed -n '2p' | tr -d ';')
+        if [[ -z "${GRPC_DOMAIN:-}" ]]; then
+            GRPC_DOMAIN=$(grep -oP 'server_name\s+\K\S+' \
+                /etc/nginx/conf.d/servers.conf 2>/dev/null | \
+                grep -v "^\." | sed -n '2p' | tr -d ';')
+        fi
     fi
 
     # 从 sing-box config 读取参数
     if [[ -f "$sb_config" ]]; then
-        SINGBOX_PASSWORD=$(python3 -c "
+        [[ -n "${SINGBOX_PASSWORD:-}" ]] || SINGBOX_PASSWORD=$(python3 -c "
 import json
 with open('${sb_config}') as f:
     c = json.load(f)
@@ -66,7 +109,7 @@ for inb in c['inbounds']:
         break
 " 2>/dev/null || echo "")
 
-        ANYTLS_DOMAIN=$(python3 -c "
+        [[ -n "${ANYTLS_DOMAIN:-}" ]] || ANYTLS_DOMAIN=$(python3 -c "
 import json
 with open('${sb_config}') as f:
     c = json.load(f)
@@ -76,6 +119,8 @@ for inb in c['inbounds']:
         break
 " 2>/dev/null || echo "")
     fi
+
+    XHTTP_PADDING="${XHTTP_PADDING:-100-1000}"
 }
 
 # ── 获取服务器IP ─────────────────────────────────────────────
@@ -157,6 +202,10 @@ gen_anytls_url() {
         return
     fi
 
+    if [[ "${SINGBOX_PASSWORD}" =~ [#\?&] ]]; then
+        log_warn "AnyTLS 密码包含 URI 保留字符，若客户端导入失败请直接使用输出文件中的原始密码"
+    fi
+
     local password_encoded
     password_encoded=$(python3 -c "
 import urllib.parse
@@ -202,7 +251,10 @@ show_client_links() {
             cat << JSON
 {
     "enc": "packet",
-    "xPaddingBytes": "128-2048",
+    "xPaddingBytes": "${XHTTP_PADDING}",
+    "headers": {
+        "User-Agent": "chrome"
+    },
     "xmux": {
         "maxConcurrency": "4-8",
         "maxConnections": 0,

@@ -89,10 +89,24 @@ https://deb.sagernet.org/ * *" \
 generate_singbox_params() {
     log_step "生成 Sing-Box 参数..."
 
-    SINGBOX_PASSWORD=$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-20)
-    SINGBOX_PASSWORD="${SINGBOX_PASSWORD}#$(openssl rand -hex 4)"
+    local state_file="/etc/xray-deploy/config.env"
+    local saved_password
+    saved_password=$(grep "^SINGBOX_PASSWORD=" "$state_file" 2>/dev/null | \
+        cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")
+
+    if [[ -n "${saved_password}" ]]; then
+        SINGBOX_PASSWORD="${saved_password}"
+        log_info "复用已有 AnyTLS 密码"
+    else
+        SINGBOX_PASSWORD=$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-20)
+        SINGBOX_PASSWORD="${SINGBOX_PASSWORD}-$(openssl rand -hex 4)"
+        log_info "生成新 AnyTLS 密码"
+    fi
 
     log_info "AnyTLS 密码: ${SINGBOX_PASSWORD}"
+    if [[ "${SINGBOX_PASSWORD}" =~ [#\?&] ]]; then
+        log_warn "当前 AnyTLS 密码包含 URI 保留字符，部分客户端导入链接时可能需要手动填写原始密码"
+    fi
 }
 
 # ── 收集 AnyTLS 参数 ─────────────────────────────────────────
@@ -158,7 +172,6 @@ generate_singbox_config() {
     ],
     "final": "local_recursive",
     "strategy": "prefer_ipv4",
-    "independent_cache": true,
     "reverse_mapping": true
   },
   "inbounds": [
@@ -207,7 +220,7 @@ generate_singbox_config() {
       "type": "socks",
       "tag": "warp",
       "server": "127.0.0.1",
-      "server_port": 40000
+      "server_port": ${WARP_PROXY_PORT:-40000}
     }
   ],
   "route": {
@@ -232,11 +245,11 @@ generate_singbox_config() {
     "rules": [
       {
         "action": "sniff",
-        "sniffer": ["http", "tls", "quic"],
+        "sniffer": ["dns", "http", "tls", "quic"],
         "timeout": "300ms"
       },
       {
-        "port": 53,
+        "protocol": "dns",
         "action": "hijack-dns"
       },
       {

@@ -87,7 +87,7 @@ create_nginx_dirs() {
         chmod 755 "$dir"
     done
 
-    for domain in "${DIRECT_DOMAINS[@]}"; do
+    for domain in "${ALL_DOMAINS[@]}"; do
         mkdir -p "/var/www/${domain}"
         chmod 755 "/var/www/${domain}"
     done
@@ -777,7 +777,7 @@ server {
 # SNI 陷阱兜底伪装站
 # ===================================================================
 server {
-    listen 127.0.0.1:20880;
+    listen 127.0.0.1:20880 proxy_protocol;
     server_name   _;
     server_tokens off;
     access_log    off;
