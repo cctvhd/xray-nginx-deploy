@@ -559,15 +559,25 @@ CONF
 }
 
 # ── 生成 servers.conf ────────────────────────────────────────
+# ── 生成 servers.conf ────────────────────────────────────────
 generate_servers_conf() {
     log_step "生成 servers.conf..."
 
-    local conf=""
+    # 每次重新生成，先清空
+    > /etc/nginx/conf.d/servers.conf
+
+    # 提取根域名函数
+    get_root_domain() {
+        echo "$1" | awk -F. '{print $(NF-1)"."$NF}'
+    }
 
     # xhttp CDN server 块
     if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
-        local cert_path="/etc/letsencrypt/live/${XHTTP_DOMAIN}"
-        conf+=$(cat << CONF
+        local xhttp_root
+        xhttp_root=$(get_root_domain "${XHTTP_DOMAIN}")
+        local cert_path="/etc/letsencrypt/live/${xhttp_root}"
+
+        cat >> /etc/nginx/conf.d/servers.conf << CONF
 
 # ===================================================================
 # CDN ${XHTTP_DOMAIN} — xhttp
@@ -659,13 +669,15 @@ server {
     }
 }
 CONF
-)
     fi
 
     # gRPC CDN server 块
     if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        local cert_path="/etc/letsencrypt/live/${GRPC_DOMAIN}"
-        conf+=$(cat << CONF
+        local grpc_root
+        grpc_root=$(get_root_domain "${GRPC_DOMAIN}")
+        local cert_path="/etc/letsencrypt/live/${grpc_root}"
+
+        cat >> /etc/nginx/conf.d/servers.conf << CONF
 
 # ===================================================================
 # CDN ${GRPC_DOMAIN} — gRPC
@@ -743,17 +755,10 @@ server {
     }
 }
 CONF
-)
     fi
 
-    # 兜底 + SNI陷阱 + HTTP重定向
-    local all_domain_names=""
-    for domain in "${ALL_DOMAINS[@]}"; do
-        all_domain_names+=" $domain"
-    done
-
-    cat >> /dev/stdin << CONF >> /etc/nginx/conf.d/servers.conf
-${conf}
+    # 兜底 + SNI陷阱
+    cat >> /etc/nginx/conf.d/servers.conf << 'CONF'
 
 # ===================================================================
 # 兜底：SNI 不匹配拒绝握手
@@ -780,11 +785,20 @@ server {
     index         index.html;
 
     location / {
-        try_files \$uri \$uri/ /index.html;
+        try_files $uri $uri/ /index.html;
         add_header Cache-Control          "public, max-age=3600" always;
         add_header X-Content-Type-Options "nosniff" always;
     }
 }
+CONF
+
+    # HTTP 重定向（域名列表动态生成）
+    local all_domain_names=""
+    for domain in "${ALL_DOMAINS[@]}"; do
+        all_domain_names+=" ${domain}"
+    done
+
+    cat >> /etc/nginx/conf.d/servers.conf << CONF
 
 # ===================================================================
 # HTTP → HTTPS 重定向 & ACME 验证
@@ -792,7 +806,7 @@ server {
 server {
     listen 80;
     listen [::]:80;
-    server_name${all_domain_names};
+    server_name ${all_domain_names};
 
     location ^~ /.well-known/acme-challenge/ {
         root          /var/www/html;
