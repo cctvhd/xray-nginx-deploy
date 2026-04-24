@@ -322,6 +322,120 @@ init_unbound_control() {
     log_info "unbound-control 证书初始化完成"
 }
 
+# ── 安装 root.hints 更新脚本 ────────────────────────────────
+install_root_hints_updater() {
+    log_step "安装 root.hints 自动更新脚本..."
+
+    mkdir -p /usr/local/bin
+
+    cat > /usr/local/bin/update-root-hints.sh << 'SCRIPT_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_HINTS_URL="${ROOT_HINTS_URL:-https://www.internic.net/domain/named.cache}"
+DEST_FILE="/var/lib/unbound/root.hints"
+ROOT_KEY_FILE="/var/lib/unbound/root.key"
+BACKUP_DIR="/var/lib/unbound/root-hints-backup"
+MAX_BACKUPS=5
+MAX_RETRIES=3
+LOG_FILE="/var/log/unbound-root-update.log"
+MIN_ROOT_HINTS_SIZE=3000
+TIMESTAMP_FILE="/var/lib/unbound/root-update.timestamp"
+
+GREEN="\033[1;32m"; YELLOW="\033[1;33m"; RED="\033[1;31m"; NC="\033[0m"
+info()  { echo -e "${GREEN}[INFO]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+error() { echo -e "${RED}[ERR]${NC}  $*"; }
+
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+if [[ $EUID -ne 0 ]]; then
+    error "请使用 root 用户运行此脚本。"
+    exit 1
+fi
+
+mkdir -p /var/lib/unbound
+
+if [[ ! -f "$DEST_FILE" || $(stat -c%s "$DEST_FILE") -lt $MIN_ROOT_HINTS_SIZE ]]; then
+    info "初始化 root.hints..."
+    curl -fsSL "$ROOT_HINTS_URL" -o "$DEST_FILE"
+    chown unbound:unbound "$DEST_FILE"
+fi
+
+if [[ ! -f "$ROOT_KEY_FILE" || ! -s "$ROOT_KEY_FILE" ]]; then
+    info "生成 root.key..."
+    unbound-anchor -a "$ROOT_KEY_FILE"
+    chown unbound:unbound "$ROOT_KEY_FILE"
+fi
+
+mkdir -p "$BACKUP_DIR"
+TS=$(date +"%Y%m%d-%H%M%S")
+cp "$DEST_FILE" "$BACKUP_DIR/root.hints.$TS"
+info "已备份 root.hints → $BACKUP_DIR/root.hints.$TS"
+ls -1t "$BACKUP_DIR"/root.hints.* 2>/dev/null | \
+    tail -n +$((MAX_BACKUPS+1)) | xargs -r rm -f
+
+info "下载最新 root.hints..."
+for i in $(seq 1 $MAX_RETRIES); do
+    if curl -fsSL "$ROOT_HINTS_URL" -o "$DEST_FILE.new"; then
+        mv "$DEST_FILE.new" "$DEST_FILE"
+        chown unbound:unbound "$DEST_FILE"
+        info "root.hints 更新成功"
+        echo "$(date)" > "$TIMESTAMP_FILE"
+        break
+    else
+        warn "下载失败，尝试 $i/${MAX_RETRIES}"
+        sleep 2
+    fi
+done
+
+info "校验 Unbound 配置..."
+if ! unbound-checkconf >/dev/null 2>&1; then
+    error "配置错误！恢复旧文件..."
+    cp "$BACKUP_DIR/root.hints.$TS" "$DEST_FILE"
+    exit 1
+fi
+
+info "测试 Unbound 查询..."
+if ! dig @127.0.0.1 . NS +time=1 +retry=1 >/dev/null 2>&1; then
+    warn "Unbound 查询不正常，但仍尝试重启..."
+fi
+
+info "重启 unbound..."
+systemctl restart unbound
+
+if systemctl is-active --quiet unbound; then
+    info "Unbound 重启成功！"
+else
+    error "Unbound 重启失败！恢复旧文件..."
+    cp "$BACKUP_DIR/root.hints.$TS" "$DEST_FILE"
+    systemctl restart unbound || true
+    exit 1
+fi
+
+info "✅ Root.hints 更新完成"
+SCRIPT_EOF
+
+    chmod +x /usr/local/bin/update-root-hints.sh
+    log_info "root.hints 更新脚本已安装: /usr/local/bin/update-root-hints.sh"
+}
+
+# ── 配置 root.hints 自动更新任务 ────────────────────────────
+setup_root_hints_updater() {
+    log_step "配置 root.hints 自动更新任务..."
+
+    cat > /etc/cron.weekly/update-root-hints << 'CRON_EOF'
+#!/usr/bin/env bash
+/usr/local/bin/update-root-hints.sh
+CRON_EOF
+    chmod +x /etc/cron.weekly/update-root-hints
+
+    (crontab -l 2>/dev/null | grep -v "update-root-hints.sh"; \
+     echo "17 4 * * 0 /usr/local/bin/update-root-hints.sh >/dev/null 2>&1") | crontab -
+
+    log_info "已配置每周自动更新 root.hints"
+}
+
 # ── 配置 resolv.conf ─────────────────────────────────────────
 setup_resolv_conf() {
     log_step "配置 /etc/resolv.conf..."
@@ -415,6 +529,8 @@ run_unbound() {
                 init_trust_anchor
                 generate_unbound_config
                 init_unbound_control
+                install_root_hints_updater
+                setup_root_hints_updater
                 setup_resolv_conf
                 systemctl restart unbound
                 sleep 2
@@ -435,6 +551,8 @@ run_unbound() {
                 init_trust_anchor
                 generate_unbound_config
                 init_unbound_control
+                install_root_hints_updater
+                setup_root_hints_updater
                 setup_resolv_conf
                 start_unbound
                 verify_unbound
@@ -448,6 +566,8 @@ run_unbound() {
         init_trust_anchor
         generate_unbound_config
         init_unbound_control
+        install_root_hints_updater
+        setup_root_hints_updater
         setup_resolv_conf
         start_unbound
         verify_unbound

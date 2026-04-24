@@ -397,6 +397,8 @@ do_inst_unbound() {
 
     # 只执行安装，不生成配置
     install_unbound
+    install_root_hints_updater
+    setup_root_hints_updater
 
     save_state "INST_UNBOUND" "1"
 
