@@ -528,8 +528,15 @@ do_conf_nginx() {
     load_os_info
     restore_domain_arrays
 
-    # 同步 XHTTP_PATH
+    # 方案A：XHTTP_PATH 为空时先生成并保存，后续复用
     XHTTP_PATH=$(get_state "XHTTP_PATH")
+    if [[ -z "${XHTTP_PATH}" ]]; then
+        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        save_state "XHTTP_PATH" "${XHTTP_PATH}"
+        log_info "生成 XHTTP_PATH: ${XHTTP_PATH}"
+    else
+        log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
+    fi
 
     load_module nginx
     generate_fallback_conf
@@ -564,6 +571,13 @@ do_conf_xray() {
     XRAY_WINDOW_CLAMP=$(get_state "XRAY_WINDOW_CLAMP" "1200")
 
     load_module xray
+    # 复用已有 XHTTP_PATH，不重新生成
+    local saved_path
+    saved_path=$(get_state "XHTTP_PATH")
+    if [[ -n "${saved_path}" ]]; then
+        XHTTP_PATH="${saved_path}"
+        log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
+    fi
     generate_xray_params
     collect_reality_params
     generate_xray_config

@@ -27,18 +27,49 @@ install_xray() {
 # ── 生成随机参数 ─────────────────────────────────────────────
 generate_xray_params() {
     log_step "生成 Xray 随机参数..."
+    local state_file="/etc/xray-deploy/config.env"
 
-    # UUID
-    XRAY_UUID=$(xray uuid)
+    # UUID：已有则复用
+    local saved_uuid
+    saved_uuid=$(grep "^XRAY_UUID=" "$state_file" 2>/dev/null | \
+        cut -d= -f2 | tr -d "'\"")
+    if [[ -n "${saved_uuid}" ]]; then
+        XRAY_UUID="${saved_uuid}"
+        log_info "复用已有 UUID: ${XRAY_UUID}"
+    else
+        XRAY_UUID=$(xray uuid)
+        log_info "生成新 UUID: ${XRAY_UUID}"
+    fi
 
-    # x25519 密钥对
-    local keypair
-    keypair=$(xray x25519)
-    XRAY_PRIVATE_KEY=$(echo "$keypair" | grep -i "private" | awk '{print $NF}')
-    XRAY_PUBLIC_KEY=$(echo "$keypair"  | grep -i "public\|password" | awk '{print $NF}')
+    # x25519 密钥对：已有则复用
+    local saved_privkey
+    saved_privkey=$(grep "^XRAY_PRIVATE_KEY=" "$state_file" 2>/dev/null | \
+        cut -d= -f2 | tr -d "'\"")
+    if [[ -n "${saved_privkey}" ]]; then
+        XRAY_PRIVATE_KEY="${saved_privkey}"
+        XRAY_PUBLIC_KEY=$(grep "^XRAY_PUBLIC_KEY=" "$state_file" 2>/dev/null | \
+            cut -d= -f2 | tr -d "'\"")
+        log_info "复用已有密钥对"
+    else
+        local keypair
+        keypair=$(xray x25519)
+        XRAY_PRIVATE_KEY=$(echo "$keypair" | grep -i "private" | awk '{print $NF}')
+        XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | \
+            awk '{print $NF}')
+        log_info "生成新密钥对"
+    fi
 
-    # xhttp path（随机32位hex）
-    XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+    # xhttp path：已有则复用，没有才生成
+    local saved_path
+    saved_path=$(grep "^XHTTP_PATH=" "$state_file" 2>/dev/null | \
+        cut -d= -f2 | tr -d "'\"")
+    if [[ -n "${saved_path}" ]]; then
+        XHTTP_PATH="${saved_path}"
+        log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
+    else
+        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        log_info "生成新 XHTTP_PATH: ${XHTTP_PATH}"
+    fi
 
     # Reality shortIds
     REALITY_SHORT_IDS=(
