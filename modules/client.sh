@@ -51,7 +51,7 @@ for inb in c['inbounds']:
         # gRPC 域名从 nginx 配置读取
         GRPC_DOMAIN=$(grep -oP 'server_name\s+\K\S+' \
             /etc/nginx/conf.d/servers.conf 2>/dev/null | \
-            grep -v "^\." | sed -n '2p')
+            grep -v "^\." | sed -n '2p' | tr -d ';')
     fi
 
     # 从 sing-box config 读取参数
@@ -157,7 +157,13 @@ gen_anytls_url() {
         return
     fi
 
-    ANYTLS_URL="anytls://${SINGBOX_PASSWORD}@${ANYTLS_DOMAIN}:443?\
+    local password_encoded
+    password_encoded=$(python3 -c "
+import urllib.parse
+print(urllib.parse.quote('${SINGBOX_PASSWORD}', safe=''))
+" 2>/dev/null || echo "${SINGBOX_PASSWORD}")
+
+    ANYTLS_URL="anytls://${password_encoded}@${ANYTLS_DOMAIN}:443?\
 security=tls\
 &sni=${ANYTLS_DOMAIN}\
 &alpn=h2\
