@@ -101,6 +101,50 @@ upgrade_kernel() {
     exit 0
 }
 
+# ── 硬件参数归一化辅助 ───────────────────────────────────────
+is_decimal_number() {
+    [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
+}
+
+parse_memory_gb_to_mb() {
+    local value="${1,,}"
+
+    value="${value// /}"
+    value="${value%gb}"
+    value="${value%g}"
+
+    is_decimal_number "$value" || return 1
+
+    awk -v v="$value" 'BEGIN {
+        mb = int(v * 1024 + 0.5)
+        if (mb < 1024) {
+            exit 1
+        }
+        print mb
+    }'
+}
+
+parse_bandwidth_to_mbps() {
+    local value="${1,,}"
+    local number unit
+
+    value="${value// /}"
+    if [[ "$value" =~ ^([0-9]+([.][0-9]+)?)([gm])(b)?$ ]]; then
+        number="${BASH_REMATCH[1]}"
+        unit="${BASH_REMATCH[3]}"
+    else
+        return 1
+    fi
+
+    awk -v v="$number" -v u="$unit" 'BEGIN {
+        if (u == "g") {
+            print int(v * 1000 + 0.5)
+        } else {
+            print int(v + 0.5)
+        }
+    }'
+}
+
 # ── 1.2 询问硬件配置 ─────────────────────────────────────────
 collect_hardware_info() {
     echo ""
@@ -118,22 +162,27 @@ collect_hardware_info() {
     done
 
     # 内存大小
-    read -rp "内存大小 GB [如: 1, 2, 4, 8, 16]: " HW_MEM_GB
-    while ! [[ "$HW_MEM_GB" =~ ^[0-9]+$ ]] || \
-          [[ "$HW_MEM_GB" -lt 1 ]]; do
-        log_warn "请输入有效的内存大小"
+    read -rp "内存大小 GB [如: 1, 2, 2.5, 4, 8]: " HW_MEM_GB
+    while ! parse_memory_gb_to_mb "$HW_MEM_GB" >/dev/null; do
+        log_warn "请输入有效的内存大小，支持 2.5 或 2.5GB"
         read -rp "内存大小 GB: " HW_MEM_GB
     done
+    HW_MEM_GB="${HW_MEM_GB,,}"
+    HW_MEM_GB="${HW_MEM_GB// /}"
+    HW_MEM_GB="${HW_MEM_GB%gb}"
+    HW_MEM_GB="${HW_MEM_GB%g}"
 
     # 网口带宽
-    echo "网口带宽 [如: 100m, 500m, 1g, 10g, 40g]"
+    echo "网口带宽 [如: 100m, 500m, 1g, 2.5g, 10g]"
     read -rp "网口带宽: " HW_BANDWIDTH
     HW_BANDWIDTH="${HW_BANDWIDTH,,}"
-    while [[ -z "$HW_BANDWIDTH" ]]; do
-        log_warn "请输入带宽"
+    while ! parse_bandwidth_to_mbps "$HW_BANDWIDTH" >/dev/null; do
+        log_warn "请输入有效的带宽，支持 2500m / 2.5g / 10g"
         read -rp "网口带宽: " HW_BANDWIDTH
         HW_BANDWIDTH="${HW_BANDWIDTH,,}"
     done
+    HW_BANDWIDTH="${HW_BANDWIDTH// /}"
+    HW_BANDWIDTH="${HW_BANDWIDTH%b}"
 
     # 双栈
     read -rp "是否支持 IPv6 双栈？[y/N]: " hw_ipv6
@@ -167,15 +216,8 @@ collect_hardware_info() {
 
 # ── 根据带宽计算网络参数 ─────────────────────────────────────
 calc_net_params() {
-    # 解析带宽单位
-    local bw="${HW_BANDWIDTH}"
-    local bw_mbps=1000
-
-    if [[ "$bw" == *"g" ]]; then
-        bw_mbps=$(( ${bw%g} * 1000 ))
-    elif [[ "$bw" == *"m" ]]; then
-        bw_mbps=${bw%m}
-    fi
+    local bw_mbps
+    bw_mbps=$(parse_bandwidth_to_mbps "${HW_BANDWIDTH}") || bw_mbps=1000
 
     # 根据带宽计算缓冲区上限
     # TCP 继续按带宽分档；同时为 QUIC/Hysteria2 保留 16MB 的低档位下限
@@ -205,22 +247,24 @@ calc_net_params() {
 
 # ── 根据内存与 CPU 计算系统参数 ──────────────────────────────
 calc_mem_params() {
-    local mem_gb="${HW_MEM_GB}"
     local cpu_cores="${HW_CPU_CORES:-1}"
+    local mem_mb
 
-    if [[ $mem_gb -ge 8 ]]; then
+    mem_mb=$(parse_memory_gb_to_mb "${HW_MEM_GB}") || mem_mb=2048
+
+    if [[ $mem_mb -ge 8192 ]]; then
         SYSCTL_SOMAXCONN=32768
         SYSCTL_NETDEV_BACKLOG=32768
         SYSCTL_NF_CONNTRACK=1048576
         SYSCTL_TCP_MAX_TW_BUCKETS=1048576
         NOFILE_LIMIT=1048576
-    elif [[ $mem_gb -ge 4 ]]; then
+    elif [[ $mem_mb -ge 4096 ]]; then
         SYSCTL_SOMAXCONN=16384
         SYSCTL_NETDEV_BACKLOG=16384
         SYSCTL_NF_CONNTRACK=524288
         SYSCTL_TCP_MAX_TW_BUCKETS=524288
         NOFILE_LIMIT=524288
-    elif [[ $mem_gb -ge 2 ]]; then
+    elif [[ $mem_mb -ge 2048 ]]; then
         SYSCTL_SOMAXCONN=8192
         SYSCTL_NETDEV_BACKLOG=8192
         SYSCTL_NF_CONNTRACK=262144
