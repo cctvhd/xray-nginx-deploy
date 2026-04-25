@@ -181,12 +181,11 @@ calc_net_params() {
     # TCP 继续按带宽分档；同时为 QUIC/Hysteria2 保留 16MB 的低档位下限
     if [[ $bw_mbps -ge 10000 ]]; then
         # 10G+
-        NET_CORE_RMEM_MAX=67108864   # 64MB
-        NET_CORE_WMEM_MAX=67108864
-        NET_RMEM="4096 87380 67108864"
-        NET_WMEM="4096 65536 67108864"
+        NET_CORE_RMEM_MAX=33554432   # 32MB
+        NET_CORE_WMEM_MAX=33554432
+        NET_RMEM="4096 87380 33554432"
+        NET_WMEM="4096 65536 33554432"
         XRAY_PADDING="100-1000"
-        XRAY_WINDOW_CLAMP=0
     elif [[ $bw_mbps -ge 1000 ]]; then
         # 1G
         NET_CORE_RMEM_MAX=16777216   # 16MB
@@ -194,7 +193,6 @@ calc_net_params() {
         NET_RMEM="4096 87380 16777216"
         NET_WMEM="4096 65536 16777216"
         XRAY_PADDING="100-1000"
-        XRAY_WINDOW_CLAMP=1200
     else
         # 100M 及以下
         NET_CORE_RMEM_MAX=16777216   # 16MB, 兼顾 QUIC/Hysteria2 的缓冲区下限
@@ -202,39 +200,59 @@ calc_net_params() {
         NET_RMEM="4096 87380 8388608"
         NET_WMEM="4096 65536 8388608"
         XRAY_PADDING="100-1000"
-        XRAY_WINDOW_CLAMP=600
     fi
 }
 
-# ── 根据内存计算系统参数 ─────────────────────────────────────
+# ── 根据内存与 CPU 计算系统参数 ──────────────────────────────
 calc_mem_params() {
     local mem_gb="${HW_MEM_GB}"
+    local cpu_cores="${HW_CPU_CORES:-1}"
 
     if [[ $mem_gb -ge 8 ]]; then
-        SYSCTL_SOMAXCONN=65535
-        SYSCTL_NETDEV_BACKLOG=65536
-        SYSCTL_NF_CONNTRACK=2000000
-        SYSCTL_TCP_MAX_TW_BUCKETS=2000000
-        NOFILE_LIMIT=1048576
-    elif [[ $mem_gb -ge 4 ]]; then
         SYSCTL_SOMAXCONN=32768
         SYSCTL_NETDEV_BACKLOG=32768
-        SYSCTL_NF_CONNTRACK=1000000
-        SYSCTL_TCP_MAX_TW_BUCKETS=1000000
+        SYSCTL_NF_CONNTRACK=1048576
+        SYSCTL_TCP_MAX_TW_BUCKETS=1048576
         NOFILE_LIMIT=1048576
-    elif [[ $mem_gb -ge 2 ]]; then
+    elif [[ $mem_gb -ge 4 ]]; then
         SYSCTL_SOMAXCONN=16384
         SYSCTL_NETDEV_BACKLOG=16384
-        SYSCTL_NF_CONNTRACK=500000
-        SYSCTL_TCP_MAX_TW_BUCKETS=500000
+        SYSCTL_NF_CONNTRACK=524288
+        SYSCTL_TCP_MAX_TW_BUCKETS=524288
         NOFILE_LIMIT=524288
-    else
-        # 1GB 及以下
+    elif [[ $mem_gb -ge 2 ]]; then
         SYSCTL_SOMAXCONN=8192
         SYSCTL_NETDEV_BACKLOG=8192
         SYSCTL_NF_CONNTRACK=262144
         SYSCTL_TCP_MAX_TW_BUCKETS=262144
         NOFILE_LIMIT=262144
+    else
+        # 1GB 及以下
+        SYSCTL_SOMAXCONN=4096
+        SYSCTL_NETDEV_BACKLOG=4096
+        SYSCTL_NF_CONNTRACK=131072
+        SYSCTL_TCP_MAX_TW_BUCKETS=131072
+        NOFILE_LIMIT=131072
+    fi
+
+    # 小核机器优先稳妥，避免把连接队列和 conntrack 撑得过大
+    if [[ $cpu_cores -le 1 ]]; then
+        (( SYSCTL_SOMAXCONN > 8192 )) && SYSCTL_SOMAXCONN=8192
+        (( SYSCTL_NETDEV_BACKLOG > 8192 )) && SYSCTL_NETDEV_BACKLOG=8192
+        (( SYSCTL_NF_CONNTRACK > 262144 )) && SYSCTL_NF_CONNTRACK=262144
+        (( SYSCTL_TCP_MAX_TW_BUCKETS > 262144 )) && SYSCTL_TCP_MAX_TW_BUCKETS=262144
+        (( NOFILE_LIMIT > 262144 )) && NOFILE_LIMIT=262144
+    elif [[ $cpu_cores -le 2 ]]; then
+        (( SYSCTL_SOMAXCONN > 16384 )) && SYSCTL_SOMAXCONN=16384
+        (( SYSCTL_NETDEV_BACKLOG > 16384 )) && SYSCTL_NETDEV_BACKLOG=16384
+        (( SYSCTL_NF_CONNTRACK > 524288 )) && SYSCTL_NF_CONNTRACK=524288
+        (( SYSCTL_TCP_MAX_TW_BUCKETS > 524288 )) && SYSCTL_TCP_MAX_TW_BUCKETS=524288
+        (( NOFILE_LIMIT > 524288 )) && NOFILE_LIMIT=524288
+    elif [[ $cpu_cores -le 4 ]]; then
+        (( SYSCTL_SOMAXCONN > 32768 )) && SYSCTL_SOMAXCONN=32768
+        (( SYSCTL_NETDEV_BACKLOG > 32768 )) && SYSCTL_NETDEV_BACKLOG=32768
+        (( SYSCTL_NF_CONNTRACK > 1048576 )) && SYSCTL_NF_CONNTRACK=1048576
+        (( SYSCTL_TCP_MAX_TW_BUCKETS > 1048576 )) && SYSCTL_TCP_MAX_TW_BUCKETS=1048576
     fi
 
     FILE_MAX_LIMIT=$(( NOFILE_LIMIT * 2 ))
@@ -383,7 +401,6 @@ net.ipv4.tcp_syncookies             = 1
 net.ipv4.tcp_fastopen               = 3
 net.ipv4.tcp_mtu_probing            = 1
 net.ipv4.tcp_slow_start_after_idle  = 0
-net.ipv4.tcp_notsent_lowat          = 16384
 net.ipv4.tcp_keepalive_time         = 300
 net.ipv4.tcp_keepalive_intvl        = 30
 net.ipv4.tcp_keepalive_probes       = 3

@@ -85,7 +85,6 @@ HW_DISK_TYPE=''
 
 # xray 网络参数（由 system 模块计算）
 XRAY_PADDING=''
-XRAY_WINDOW_CLAMP=''
 
 # 域名信息（由 cert 模块写入）
 XHTTP_DOMAIN=''
@@ -146,7 +145,6 @@ ENV
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XRAY_PADDING=$(get_state "XRAY_PADDING")
-    XRAY_WINDOW_CLAMP=$(get_state "XRAY_WINDOW_CLAMP")
     WARP_PROXY_PORT=$(get_state "WARP_PROXY_PORT" "40000")
 }
 
@@ -371,7 +369,6 @@ do_inst_system() {
     save_state "HW_DUAL_STACK"   "$HW_DUAL_STACK"
     save_state "HW_DISK_TYPE"    "$HW_DISK_TYPE"
     save_state "XRAY_PADDING"    "${XRAY_PADDING:-128-2048}"
-    save_state "XRAY_WINDOW_CLAMP" "${XRAY_WINDOW_CLAMP:-1200}"
     save_state "INST_SYSTEM"     "1"
 
     done_return
@@ -589,7 +586,6 @@ do_conf_xray() {
 
     # 读取硬件相关参数
     XRAY_PADDING=$(get_state "XRAY_PADDING" "128-2048")
-    XRAY_WINDOW_CLAMP=$(get_state "XRAY_WINDOW_CLAMP" "1200")
 
     load_module xray
     # 复用已有 XHTTP_PATH，不重新生成
@@ -700,7 +696,6 @@ do_full_install() {
     save_state "HW_DUAL_STACK"     "$HW_DUAL_STACK"
     save_state "HW_DISK_TYPE"      "$HW_DISK_TYPE"
     save_state "XRAY_PADDING"      "${XRAY_PADDING:-128-2048}"
-    save_state "XRAY_WINDOW_CLAMP" "${XRAY_WINDOW_CLAMP:-1200}"
     save_state "INST_SYSTEM"       "1"
 
     # Unbound 只安装不配置
