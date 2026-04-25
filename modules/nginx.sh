@@ -441,6 +441,9 @@ generate_nginx_conf() {
     local cpu_cores
     cpu_cores=$(nproc)
 
+    local worker_processes="auto"
+    [[ $cpu_cores -eq 1 ]] && worker_processes="1"
+
     local mem_gb
     mem_gb=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
 
@@ -459,7 +462,7 @@ generate_nginx_conf() {
 # CPU: ${cpu_cores}核 | 内存: ${mem_gb}GB
 # ============================================================
 user nginx;
-worker_processes auto;
+worker_processes ${worker_processes};
 worker_rlimit_nofile 200000;
 worker_cpu_affinity auto;
 error_log /var/log/nginx/error.log warn;
@@ -501,7 +504,7 @@ http {
         default 0;
     }
 
-    access_log /var/log/nginx/access.log main buffer=128k flush=10s if=\$do_log;
+    access_log /var/log/nginx/access.log main buffer=32k flush=10s if=\$do_log;
 
     sendfile    on;
     tcp_nopush  on;
@@ -512,7 +515,7 @@ http {
 
     client_max_body_size        0;
     client_body_timeout         7200s;
-    client_header_timeout       300s;
+    client_header_timeout       60s;
     client_body_buffer_size     1m;
     client_header_buffer_size   8k;
     large_client_header_buffers 8 32k;
@@ -548,15 +551,7 @@ http {
     open_file_cache_min_uses 1;
     open_file_cache_errors   on;
 
-    gzip            on;
-    gzip_vary       on;
-    gzip_comp_level 2;
-    gzip_min_length 1000;
-    gzip_proxied    any;
-    gzip_types      text/plain text/css application/json application/javascript
-                    text/xml application/xml application/xml+rss text/javascript
-                    image/svg+xml;
-    gzip_disable    "msie6";
+    gzip off;
 
     limit_req_zone  \$final_real_ip zone=websocket:20m rate=2000r/s;
     limit_req_zone  \$final_real_ip zone=api:20m      rate=3000r/s;
@@ -670,6 +665,13 @@ server {
     server_name   _;
     access_log    off;
     server_tokens off;
+    gzip          on;
+    gzip_vary     on;
+    gzip_comp_level 2;
+    gzip_min_length 1000;
+    gzip_types    text/plain text/css application/json application/javascript
+                  text/xml application/xml application/xml+rss text/javascript
+                  image/svg+xml;
 
     location ${XHTTP_PATH} {
         gzip off;
@@ -740,6 +742,13 @@ server {
     listen 127.0.0.1:20443 ssl proxy_protocol;
     http2  on;
     server_name ${XHTTP_DOMAIN};
+    gzip   on;
+    gzip_vary       on;
+    gzip_comp_level 2;
+    gzip_min_length 1000;
+    gzip_types      text/plain text/css application/json application/javascript
+                    text/xml application/xml application/xml+rss text/javascript
+                    image/svg+xml;
 
     ssl_certificate     ${cert_path}/fullchain.pem;
     ssl_certificate_key ${cert_path}/privkey.pem;
@@ -840,6 +849,13 @@ server {
     listen 127.0.0.1:20445 ssl proxy_protocol;
     http2  on;
     server_name ${GRPC_DOMAIN};
+    gzip   on;
+    gzip_vary       on;
+    gzip_comp_level 2;
+    gzip_min_length 1000;
+    gzip_types      text/plain text/css application/json application/javascript
+                    text/xml application/xml application/xml+rss text/javascript
+                    image/svg+xml;
 
     ssl_certificate     ${cert_path}/fullchain.pem;
     ssl_certificate_key ${cert_path}/privkey.pem;
@@ -935,6 +951,13 @@ server {
     server_name   _;
     server_tokens off;
     access_log    off;
+    gzip          on;
+    gzip_vary     on;
+    gzip_comp_level 2;
+    gzip_min_length 1000;
+    gzip_types    text/plain text/css application/json application/javascript
+                  text/xml application/xml application/xml+rss text/javascript
+                  image/svg+xml;
     root          /var/www/html;
     index         index.html;
 

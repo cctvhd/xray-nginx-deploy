@@ -140,11 +140,9 @@ generate_xray_config() {
             ;;
     esac
 
-    local window_clamp="${XRAY_WINDOW_CLAMP:-1200}"
     local user_timeout=30000
 
     XRAY_PADDING="${x_padding}"
-    XRAY_WINDOW_CLAMP="${window_clamp}"
 
     # 构建 Reality serverNames JSON 数组
     local sn_json=""
@@ -274,8 +272,10 @@ generate_xray_config() {
                 "network": "grpc",
                 "security": "none",
                 "grpcSettings": {
-                    "serviceName": "grpc.Service",
-                    "multiMode": true
+                    "serviceName":          "grpc.Service",
+                    "multiMode":            true,
+                    "idle_timeout":         60,
+                    "health_check_timeout": 20
                 }
             },
             "sniffing": {
