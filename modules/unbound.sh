@@ -410,7 +410,7 @@ ${ipv6_interface_lines}}
     directory: "/etc/unbound"
     chroot: ""
     pidfile: "/run/unbound.pid"
-    use-systemd: yes
+    do-daemonize: no
     module-config: "validator iterator"
 
     local-zone: "localhost." static
@@ -585,7 +585,13 @@ setup_resolv_conf() {
     log_step "配置 /etc/resolv.conf..."
 
     local stack_mode
+    local resolver_addr
     stack_mode=$(get_stack_mode)
+    if [[ "$stack_mode" == "ipv6" ]]; then
+        resolver_addr="::1"
+    else
+        resolver_addr="127.0.0.1"
+    fi
 
     chattr -i /etc/resolv.conf 2>/dev/null || true
 
@@ -596,13 +602,12 @@ setup_resolv_conf() {
 
     cat > /etc/resolv.conf << RESOLV_EOF
 # 本地 Unbound 递归 DNS
-nameserver 127.0.0.1
-$( [[ "$stack_mode" == "dual" || "$stack_mode" == "ipv6" ]] && echo 'nameserver ::1' )
-options ndots:3 timeout:2 attempts:3
+nameserver ${resolver_addr}
+options ndots:1 timeout:2 attempts:2
 RESOLV_EOF
 
     chattr +i /etc/resolv.conf 2>/dev/null || true
-    log_info "/etc/resolv.conf 配置完成并已锁定（网络栈: ${stack_mode}）"
+    log_info "/etc/resolv.conf 配置完成并已锁定（网络栈: ${stack_mode}，解析器: ${resolver_addr}）"
 }
 
 # ── 启动 Unbound ─────────────────────────────────────────────
