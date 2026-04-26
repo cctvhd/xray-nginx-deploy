@@ -27,6 +27,54 @@ get_stack_mode() {
     esac
 }
 
+detect_unbound_stack_mode() {
+    local has_v4=0 has_v6=0
+
+    ip -o -4 addr show scope global 2>/dev/null | grep -q . && has_v4=1 || true
+    ip -o -6 addr show scope global 2>/dev/null | grep -v ' fe80:' | grep -q . && has_v6=1 || true
+
+    if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then
+        echo "dual"
+    elif [[ $has_v6 -eq 1 ]]; then
+        echo "ipv6"
+    else
+        echo "ipv4"
+    fi
+}
+
+collect_unbound_stack_mode() {
+    local detected_stack default_stack stack_choice default_choice
+
+    detected_stack=$(detect_unbound_stack_mode)
+    default_stack=$(get_stack_mode)
+    [[ -z "${HW_DUAL_STACK:-}" ]] && default_stack="$detected_stack"
+
+    echo "网络栈类型："
+    echo "  1. 双栈 IPv4 + IPv6"
+    echo "  2. 单栈 IPv4"
+    echo "  3. 单栈 IPv6"
+    case "$detected_stack" in
+        dual) log_info "自动检测建议: 双栈 IPv4 + IPv6" ;;
+        ipv6) log_info "自动检测建议: 单栈 IPv6" ;;
+        *)    log_info "自动检测建议: 单栈 IPv4" ;;
+    esac
+
+    case "$default_stack" in
+        dual) default_choice="1" ;;
+        ipv6) default_choice="3" ;;
+        *)    default_choice="2" ;;
+    esac
+
+    read -rp "请选择 [1-3，默认${default_choice}]: " stack_choice
+    case "${stack_choice:-$default_choice}" in
+        1) HW_DUAL_STACK="dual" ;;
+        3) HW_DUAL_STACK="ipv6" ;;
+        *) HW_DUAL_STACK="ipv4" ;;
+    esac
+
+    log_info "Unbound 网络栈模式: ${HW_DUAL_STACK}"
+}
+
 # ── 安装 Unbound ─────────────────────────────────────────────
 install_unbound() {
     log_step "安装 Unbound..."
@@ -651,6 +699,7 @@ run_unbound() {
                 ;;
             2)
                 # 只更新配置
+                collect_unbound_stack_mode
                 collect_unbound_service_name
                 disable_systemd_resolved
                 download_root_hints
@@ -673,6 +722,7 @@ run_unbound() {
                 ;;
             3)
                 # 完整重装
+                collect_unbound_stack_mode
                 collect_unbound_service_name
                 install_unbound
                 disable_systemd_resolved
@@ -689,6 +739,7 @@ run_unbound() {
         esac
     else
         # 未安装，走完整安装流程
+        collect_unbound_stack_mode
         collect_unbound_service_name
         install_unbound
         disable_systemd_resolved

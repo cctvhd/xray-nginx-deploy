@@ -384,6 +384,7 @@ do_inst_unbound() {
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
     run_unbound
 
+    save_state "HW_DUAL_STACK" "${HW_DUAL_STACK:-}"
     save_state "UNBOUND_SERVICE_NAME" "${UNBOUND_SERVICE_NAME:-}"
     save_state "INST_UNBOUND" "1"
     done_return
@@ -691,6 +692,7 @@ do_full_install() {
     restore_domain_arrays
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
     run_unbound
+    save_state "HW_DUAL_STACK" "${HW_DUAL_STACK:-}"
     save_state "UNBOUND_SERVICE_NAME" "${UNBOUND_SERVICE_NAME:-}"
     save_state "INST_UNBOUND" "1"
     log_info "Unbound 已完成安装与配置"
