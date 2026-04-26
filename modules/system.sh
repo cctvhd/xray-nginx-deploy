@@ -249,10 +249,8 @@ calc_net_params() {
 calc_mem_params() {
     local cpu_cores="${HW_CPU_CORES:-1}"
     local mem_mb
-    local bw_mbps
 
     mem_mb=$(parse_memory_gb_to_mb "${HW_MEM_GB}") || mem_mb=2048
-    bw_mbps=$(parse_bandwidth_to_mbps "${HW_BANDWIDTH}") || bw_mbps=1000
 
     if [[ $mem_mb -ge 8192 ]]; then
         SYSCTL_SOMAXCONN=32768
@@ -299,15 +297,6 @@ calc_mem_params() {
         (( SYSCTL_NETDEV_BACKLOG > 32768 )) && SYSCTL_NETDEV_BACKLOG=32768
         (( SYSCTL_NF_CONNTRACK > 1048576 )) && SYSCTL_NF_CONNTRACK=1048576
         (( SYSCTL_TCP_MAX_TW_BUCKETS > 1048576 )) && SYSCTL_TCP_MAX_TW_BUCKETS=1048576
-    fi
-
-    # 新硬件高带宽小内存机器，适当放大连接容量上限
-    if [[ $cpu_cores -ge 4 && $mem_mb -ge 2048 && $bw_mbps -ge 10000 ]]; then
-        (( SYSCTL_SOMAXCONN < 16384 )) && SYSCTL_SOMAXCONN=16384
-        (( SYSCTL_NETDEV_BACKLOG < 16384 )) && SYSCTL_NETDEV_BACKLOG=16384
-        (( SYSCTL_NF_CONNTRACK < 524288 )) && SYSCTL_NF_CONNTRACK=524288
-        (( SYSCTL_TCP_MAX_TW_BUCKETS < 524288 )) && SYSCTL_TCP_MAX_TW_BUCKETS=524288
-        (( NOFILE_LIMIT < 524288 )) && NOFILE_LIMIT=524288
     fi
 
     FILE_MAX_LIMIT=$(( NOFILE_LIMIT * 2 ))
