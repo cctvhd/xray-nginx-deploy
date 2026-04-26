@@ -141,6 +141,86 @@ init_trust_anchor() {
     log_info "DNSSEC trust anchor 初始化完成"
 }
 
+# ── 服务名称与配置路径 ───────────────────────────────────────
+sanitize_unbound_service_name() {
+    local value="${1:-}"
+    value=$(echo "${value,,}" | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')
+    [[ -n "$value" ]] || value="$(hostname -s 2>/dev/null || echo unbound)"
+    echo "$value"
+}
+
+infer_unbound_service_name() {
+    local candidate="${UNBOUND_SERVICE_NAME:-}"
+    if [[ -z "$candidate" ]]; then
+        candidate="$(hostname -s 2>/dev/null || echo unbound)"
+    fi
+    sanitize_unbound_service_name "$candidate"
+}
+
+collect_unbound_service_name() {
+    local default_name input
+    default_name=$(infer_unbound_service_name)
+    read -rp "Unbound 服务名称（用于配置文件名，默认 ${default_name}）: " input
+    UNBOUND_SERVICE_NAME=$(sanitize_unbound_service_name "${input:-$default_name}")
+    log_info "Unbound 服务配置文件名: ${UNBOUND_SERVICE_NAME}.conf"
+}
+
+get_unbound_conf_dir() {
+    case "$OS_ID" in
+        ubuntu|debian)
+            echo "/etc/unbound/unbound.conf.d"
+            ;;
+        centos|rhel|rocky|almalinux)
+            echo "/etc/unbound/conf.d"
+            ;;
+    esac
+}
+
+ensure_unbound_include_dir() {
+    local conf_dir main_conf
+    conf_dir=$(get_unbound_conf_dir)
+    mkdir -p "$conf_dir"
+
+    if [[ "$OS_ID" =~ ^(ubuntu|debian)$ ]]; then
+        main_conf="/etc/unbound/unbound.conf"
+        if [[ -f "$main_conf" ]] && ! grep -q 'unbound\.conf\.d/\*\.conf' "$main_conf"; then
+            echo 'include: "/etc/unbound/unbound.conf.d/*.conf"' >> "$main_conf"
+        fi
+    fi
+}
+
+build_unbound_transparent_zones() {
+    local extra_domains=()
+    local -A seen=()
+    local domain root
+
+    if declare -p ALL_DOMAINS >/dev/null 2>&1; then
+        extra_domains=("${ALL_DOMAINS[@]}")
+    fi
+
+    for domain in \
+        "${XHTTP_DOMAIN:-}" \
+        "${GRPC_DOMAIN:-}" \
+        "${REALITY_DOMAIN:-}" \
+        "${ANYTLS_DOMAIN:-}" \
+        "${extra_domains[@]}"; do
+        [[ -n "$domain" ]] || continue
+        domain="${domain%.}"
+        domain="${domain,,}"
+
+        if [[ -z "${seen[$domain]:-}" ]]; then
+            printf '    local-zone: "%s." transparent\n' "$domain"
+            seen["$domain"]=1
+        fi
+
+        root=$(echo "$domain" | awk -F. 'NF >= 2 {print $(NF-1)"."$NF}')
+        if [[ -n "$root" && -z "${seen[$root]:-}" ]]; then
+            printf '    local-zone: "%s." transparent\n' "$root"
+            seen["$root"]=1
+        fi
+    done
+}
+
 # ── 计算线程数 ───────────────────────────────────────────────
 get_thread_count() {
     local cores
@@ -180,61 +260,25 @@ generate_unbound_config() {
     [[ $mem_gb -ge 4 ]] && msg_cache="256m"  && rrset_cache="512m"
     [[ $mem_gb -ge 8 ]] && msg_cache="512m"  && rrset_cache="1024m"
 
-    local target_conf=""
-    case "$OS_ID" in
-        ubuntu|debian)
-            local conf_dir="/etc/unbound/unbound.conf.d"
-            mkdir -p "$conf_dir"
-            target_conf="${conf_dir}/local-recursive.conf"
-            local main_conf="/etc/unbound/unbound.conf"
-            if [[ -f "$main_conf" ]] && \
-               ! grep -q "unbound.conf.d" "$main_conf"; then
-                echo 'include: "/etc/unbound/unbound.conf.d/*.conf"' \
-                    >> "$main_conf"
-            fi
-            ;;
-        centos|rhel|rocky|almalinux)
-            local conf_dir="/etc/unbound/conf.d"
-            mkdir -p "$conf_dir"
-            target_conf="${conf_dir}/local-recursive.conf"
-            ;;
-    esac
+    local conf_dir target_conf anchor_conf remote_conf
+    local transparent_zone_lines
 
-    # 检测主配置是否已有 auto-trust-anchor-file
-    # 如果有则不在我们的配置里重复声明
-    local anchor_line=""
-    local existing_anchor
-    existing_anchor=$(get_main_conf_anchor)
+    UNBOUND_SERVICE_NAME=$(infer_unbound_service_name)
+    ensure_unbound_include_dir
 
-    if [[ -z "$existing_anchor" ]]; then
-        anchor_line="    auto-trust-anchor-file: \"/var/lib/unbound/root.key\""
-    else
-        log_info "主配置已有 trust anchor: $existing_anchor，跳过重复声明"
-        anchor_line="    # auto-trust-anchor-file 已在主配置声明，此处跳过"
-    fi
+    conf_dir=$(get_unbound_conf_dir)
+    target_conf="${conf_dir}/${UNBOUND_SERVICE_NAME}.conf"
+    anchor_conf="${conf_dir}/root-auto-trust-anchor-file.conf"
+    remote_conf="${conf_dir}/remote-control.conf"
+    transparent_zone_lines=$(build_unbound_transparent_zones)
 
-    # 检测主配置是否已有 root-hints
-    local hints_line=""
-    local existing_hints
-    existing_hints=$(grep -r "root-hints" \
-        /etc/unbound/unbound.conf \
-        /etc/unbound/conf.d/ \
-        /etc/unbound/unbound.conf.d/ \
-        2>/dev/null | \
-        grep -v "local-recursive.conf" | head -1)
-
-    if [[ -z "$existing_hints" ]]; then
-        hints_line="    root-hints: \"/var/lib/unbound/root.hints\""
-    else
-        log_info "主配置已有 root-hints，跳过重复声明"
-        hints_line="    # root-hints 已在主配置声明，此处跳过"
-    fi
+    rm -f "${conf_dir}/local-recursive.conf"
 
     cat > "$target_conf" << CONF_EOF
 # ----------------------------------------------------------------------
 # Unbound 本地递归 DNS 配置
 # 自动生成 - $(date)
-# CPU: ${threads}线程 | 内存: ${mem_gb}GB
+# 服务: ${UNBOUND_SERVICE_NAME} | CPU: ${threads}线程 | 内存: ${mem_gb}GB
 # ----------------------------------------------------------------------
 server:
     verbosity: 1
@@ -247,69 +291,94 @@ server:
     interface: 127.0.0.1
     interface: ::1
 
-    access-control: 0.0.0.0/0 refuse
     access-control: 127.0.0.0/8 allow
-    access-control: ::0/0 refuse
     access-control: ::1 allow
     access-control: ::ffff:127.0.0.1 allow
+    access-control: 0.0.0.0/0 refuse
+    access-control: ::0/0 refuse
 
     num-threads: ${threads}
     so-reuseport: yes
-    edns-tcp-keepalive: yes
     msg-cache-size: ${msg_cache}
     rrset-cache-size: ${rrset_cache}
     cache-max-ttl: 86400
     cache-min-ttl: 300
     prefetch: yes
     prefetch-key: yes
+    outgoing-range: 8192
+    num-queries-per-thread: 4096
+    jostle-timeout: 200
+    so-rcvbuf: 8m
+    so-sndbuf: 8m
     outgoing-num-tcp: 64
     incoming-num-tcp: 64
     tcp-upstream: yes
-    udp-upstream-without-downstream: yes
-    so-rcvbuf: 4m
-    so-sndbuf: 4m
-    msg-buffer-size: 65552
-    jostle-timeout: 200
+    edns-tcp-keepalive: yes
+    root-hints: "/var/lib/unbound/root.hints"
 
-${anchor_line}
-${hints_line}
-    harden-dnssec-stripped: no
-    val-clean-additional: yes
-    val-log-level: 1
-    trust-anchor-signaling: yes
+    serve-expired: yes
+    serve-expired-ttl: 1800
+    serve-expired-client-timeout: 120
 
+    prefer-ip6: no
     deny-any: yes
     harden-glue: yes
     harden-referral-path: yes
     harden-below-nxdomain: yes
-    harden-algo-downgrade: yes
-
-    qname-minimisation: yes
-    qname-minimisation-strict: yes
     hide-identity: yes
     hide-version: yes
     hide-trustanchor: yes
-    aggressive-nsec: yes
 
     username: "unbound"
     directory: "/etc/unbound"
     chroot: ""
     pidfile: "/run/unbound.pid"
-    do-daemonize: no
     use-systemd: yes
-
     module-config: "validator iterator"
 
+    local-zone: "localhost." static
+    local-data: "localhost. 10800 IN A 127.0.0.1"
+    local-data: "localhost. 10800 IN AAAA ::1"
+    local-zone: "127.in-addr.arpa." static
+    local-zone: "0.0.0.0/8." static
+    local-zone: "ip6.arpa." transparent
+
+    local-zone: "cdnjs.cloudflare.com." transparent
+    local-zone: "ajax.cloudflare.com." transparent
+    local-zone: "ajax.googleapis.com." transparent
+    local-zone: "fonts.googleapis.com." transparent
+    local-zone: "fonts.gstatic.com." transparent
+    local-zone: "googleapis.com." transparent
+    local-zone: "gstatic.com." transparent
+${transparent_zone_lines:+
+${transparent_zone_lines}}
+    do-not-query-localhost: yes
+    private-address: 192.168.0.0/16
+    private-address: 172.16.0.0/12
+    private-address: 10.0.0.0/8
+    private-address: 169.254.0.0/16
+    private-address: fd00::/8
+    private-address: fe80::/10
+
+    local-zone: "version.bind." refuse
+    local-zone: "authors.bind." refuse
+    local-zone: "hostname.bind." refuse
+    local-zone: "id.server." refuse
+
+    statistics-interval: 0
+    statistics-cumulative: no
+    extended-statistics: yes
+CONF_EOF
+
+    cat > "$anchor_conf" << CONF_EOF
+server:
+    auto-trust-anchor-file: "/var/lib/unbound/root.key"
+CONF_EOF
+
+    cat > "$remote_conf" << CONF_EOF
 remote-control:
     control-enable: yes
-    control-interface: 127.0.0.1
-    control-interface: ::1
-    control-port: 8953
-    control-use-cert: yes
-    server-key-file: "/etc/unbound/unbound_server.key"
-    server-cert-file: "/etc/unbound/unbound_server.pem"
-    control-key-file: "/etc/unbound/unbound_control.key"
-    control-cert-file: "/etc/unbound/unbound_control.pem"
+    control-interface: /run/unbound.ctl
 CONF_EOF
 
     log_info "Unbound 配置生成完成: $target_conf"
@@ -317,9 +386,7 @@ CONF_EOF
 
 # ── 初始化 unbound-control 证书 ──────────────────────────────
 init_unbound_control() {
-    log_step "初始化 unbound-control 证书..."
-    unbound-control-setup 2>/dev/null || true
-    log_info "unbound-control 证书初始化完成"
+    log_info "使用 UNIX socket remote-control，跳过证书初始化"
 }
 
 # ── 安装 root.hints 更新脚本 ────────────────────────────────
@@ -462,8 +529,9 @@ RESOLV_EOF
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
-    if ! unbound-checkconf 2>&1; then
+    if ! unbound-checkconf >/dev/null 2>&1; then
         log_error "Unbound 配置验证失败"
+        unbound-checkconf || true
         exit 1
     fi
 
@@ -502,6 +570,33 @@ verify_unbound() {
     fi
 }
 
+# ── 域名更新后刷新生成配置 ───────────────────────────────────
+refresh_unbound_generated_config() {
+    log_step "刷新 Unbound 生成配置..."
+    generate_unbound_config
+
+    if ! unbound-checkconf >/dev/null 2>&1; then
+        log_error "Unbound 配置验证失败"
+        unbound-checkconf || true
+        return 1
+    fi
+
+    if systemctl is-active --quiet unbound; then
+        systemctl restart unbound
+        sleep 1
+        if systemctl is-active --quiet unbound; then
+            log_info "Unbound 已按最新域名配置重启"
+            return 0
+        fi
+        log_error "Unbound 重启失败"
+        journalctl -u unbound -n 20 --no-pager || true
+        return 1
+    fi
+
+    log_info "Unbound 当前未运行，配置文件已更新"
+    return 0
+}
+
 # ── 模块入口 ─────────────────────────────────────────────────
 run_unbound() {
     log_step "========== Unbound 安装配置 =========="
@@ -524,6 +619,7 @@ run_unbound() {
                 ;;
             2)
                 # 只更新配置
+                collect_unbound_service_name
                 disable_systemd_resolved
                 download_root_hints
                 init_trust_anchor
@@ -545,6 +641,7 @@ run_unbound() {
                 ;;
             3)
                 # 完整重装
+                collect_unbound_service_name
                 install_unbound
                 disable_systemd_resolved
                 download_root_hints
@@ -560,6 +657,7 @@ run_unbound() {
         esac
     else
         # 未安装，走完整安装流程
+        collect_unbound_service_name
         install_unbound
         disable_systemd_resolved
         download_root_hints

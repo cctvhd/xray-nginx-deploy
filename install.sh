@@ -82,6 +82,7 @@ HW_MEM_GB=''
 HW_BANDWIDTH=''
 HW_DUAL_STACK=''
 HW_DISK_TYPE=''
+UNBOUND_SERVICE_NAME=''
 
 # xray 网络参数（由 system 模块计算）
 XRAY_PADDING=''
@@ -136,6 +137,7 @@ ENV
     HW_BANDWIDTH=$(get_state "HW_BANDWIDTH")
     HW_DUAL_STACK=$(get_state "HW_DUAL_STACK")
     HW_DISK_TYPE=$(get_state "HW_DISK_TYPE")
+    UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
     XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
@@ -286,7 +288,7 @@ main_menu() {
     echo -e "  ${CYAN}=== 安装 ===${NC}"
     echo "  ┌─────────────────────────────────────────┐"
     echo "  │  1. 系统初始化与优化                    │"
-    echo "  │  2. 安装 Unbound（仅安装，手动配置）    │"
+    echo "  │  2. 安装并配置 Unbound                  │"
     echo "  │  3. 安装 Nginx                          │"
     echo "  │  4. 申请 SSL 证书                       │"
     echo "  │  5. 安装 Xray                           │"
@@ -374,41 +376,16 @@ do_inst_system() {
     done_return
 }
 
-# ── 2. 安装 Unbound（仅安装）────────────────────────────────
+# ── 2. 安装并配置 Unbound ───────────────────────────────────
 do_inst_unbound() {
     load_os_info
     load_module unbound
+    restore_domain_arrays
+    UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
+    run_unbound
 
-    # 检测是否已安装
-    if command -v unbound &>/dev/null; then
-        log_info "Unbound 已安装: $(unbound -V 2>&1 | head -1)"
-        read -rp "是否重新安装？[y/N]: " reinstall
-        if [[ "${reinstall,,}" != "y" ]]; then
-            save_state "INST_UNBOUND" "1"
-            log_info "跳过安装，Unbound 配置请手动完成"
-            log_info "参考配置位置: /etc/unbound/conf.d/ 或 /etc/unbound/unbound.conf.d/"
-            done_return
-            return
-        fi
-    fi
-
-    # 只执行安装，不生成配置
-    install_unbound
-    install_root_hints_updater
-    setup_root_hints_updater
-
+    save_state "UNBOUND_SERVICE_NAME" "${UNBOUND_SERVICE_NAME:-}"
     save_state "INST_UNBOUND" "1"
-
-    echo ""
-    log_warn "Unbound 已安装，配置请手动完成"
-    log_info "参考配置："
-    echo "  AlmaLinux/Rocky: /etc/unbound/conf.d/*.conf"
-    echo "  Ubuntu/Debian:   /etc/unbound/unbound.conf.d/*.conf"
-    echo ""
-    log_info "配置完成后执行："
-    echo "  unbound-checkconf"
-    echo "  systemctl enable --now unbound"
-
     done_return
 }
 
@@ -457,6 +434,17 @@ do_inst_cert() {
     save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
     save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
     save_state "INST_CERT"      "1"
+
+    if [[ "$(get_step INST_UNBOUND)" == "1" ]] && command -v unbound &>/dev/null; then
+        load_module unbound
+        restore_domain_arrays
+        UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
+        if refresh_unbound_generated_config; then
+            log_info "Unbound 已按当前域名配置刷新"
+        else
+            log_warn "Unbound 域名透传配置刷新失败，请稍后重试步骤 2"
+        fi
+    fi
 
     done_return
 }
@@ -698,12 +686,14 @@ do_full_install() {
     save_state "XRAY_PADDING"      "${XRAY_PADDING:-128-2048}"
     save_state "INST_SYSTEM"       "1"
 
-    # Unbound 只安装不配置
+    # Unbound 安装并配置
     load_module unbound
-    install_unbound
+    restore_domain_arrays
+    UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
+    run_unbound
+    save_state "UNBOUND_SERVICE_NAME" "${UNBOUND_SERVICE_NAME:-}"
     save_state "INST_UNBOUND" "1"
-    log_warn "Unbound 已安装，请手动配置后再继续"
-    log_info "配置完成后重新运行脚本选择后续步骤"
+    log_info "Unbound 已完成安装与配置"
     done_return
     return
 }
