@@ -24,6 +24,48 @@ install_xray() {
     chmod 755 /var/log/xray
 }
 
+# ── 为 Xray 补齐 service / sysctl 最低限制 ──────────────────
+ensure_xray_runtime_limits() {
+    log_step "检查 Xray 所需的系统限制..."
+
+    local required_nofile=1000000
+    local required_nproc=10000
+    local current_nr_open current_file_max
+
+    mkdir -p /etc/systemd/system/xray.service.d
+    mkdir -p /etc/systemd/system/xray@.service.d
+
+    cat > /etc/systemd/system/xray.service.d/10-limits.conf << CONF
+[Service]
+LimitNOFILE=${required_nofile}
+LimitNPROC=${required_nproc}
+CONF
+
+    cat > /etc/systemd/system/xray@.service.d/10-limits.conf << CONF
+[Service]
+LimitNOFILE=${required_nofile}
+LimitNPROC=${required_nproc}
+CONF
+
+    current_nr_open=$(sysctl -n fs.nr_open 2>/dev/null || echo 0)
+    current_file_max=$(sysctl -n fs.file-max 2>/dev/null || echo 0)
+
+    if (( current_nr_open < required_nofile )) || \
+       (( current_file_max < required_nofile )); then
+        cat > /etc/sysctl.d/98-xray-service-limits.conf << CONF
+# xray-nginx-deploy - keep kernel limits compatible with Xray official service
+fs.nr_open = 1048576
+fs.file-max = 2097152
+CONF
+
+        sysctl -p /etc/sysctl.d/98-xray-service-limits.conf >/dev/null 2>&1 || true
+        log_info "已为 Xray 写入最小系统限制兜底"
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    log_info "Xray service 限制已校准: NOFILE=${required_nofile}, NPROC=${required_nproc}"
+}
+
 # ── 生成随机参数 ─────────────────────────────────────────────
 generate_xray_params() {
     log_step "生成 Xray 随机参数..."
@@ -116,10 +158,29 @@ collect_reality_params() {
            read -rp "输入 serverName（多个用空格分隔）: " -a REALITY_SERVER_NAMES ;;
     esac
 
-    # 加入自有 Reality 域名
+    # 自有域名是否加入 Reality serverNames
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        REALITY_SERVER_NAMES=("${REALITY_DOMAIN}" "${REALITY_SERVER_NAMES[@]}")
+        echo ""
+        log_info "检测到自有 Reality 域名: ${REALITY_DOMAIN}"
+        log_warn "建议默认不要把自有域名加入 Reality serverNames；公共 serverNames 通常更隐蔽"
+        read -rp "是否把自有域名也加入 Reality serverNames？[y/N]: " include_own_reality_domain
+        if [[ "${include_own_reality_domain,,}" == "y" ]]; then
+            REALITY_SERVER_NAMES=("${REALITY_DOMAIN}" "${REALITY_SERVER_NAMES[@]}")
+        fi
     fi
+
+    # 去重，避免同一个 serverName 重复写入 xray / nginx 配置
+    local deduped_server_names=()
+    local seen_server_names=""
+    local sn
+    for sn in "${REALITY_SERVER_NAMES[@]}"; do
+        [[ -n "$sn" ]] || continue
+        if [[ " ${seen_server_names} " != *" ${sn} "* ]]; then
+            deduped_server_names+=("$sn")
+            seen_server_names+=" ${sn}"
+        fi
+    done
+    REALITY_SERVER_NAMES=("${deduped_server_names[@]}")
 
     # spiderX
     read -rp "Reality spiderX [默认 /api/health]: " spider_x
@@ -362,6 +423,8 @@ CONF
 # ── 启动 Xray ────────────────────────────────────────────────
 start_xray() {
     log_step "启动 Xray 服务..."
+
+    ensure_xray_runtime_limits
 
     if ! xray run -test -config /usr/local/etc/xray/config.json; then
         log_error "Xray 配置验证失败"

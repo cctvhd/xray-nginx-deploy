@@ -2,9 +2,8 @@
 set -euo pipefail
 
 # ============================================================
-# xray-nginx-deploy 主入口
+# xray-nginx-deploy main entry
 # GitHub: https://github.com/cctvhd/xray-nginx-deploy
-# 运行: bash <(curl -fsSL https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/main/install.sh)
 # ============================================================
 
 BASE_URL="https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/main"
@@ -12,7 +11,6 @@ MODULES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/modules"
 STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
 
-# ── 颜色定义 ─────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -25,7 +23,6 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 
-# ── 检查 root 权限 ───────────────────────────────────────────
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "请使用 root 权限运行此脚本"
@@ -33,21 +30,37 @@ check_root() {
     fi
 }
 
-# ── 读取状态值 ───────────────────────────────────────────────
 get_state() {
     local key="$1"
     local default="${2:-}"
-    grep "^${key}=" "$STATE_FILE" 2>/dev/null | \
-        head -1 | cut -d= -f2- | \
-        sed "s/^['\"]//;s/['\"]$//" || echo "$default"
+
+    if [[ ! -f "$STATE_FILE" ]]; then
+        echo "$default"
+        return
+    fi
+
+    local value
+    value=$(grep "^${key}=" "$STATE_FILE" 2>/dev/null | \
+        head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true)
+
+    if [[ -n "$value" ]]; then
+        echo "$value"
+    else
+        echo "$default"
+    fi
 }
 
-# ── 保存状态值 ───────────────────────────────────────────────
 save_state() {
     local key="$1"
     local value="$2"
     local escaped
-    escaped=$(echo "$value" | sed "s/'/'\\\\''/g")
+
+    mkdir -p "$STATE_DIR"
+    chmod 700 "$STATE_DIR"
+    touch "$STATE_FILE"
+    chmod 600 "$STATE_FILE"
+
+    escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
     if grep -q "^${key}=" "$STATE_FILE" 2>/dev/null; then
         sed -i "s|^${key}=.*|${key}='${escaped}'|" "$STATE_FILE"
     else
@@ -55,28 +68,22 @@ save_state() {
     fi
 }
 
-# ── 获取步骤状态 ─────────────────────────────────────────────
 get_step() {
     get_state "$1" "0"
 }
 
-# ── 初始化状态文件 ───────────────────────────────────────────
 init_state() {
     mkdir -p "$STATE_DIR"
     chmod 700 "$STATE_DIR"
 
     if [[ ! -f "$STATE_FILE" ]]; then
         cat > "$STATE_FILE" << 'ENV'
-# xray-nginx-deploy 状态文件
-# 自动生成，请勿手动编辑关键字段
-
-# 系统信息
+# xray-nginx-deploy state file
 OS_ID=''
 OS_NAME=''
 PKG_MANAGER=''
 BBR_VERSION=''
 
-# 硬件配置
 HW_CPU_CORES=''
 HW_MEM_GB=''
 HW_BANDWIDTH=''
@@ -84,10 +91,8 @@ HW_DUAL_STACK=''
 HW_DISK_TYPE=''
 UNBOUND_SERVICE_NAME=''
 
-# xray 网络参数（由 system 模块计算）
 XRAY_PADDING=''
 
-# 域名信息（由 cert 模块写入）
 XHTTP_DOMAIN=''
 GRPC_DOMAIN=''
 REALITY_DOMAIN=''
@@ -97,7 +102,6 @@ CDN_DOMAINS=''
 DIRECT_DOMAINS=''
 XHTTP_PATH=''
 
-# Xray 参数（由 xray 模块写入）
 XRAY_UUID=''
 XRAY_PUBLIC_KEY=''
 XRAY_PRIVATE_KEY=''
@@ -106,11 +110,9 @@ REALITY_SNI=''
 REALITY_SHORT_ID=''
 REALITY_SPIDER_X=''
 
-# Sing-Box 参数
 SINGBOX_PASSWORD=''
 WARP_PROXY_PORT='40000'
 
-# 安装状态
 INST_SYSTEM='0'
 INST_UNBOUND='0'
 INST_NGINX='0'
@@ -119,16 +121,15 @@ INST_XRAY='0'
 INST_SINGBOX='0'
 INST_WARP='0'
 
-# 配置状态
 CONF_NGINX='0'
 CONF_XRAY='0'
 CONF_SINGBOX='0'
 CONF_WARP='0'
 ENV
+        chmod 600 "$STATE_FILE"
         log_info "状态文件已创建: $STATE_FILE"
     fi
 
-    # 读取基础变量
     OS_ID=$(get_state "OS_ID")
     OS_NAME=$(get_state "OS_NAME")
     PKG_MANAGER=$(get_state "PKG_MANAGER")
@@ -150,7 +151,6 @@ ENV
     WARP_PROXY_PORT=$(get_state "WARP_PROXY_PORT" "40000")
 }
 
-# ── 加载模块 ─────────────────────────────────────────────────
 load_module() {
     local module="$1"
     local local_path="${MODULES_DIR}/${module}.sh"
@@ -160,11 +160,11 @@ load_module() {
         # shellcheck source=/dev/null
         source "$local_path"
     else
+        # shellcheck source=/dev/null
         source <(curl -fsSL "$remote_url")
     fi
 }
 
-# ── 加载系统基础信息 ─────────────────────────────────────────
 load_os_info() {
     if [[ -n "${OS_ID:-}" ]]; then
         case "$OS_ID" in
@@ -172,18 +172,18 @@ load_os_info() {
                 PKG_UPDATE="apt-get update -y"
                 PKG_INSTALL="apt-get install -y"
                 ;;
-            centos|rhel|rocky|almalinux)
+            centos|rhel|rocky|almalinux|fedora)
                 PKG_UPDATE="dnf makecache -y"
                 PKG_INSTALL="dnf install -y"
                 ;;
         esac
-    else
-        load_module system
-        detect_os
+        return
     fi
+
+    load_module system
+    detect_os
 }
 
-# ── 恢复域名数组 ─────────────────────────────────────────────
 restore_domain_arrays() {
     local all_str cdn_str direct_str
     all_str=$(get_state "ALL_DOMAINS")
@@ -205,108 +205,73 @@ restore_domain_arrays() {
     XHTTP_PATH=$(get_state "XHTTP_PATH")
 }
 
-# ── 显示安装状态 ─────────────────────────────────────────────
 show_status() {
     echo ""
-    echo -e "${BLUE}── 安装状态 ───────────────────────────────${NC}"
-
-    local inst_items=(
-        "INST_SYSTEM:系统初始化"
-        "INST_UNBOUND:Unbound DNS"
-        "INST_NGINX:Nginx"
-        "INST_CERT:SSL 证书"
-        "INST_XRAY:Xray"
-        "INST_SINGBOX:Sing-Box"
-        "INST_WARP:Cloudflare WARP"
-    )
-
-    echo -e "  ${CYAN}[ 安装 ]${NC}"
-    for item in "${inst_items[@]}"; do
-        local key="${item%%:*}"
-        local name="${item##*:}"
-        local val
-        val=$(get_step "$key")
-        if [[ "$val" == "1" ]]; then
-            echo -e "    ${GREEN}[✓]${NC} ${name}"
-        else
-            echo -e "    ${RED}[✗]${NC} ${name}"
-        fi
-    done
+    echo -e "${BLUE}================ 当前状态 ================${NC}"
+    echo "  [安装]"
+    printf "    %-20s %s\n" "System"   "$([[ "$(get_step INST_SYSTEM)"   == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Unbound"  "$([[ "$(get_step INST_UNBOUND)"  == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Nginx"    "$([[ "$(get_step INST_NGINX)"    == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Cert"     "$([[ "$(get_step INST_CERT)"     == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Xray"     "$([[ "$(get_step INST_XRAY)"     == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Sing-Box" "$([[ "$(get_step INST_SINGBOX)"  == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "WARP"     "$([[ "$(get_step INST_WARP)"     == "1" ]] && echo "OK" || echo "--")"
 
     echo ""
-    echo -e "  ${CYAN}[ 配置 ]${NC}"
-    local conf_items=(
-        "CONF_NGINX:Nginx 配置"
-        "CONF_XRAY:Xray 配置"
-        "CONF_SINGBOX:Sing-Box 配置"
-        "CONF_WARP:WARP 配置"
-    )
-    for item in "${conf_items[@]}"; do
-        local key="${item%%:*}"
-        local name="${item##*:}"
-        local val
-        val=$(get_step "$key")
-        if [[ "$val" == "1" ]]; then
-            echo -e "    ${GREEN}[✓]${NC} ${name}"
-        else
-            echo -e "    ${RED}[✗]${NC} ${name}"
-        fi
-    done
+    echo "  [配置]"
+    printf "    %-20s %s\n" "Nginx"    "$([[ "$(get_step CONF_NGINX)"    == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Xray"     "$([[ "$(get_step CONF_XRAY)"     == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Sing-Box" "$([[ "$(get_step CONF_SINGBOX)"  == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "WARP"     "$([[ "$(get_step CONF_WARP)"     == "1" ]] && echo "OK" || echo "--")"
 
     echo ""
-    echo -e "  ${CYAN}[ 域名信息 ]${NC}"
-    [[ -n "${XHTTP_DOMAIN:-}"   ]] && \
-        echo -e "    xhttp:   ${CYAN}${XHTTP_DOMAIN}${NC}"
-    [[ -n "${GRPC_DOMAIN:-}"    ]] && \
-        echo -e "    gRPC:    ${CYAN}${GRPC_DOMAIN}${NC}"
-    [[ -n "${REALITY_DOMAIN:-}" ]] && \
-        echo -e "    Reality: ${CYAN}${REALITY_DOMAIN}${NC}"
-    [[ -n "${ANYTLS_DOMAIN:-}"  ]] && \
-        echo -e "    AnyTLS:  ${CYAN}${ANYTLS_DOMAIN}${NC}"
+    echo "  [域名]"
+    [[ -n "${XHTTP_DOMAIN:-}"   ]] && echo "    xhttp   : ${XHTTP_DOMAIN}"
+    [[ -n "${GRPC_DOMAIN:-}"    ]] && echo "    gRPC    : ${GRPC_DOMAIN}"
+    [[ -n "${REALITY_DOMAIN:-}" ]] && echo "    Reality : ${REALITY_DOMAIN}"
+    [[ -n "${ANYTLS_DOMAIN:-}"  ]] && echo "    AnyTLS  : ${ANYTLS_DOMAIN}"
 
-    [[ -n "${HW_CPU_CORES:-}" ]] && {
+    if [[ -n "${HW_CPU_CORES:-}" ]]; then
         echo ""
-        echo -e "  ${CYAN}[ 硬件配置 ]${NC}"
-        echo -e "    CPU: ${HW_CPU_CORES}核 | 内存: ${HW_MEM_GB}GB | 带宽: ${HW_BANDWIDTH} | IPv6: ${HW_DUAL_STACK} | 磁盘: ${HW_DISK_TYPE}"
-    }
+        echo "  [硬件]"
+        echo "    CPU: ${HW_CPU_CORES} | MEM: ${HW_MEM_GB}GB | BW: ${HW_BANDWIDTH} | STACK: ${HW_DUAL_STACK} | DISK: ${HW_DISK_TYPE}"
+    fi
 
-    echo -e "${BLUE}──────────────────────────────────────────${NC}"
+    echo -e "${BLUE}==========================================${NC}"
     echo ""
 }
 
-# ── 主菜单 ───────────────────────────────────────────────────
 main_menu() {
     clear
     echo ""
-    echo -e "${BLUE}╔════════════════════════════════════════════╗${NC}"
-    echo -e "${BLUE}║    Xray + Nginx + Sing-Box 部署工具        ║${NC}"
-    echo -e "${BLUE}║    GitHub: cctvhd/xray-nginx-deploy        ║${NC}"
-    echo -e "${BLUE}╚════════════════════════════════════════════╝${NC}"
+    echo -e "${BLUE}==========================================${NC}"
+    echo -e "${BLUE}   Xray + Nginx + Sing-Box 部署工具${NC}"
+    echo -e "${BLUE}   GitHub: cctvhd/xray-nginx-deploy${NC}"
+    echo -e "${BLUE}==========================================${NC}"
 
     show_status
 
-    echo -e "  ${CYAN}=== 安装 ===${NC}"
-    echo "  ┌─────────────────────────────────────────┐"
-    echo "  │  1. 系统初始化与优化                    │"
-    echo "  │  2. 安装并配置 Unbound                  │"
-    echo "  │  3. 安装 Nginx                          │"
-    echo "  │  4. 申请 SSL 证书                       │"
-    echo "  │  5. 安装 Xray                           │"
-    echo "  │  6. 安装 Sing-Box                       │"
-    echo "  ├─────────────────────────────────────────┤"
-    echo -e "  │  ${CYAN}=== 配置 ===${NC}                           │"
-    echo "  │  7. 配置 Nginx                          │"
-    echo "  │  8. 配置 Xray                           │"
-    echo "  │  9. 配置 Sing-Box                       │"
-    echo "  ├─────────────────────────────────────────┤"
-    echo -e "  │  ${CYAN}=== 其他 ===${NC}                           │"
-    echo "  │  a. 生成客户端连接链接                  │"
-    echo "  │  b. 查看当前状态                        │"
-    echo "  │  w. 安装/配置 Cloudflare WARP          │"
-    echo "  ├─────────────────────────────────────────┤"
-    echo "  │  0. 全量一键安装 (步骤 1-6)             │"
-    echo "  │  q. 退出                                │"
-    echo "  └─────────────────────────────────────────┘"
+    echo "  === 安装 ==="
+    echo "  1. 系统初始化与优化"
+    echo "  2. 安装并配置 Unbound"
+    echo "  3. 安装 Nginx"
+    echo "  4. 申请 SSL 证书"
+    echo "  5. 安装 Xray"
+    echo "  6. 安装 Sing-Box"
+    echo ""
+    echo "  === 配置 ==="
+    echo "  7. 配置 Nginx"
+    echo "  8. 配置 Xray"
+    echo "  9. 配置 Sing-Box"
+    echo ""
+    echo "  === 其他 ==="
+    echo "  a. 生成客户端链接"
+    echo "  b. 查看当前状态"
+    echo "  w. 安装 / 配置 Cloudflare WARP"
+    echo "  u. 卸载 / 清理模块"
+    echo "  r. 全部重装（先清理再执行 1-9）"
+    echo "  0. 全流程一键安装（步骤 1-9）"
+    echo "  q. 退出"
     echo ""
     echo -e "  再次运行: ${CYAN}bash <(curl -fsSL ${BASE_URL}/install.sh)${NC}"
     echo ""
@@ -324,31 +289,31 @@ main_menu() {
         8) do_conf_xray ;;
         9) do_conf_singbox ;;
         a|A) do_client ;;
-        b|B) show_status
-             read -rp "按回车返回菜单..." _
-             main_menu ;;
+        b|B)
+            show_status
+            read -rp "按回车返回主菜单..." _
+            main_menu
+            ;;
         w|W) do_warp ;;
+        u|U) do_uninstall_menu ;;
+        r|R) do_reinstall_all ;;
         0) do_full_install ;;
         q|Q) exit 0 ;;
-        *) log_error "无效选择"
-           sleep 1
-           main_menu ;;
+        *)
+            log_error "无效选择"
+            sleep 1
+            main_menu
+            ;;
     esac
 }
 
-# ── 完成后返回菜单 ───────────────────────────────────────────
 done_return() {
     echo ""
-    read -rp "按回车返回菜单..." _
+    read -rp "按回车返回主菜单..." _
     init_state
     main_menu
 }
 
-# ============================================================
-# 安装模块
-# ============================================================
-
-# ── 1. 系统初始化 ────────────────────────────────────────────
 do_inst_system() {
     load_module system
     detect_os
@@ -376,7 +341,6 @@ do_inst_system() {
     done_return
 }
 
-# ── 2. 安装并配置 Unbound ───────────────────────────────────
 do_inst_unbound() {
     load_os_info
     load_module unbound
@@ -390,15 +354,13 @@ do_inst_unbound() {
     done_return
 }
 
-# ── 3. 安装 Nginx ────────────────────────────────────────────
 do_inst_nginx() {
     load_os_info
     load_module nginx
 
-    # 检测是否已安装
     if command -v nginx &>/dev/null; then
-        local ver
-        ver=$(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1)
+        local ver reinstall
+        ver=$(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1 || true)
         log_info "Nginx 已安装: v${ver}"
         read -rp "是否重新安装？[y/N]: " reinstall
         if [[ "${reinstall,,}" != "y" ]]; then
@@ -420,7 +382,6 @@ do_inst_nginx() {
     done_return
 }
 
-# ── 4. 申请 SSL 证书 ─────────────────────────────────────────
 do_inst_cert() {
     load_os_info
     load_module cert
@@ -443,22 +404,20 @@ do_inst_cert() {
         if refresh_unbound_generated_config; then
             log_info "Unbound 已按当前域名配置刷新"
         else
-            log_warn "Unbound 域名透传配置刷新失败，请稍后重试步骤 2"
+            log_warn "Unbound 域名配置刷新失败，请稍后重试步骤 2"
         fi
     fi
 
     done_return
 }
 
-# ── 5. 安装 Xray ─────────────────────────────────────────────
 do_inst_xray() {
     load_os_info
     load_module xray
 
-    # 检测是否已安装
     if command -v xray &>/dev/null; then
-        local ver
-        ver=$(xray version 2>&1 | grep -oP '[\d.]+' | head -1)
+        local ver reinstall
+        ver=$(xray version 2>&1 | grep -oP '[\d.]+' | head -1 || true)
         log_info "Xray 已安装: v${ver}"
         read -rp "是否重新安装？[y/N]: " reinstall
         if [[ "${reinstall,,}" != "y" ]]; then
@@ -472,19 +431,17 @@ do_inst_xray() {
     install_xray
     save_state "INST_XRAY" "1"
 
-    log_info "Xray 安装完成，请继续执行步骤 8（配置 Xray）"
+    log_info "Xray 安装完成，请继续执行步骤 8"
     done_return
 }
 
-# ── 6. 安装 Sing-Box ─────────────────────────────────────────
 do_inst_singbox() {
     load_os_info
     load_module singbox
 
-    # 检测是否已安装
     if command -v sing-box &>/dev/null; then
-        local ver
-        ver=$(sing-box version 2>&1 | grep -oP '[\d.]+' | head -1)
+        local ver reinstall
+        ver=$(sing-box version 2>&1 | grep -oP '[\d.]+' | head -1 || true)
         log_info "Sing-Box 已安装: v${ver}"
         read -rp "是否重新安装？[y/N]: " reinstall
         if [[ "${reinstall,,}" != "y" ]]; then
@@ -498,25 +455,19 @@ do_inst_singbox() {
     install_singbox
     save_state "INST_SINGBOX" "1"
 
-    log_info "Sing-Box 安装完成，请继续执行步骤 9（配置 Sing-Box）"
+    log_info "Sing-Box 安装完成，请继续执行步骤 9"
     done_return
 }
 
-# ============================================================
-# 配置模块
-# ============================================================
-
-# ── 7. 配置 Nginx ────────────────────────────────────────────
 do_conf_nginx() {
-    # 检查依赖
     if [[ "$(get_step INST_NGINX)" != "1" ]]; then
-        log_warn "请先完成步骤3（安装 Nginx）"
+        log_warn "请先完成步骤 3（安装 Nginx）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
 
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
-        log_warn "请先完成步骤4（申请 SSL 证书）"
+        log_warn "请先完成步骤 4（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
@@ -524,7 +475,6 @@ do_conf_nginx() {
     load_os_info
     restore_domain_arrays
 
-    # 方案A：XHTTP_PATH 为空时先生成并保存，后续复用
     XHTTP_PATH=$(get_state "XHTTP_PATH")
     if [[ -z "${XHTTP_PATH}" ]]; then
         XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
@@ -555,35 +505,31 @@ do_conf_nginx() {
     done_return
 }
 
-# ── 8. 配置 Xray ─────────────────────────────────────────────
 do_conf_xray() {
-    # 检查依赖
     if [[ "$(get_step INST_XRAY)" != "1" ]]; then
-        log_warn "请先完成步骤5（安装 Xray）"
+        log_warn "请先完成步骤 5（安装 Xray）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
 
     if [[ "$(get_step CONF_NGINX)" != "1" ]]; then
-        log_warn "建议先完成步骤7（配置 Nginx）"
+        log_warn "建议先完成步骤 7（配置 Nginx）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
 
     load_os_info
     restore_domain_arrays
-
-    # 读取硬件相关参数
     XRAY_PADDING=$(get_state "XRAY_PADDING" "128-2048")
 
     load_module xray
-    # 复用已有 XHTTP_PATH，不重新生成
     local saved_path
     saved_path=$(get_state "XHTTP_PATH")
     if [[ -n "${saved_path}" ]]; then
         XHTTP_PATH="${saved_path}"
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
+
     generate_xray_params
     collect_reality_params
     generate_xray_config
@@ -602,23 +548,21 @@ do_conf_xray() {
     done_return
 }
 
-# ── 9. 配置 Sing-Box ─────────────────────────────────────────
 do_conf_singbox() {
-    # 检查依赖
     if [[ "$(get_step INST_SINGBOX)" != "1" ]]; then
-        log_warn "请先完成步骤6（安装 Sing-Box）"
+        log_warn "请先完成步骤 6（安装 Sing-Box）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
 
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
-        log_warn "建议先完成步骤4（申请 SSL 证书）"
+        log_warn "建议先完成步骤 4（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
 
     if [[ "$(get_step CONF_NGINX)" != "1" ]]; then
-        log_warn "建议先完成步骤7（配置 Nginx），AnyTLS 依赖 443 SNI 分流"
+        log_warn "建议先完成步骤 7（配置 Nginx），AnyTLS 依赖 443 SNI 分流"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
@@ -638,14 +582,12 @@ do_conf_singbox() {
     done_return
 }
 
-# ── a. 生成客户端链接 ────────────────────────────────────────
 do_client() {
     load_module client
     run_client
     done_return
 }
 
-# ── w. 安装/配置 Cloudflare WARP ─────────────────────────────
 do_warp() {
     load_os_info
     load_module warp
@@ -659,12 +601,61 @@ do_warp() {
     done_return
 }
 
-# ── 0. 全量安装 ──────────────────────────────────────────────
-do_full_install() {
-    log_step "开始全量安装..."
+do_uninstall_menu() {
+    clear
+    echo ""
+    echo -e "${BLUE}================ 清理 / 卸载 ================${NC}"
+    echo "  1. 清理 System 优化"
+    echo "  2. 清理 Unbound"
+    echo "  3. 清理 Nginx"
+    echo "  4. 清理证书 / Cloudflare 配置"
+    echo "  5. 清理 Xray"
+    echo "  6. 清理 Sing-Box"
+    echo "  7. 清理 Cloudflare WARP"
+    echo "  8. 清理全部"
+    echo "  q. 返回主菜单"
+    echo ""
+    read -rp "  请选择: " cleanup_choice
     echo ""
 
-    # 安装阶段
+    load_module uninstall
+
+    case "$cleanup_choice" in
+        1) cleanup_system_module ;;
+        2) cleanup_unbound_module ;;
+        3) cleanup_nginx_module ;;
+        4) cleanup_cert_module ;;
+        5) cleanup_xray_module ;;
+        6) cleanup_singbox_module ;;
+        7) cleanup_warp_module ;;
+        8)
+            read -rp "这会删除本脚本生成的大部分服务、配置和证书，确认继续吗？[y/N]: " confirm_cleanup
+            if [[ "${confirm_cleanup,,}" != "y" ]]; then
+                main_menu
+                return
+            fi
+            cleanup_all_modules
+            init_state
+            ;;
+        q|Q)
+            main_menu
+            return
+            ;;
+        *)
+            log_error "无效选择"
+            sleep 1
+            main_menu
+            return
+            ;;
+    esac
+
+    done_return
+}
+
+run_full_install_flow() {
+    log_step "开始全流程安装..."
+    echo ""
+
     load_module system
     detect_os
     detect_kernel
@@ -675,19 +666,19 @@ do_full_install() {
     optimize_limits
     install_base_tools
     sync_time
-    save_state "OS_ID"             "$OS_ID"
-    save_state "OS_NAME"           "$OS_NAME"
-    save_state "PKG_MANAGER"       "$PKG_MANAGER"
-    save_state "BBR_VERSION"       "${BBR_VERSION:-bbr}"
-    save_state "HW_CPU_CORES"      "$HW_CPU_CORES"
-    save_state "HW_MEM_GB"         "$HW_MEM_GB"
-    save_state "HW_BANDWIDTH"      "$HW_BANDWIDTH"
-    save_state "HW_DUAL_STACK"     "$HW_DUAL_STACK"
-    save_state "HW_DISK_TYPE"      "$HW_DISK_TYPE"
-    save_state "XRAY_PADDING"      "${XRAY_PADDING:-128-2048}"
-    save_state "INST_SYSTEM"       "1"
 
-    # Unbound 安装并配置
+    save_state "OS_ID"           "$OS_ID"
+    save_state "OS_NAME"         "$OS_NAME"
+    save_state "PKG_MANAGER"     "$PKG_MANAGER"
+    save_state "BBR_VERSION"     "${BBR_VERSION:-bbr}"
+    save_state "HW_CPU_CORES"    "$HW_CPU_CORES"
+    save_state "HW_MEM_GB"       "$HW_MEM_GB"
+    save_state "HW_BANDWIDTH"    "$HW_BANDWIDTH"
+    save_state "HW_DUAL_STACK"   "$HW_DUAL_STACK"
+    save_state "HW_DISK_TYPE"    "$HW_DISK_TYPE"
+    save_state "XRAY_PADDING"    "${XRAY_PADDING:-128-2048}"
+    save_state "INST_SYSTEM"     "1"
+
     load_module unbound
     restore_domain_arrays
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
@@ -695,12 +686,125 @@ do_full_install() {
     save_state "HW_DUAL_STACK" "${HW_DUAL_STACK:-}"
     save_state "UNBOUND_SERVICE_NAME" "${UNBOUND_SERVICE_NAME:-}"
     save_state "INST_UNBOUND" "1"
-    log_info "Unbound 已完成安装与配置"
-    done_return
-    return
+
+    load_os_info
+    load_module nginx
+    install_nginx
+    create_nginx_dirs
+    generate_fake_site "/var/www/html" "Welcome"
+    generate_cf_realip_conf
+    generate_ssl_conf
+    generate_upstreams_conf
+    save_state "INST_NGINX" "1"
+
+    load_module cert
+    run_cert
+    save_state "XHTTP_DOMAIN"   "${XHTTP_DOMAIN:-}"
+    save_state "GRPC_DOMAIN"    "${GRPC_DOMAIN:-}"
+    save_state "REALITY_DOMAIN" "${REALITY_DOMAIN:-}"
+    save_state "ANYTLS_DOMAIN"  "${ANYTLS_DOMAIN:-}"
+    save_state "ALL_DOMAINS"    "${ALL_DOMAINS[*]:-}"
+    save_state "CDN_DOMAINS"    "${CDN_DOMAINS[*]:-}"
+    save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
+    save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
+    save_state "INST_CERT"      "1"
+
+    if [[ "$(get_step INST_UNBOUND)" == "1" ]] && command -v unbound &>/dev/null; then
+        load_module unbound
+        restore_domain_arrays
+        UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
+        if refresh_unbound_generated_config; then
+            log_info "Unbound 已按当前域名刷新"
+        else
+            log_warn "Unbound 刷新失败，请稍后手动执行步骤 2"
+        fi
+    fi
+
+    restore_domain_arrays
+    XHTTP_PATH=$(get_state "XHTTP_PATH")
+    if [[ -z "${XHTTP_PATH}" ]]; then
+        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        save_state "XHTTP_PATH" "${XHTTP_PATH}"
+        log_info "生成 XHTTP_PATH: ${XHTTP_PATH}"
+    else
+        log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
+    fi
+
+    load_module nginx
+    create_nginx_dirs
+    generate_fake_site "/var/www/html" "Welcome"
+    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
+        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
+    fi
+    generate_cf_realip_conf
+    generate_ssl_conf
+    generate_upstreams_conf
+    generate_fallback_conf
+    generate_servers_conf
+    generate_nginx_conf
+    reload_nginx
+    install_cf_ip_updater
+    setup_cf_ip_updater
+    run_cf_ip_updater
+    save_state "CONF_NGINX" "1"
+
+    load_module xray
+    install_xray
+    save_state "INST_XRAY" "1"
+
+    XRAY_PADDING=$(get_state "XRAY_PADDING" "128-2048")
+    XHTTP_PATH=$(get_state "XHTTP_PATH")
+    if [[ -n "${XHTTP_PATH}" ]]; then
+        log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
+    fi
+    generate_xray_params
+    collect_reality_params
+    generate_xray_config
+    start_xray
+    save_state "XRAY_UUID"        "${XRAY_UUID:-}"
+    save_state "XRAY_PUBLIC_KEY"  "${XRAY_PUBLIC_KEY:-}"
+    save_state "XRAY_PRIVATE_KEY" "${XRAY_PRIVATE_KEY:-}"
+    save_state "XHTTP_PATH"       "${XHTTP_PATH:-}"
+    save_state "REALITY_DEST"     "${REALITY_DEST:-}"
+    save_state "REALITY_SNI"      "${REALITY_SERVER_NAMES[0]:-}"
+    save_state "REALITY_SHORT_ID" "${REALITY_SHORT_IDS[1]:-}"
+    save_state "REALITY_SPIDER_X" "${REALITY_SPIDER_X:-}"
+    save_state "CONF_XRAY"        "1"
+
+    load_module singbox
+    install_singbox
+    save_state "INST_SINGBOX" "1"
+
+    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    generate_singbox_params
+    collect_singbox_params
+    generate_singbox_config
+    start_singbox
+    save_state "SINGBOX_PASSWORD" "${SINGBOX_PASSWORD:-}"
+    save_state "CONF_SINGBOX"     "1"
+
+    log_info "全流程安装完成"
 }
 
-# ── 入口 ─────────────────────────────────────────────────────
+do_full_install() {
+    run_full_install_flow
+    done_return
+}
+
+do_reinstall_all() {
+    read -rp "这会先清理全部，再重新执行完整安装流程，确认继续吗？[y/N]: " reinstall_all
+    if [[ "${reinstall_all,,}" != "y" ]]; then
+        main_menu
+        return
+    fi
+
+    load_module uninstall
+    cleanup_all_modules
+    init_state
+    run_full_install_flow
+    done_return
+}
+
 check_root
 init_state
 main_menu

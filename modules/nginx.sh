@@ -434,6 +434,44 @@ CONF
     log_info "SSL 通用配置生成完成"
 }
 
+# ── 选择 nginx 动态档位 ───────────────────────────────────────
+select_nginx_profile() {
+    local cpu_cores="$1"
+    local mem_mb="$2"
+
+    # 小鸡：1C 或 < 2GB，优先保守稳定
+    # 中配：2C/2-8GB，兼顾连接容量和资源占用
+    # 大机：> 2C 且 >= 8GB，适当拉高长连接与文件缓存
+    if [[ $cpu_cores -le 1 || $mem_mb -lt 2048 ]]; then
+        NGINX_PROFILE="small"
+        NGINX_WORKER_CONNECTIONS=4096
+        NGINX_KEEPALIVE_TIMEOUT=1800
+        NGINX_KEEPALIVE_REQUESTS=5000
+        NGINX_OPEN_FILE_CACHE_MAX=20000
+        NGINX_OPEN_FILE_CACHE_INACTIVE=120
+        NGINX_OPEN_FILE_CACHE_VALID=60
+        NGINX_OPEN_FILE_CACHE_MIN_USES=2
+    elif [[ $cpu_cores -le 2 || $mem_mb -lt 8192 ]]; then
+        NGINX_PROFILE="medium"
+        NGINX_WORKER_CONNECTIONS=8192
+        NGINX_KEEPALIVE_TIMEOUT=3600
+        NGINX_KEEPALIVE_REQUESTS=8000
+        NGINX_OPEN_FILE_CACHE_MAX=100000
+        NGINX_OPEN_FILE_CACHE_INACTIVE=240
+        NGINX_OPEN_FILE_CACHE_VALID=120
+        NGINX_OPEN_FILE_CACHE_MIN_USES=1
+    else
+        NGINX_PROFILE="large"
+        NGINX_WORKER_CONNECTIONS=16384
+        NGINX_KEEPALIVE_TIMEOUT=7200
+        NGINX_KEEPALIVE_REQUESTS=10000
+        NGINX_OPEN_FILE_CACHE_MAX=200000
+        NGINX_OPEN_FILE_CACHE_INACTIVE=300
+        NGINX_OPEN_FILE_CACHE_VALID=120
+        NGINX_OPEN_FILE_CACHE_MIN_USES=1
+    fi
+}
+
 # ── 生成 nginx.conf ──────────────────────────────────────────
 generate_nginx_conf() {
     log_step "生成 nginx.conf..."
@@ -444,12 +482,17 @@ generate_nginx_conf() {
     local worker_processes="auto"
     [[ $cpu_cores -eq 1 ]] && worker_processes="1"
 
-    local mem_gb
-    mem_gb=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
+    local mem_mb
+    local mem_gb_display
+    if [[ -n "${HW_MEM_GB:-}" ]] && [[ "${HW_MEM_GB}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        mem_mb=$(awk -v v="${HW_MEM_GB}" 'BEGIN { print int(v * 1024 + 0.5) }')
+        mem_gb_display="${HW_MEM_GB}"
+    else
+        mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+        mem_gb_display=$(awk -v m="${mem_mb}" 'BEGIN { print int((m + 1023) / 1024) }')
+    fi
 
-    local worker_connections=4096
-    [[ $mem_gb -ge 4 ]] && worker_connections=8192
-    [[ $mem_gb -ge 8 ]] && worker_connections=16384
+    select_nginx_profile "$cpu_cores" "$mem_mb"
 
     [[ -f /etc/nginx/nginx.conf ]] && \
         cp /etc/nginx/nginx.conf \
@@ -458,8 +501,9 @@ generate_nginx_conf() {
     cat > /etc/nginx/nginx.conf << CONF
 # ============================================================
 # /etc/nginx/nginx.conf
-# 自动生成 - $(date)
-# CPU: ${cpu_cores}核 | 内存: ${mem_gb}GB
+# 自动生成 | nginx $(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1 || echo "unknown")
+# CPU: ${cpu_cores}C | MEM: ${mem_gb_display}G | $(date '+%Y-%m')
+# PROFILE: ${NGINX_PROFILE}
 # ============================================================
 user nginx;
 worker_processes ${worker_processes};
@@ -469,7 +513,7 @@ error_log /var/log/nginx/error.log warn;
 pid /run/nginx.pid;
 
 events {
-    worker_connections ${worker_connections};
+    worker_connections ${NGINX_WORKER_CONNECTIONS};
     multi_accept       on;
     use                epoll;
     accept_mutex       off;
@@ -504,18 +548,18 @@ http {
         default 0;
     }
 
-    access_log /var/log/nginx/access.log main buffer=32k flush=10s if=\$do_log;
+    access_log /var/log/nginx/access.log main buffer=128k flush=10s if=\$do_log;
 
     sendfile    on;
     tcp_nopush  on;
     tcp_nodelay on;
 
-    keepalive_timeout  7200s;
-    keepalive_requests 10000;
+    keepalive_timeout  ${NGINX_KEEPALIVE_TIMEOUT}s;
+    keepalive_requests ${NGINX_KEEPALIVE_REQUESTS};
 
     client_max_body_size        0;
     client_body_timeout         7200s;
-    client_header_timeout       60s;
+    client_header_timeout       300s;
     client_body_buffer_size     1m;
     client_header_buffer_size   8k;
     large_client_header_buffers 8 32k;
@@ -546,9 +590,9 @@ http {
     proxy_next_upstream_timeout 0;
     proxy_next_upstream_tries   0;
 
-    open_file_cache          max=100000 inactive=300s;
-    open_file_cache_valid    120s;
-    open_file_cache_min_uses 1;
+    open_file_cache          max=${NGINX_OPEN_FILE_CACHE_MAX} inactive=${NGINX_OPEN_FILE_CACHE_INACTIVE}s;
+    open_file_cache_valid    ${NGINX_OPEN_FILE_CACHE_VALID}s;
+    open_file_cache_min_uses ${NGINX_OPEN_FILE_CACHE_MIN_USES};
     open_file_cache_errors   on;
 
     gzip off;
@@ -558,7 +602,7 @@ http {
     limit_req_zone  \$final_real_ip zone=health:1m    rate=10r/s;
     limit_conn_zone \$final_real_ip zone=conn_limit:20m;
 
-    include /etc/nginx/ssl/common.conf;
+    include /etc/nginx/ssl/*.conf;
     include /etc/nginx/conf.d/*.conf;
 }
 
@@ -579,6 +623,7 @@ stream {
 
     map \$ssl_preread_server_name \$backend {
 $(generate_sni_map)
+        # -- SNI 陷阱兜底 -----------------------------------------
         default               127.0.0.1:20880;
     }
 
@@ -592,6 +637,7 @@ $(generate_sni_map)
         proxy_protocol        on;
     }
 
+    # -- 中间层: 消费 proxy_protocol 后转发给 sing-box ----------
     server {
         listen 127.0.0.1:18443 proxy_protocol;
         proxy_pass            127.0.0.1:8443;
@@ -606,21 +652,41 @@ CONF
 
 # ── 生成 SNI 路由映射 ────────────────────────────────────────
 generate_sni_map() {
+    local had_output=0
+    local sn
+    local -A seen_reality_sni=()
+
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames）------------"
         echo "        ${REALITY_DOMAIN}     127.0.0.1:9443;"
+        seen_reality_sni["${REALITY_DOMAIN}"]=1
+        had_output=1
     fi
     if [[ -n "${REALITY_SERVER_NAMES:-}" ]]; then
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames）------------"
         for sn in "${REALITY_SERVER_NAMES[@]}"; do
+            [[ -n "$sn" ]] || continue
+            [[ -n "${seen_reality_sni[$sn]:-}" ]] && continue
             echo "        ${sn}     127.0.0.1:9443;"
+            seen_reality_sni["$sn"]=1
         done
+        had_output=1
     fi
     if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        echo "        # -- xhttp CDN 回源 -----------------------------------"
         echo "        ${XHTTP_DOMAIN}        127.0.0.1:20443;"
+        had_output=1
     fi
     if [[ -n "${GRPC_DOMAIN:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        echo "        # -- gRPC CDN 回源 ------------------------------------"
         echo "        ${GRPC_DOMAIN}         127.0.0.1:20445;"
+        had_output=1
     fi
     if [[ -n "${ANYTLS_DOMAIN:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        echo "        # -- AnyTLS -> nginx 中间层 -> sing-box --------------"
         echo "        ${ANYTLS_DOMAIN}       127.0.0.1:18443;"
     fi
 }
