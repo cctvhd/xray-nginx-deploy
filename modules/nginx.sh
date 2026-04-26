@@ -472,6 +472,30 @@ select_nginx_profile() {
     fi
 }
 
+# ── 获取用于动态分档的有效内存 ───────────────────────────────
+get_effective_memory_mb() {
+    local mem_mb
+
+    if [[ -n "${HW_MEM_GB:-}" ]] && [[ "${HW_MEM_GB}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        awk -v v="${HW_MEM_GB}" 'BEGIN { print int(v * 1024 + 0.5) }'
+        return
+    fi
+
+    mem_mb=$(awk '/MemTotal/{print int($2/1024 + 0.5)}' /proc/meminfo)
+
+    # 云主机常见情况：标称 2G / 4G / 8G，系统可用值通常会略小。
+    # 这里按“接近标准档位则向上归档”的方式处理，避免 1.8G 被当成 1G 档。
+    if (( mem_mb >= 1792 && mem_mb < 2048 )); then
+        echo 2048
+    elif (( mem_mb >= 3584 && mem_mb < 4096 )); then
+        echo 4096
+    elif (( mem_mb >= 7168 && mem_mb < 8192 )); then
+        echo 8192
+    else
+        echo "$mem_mb"
+    fi
+}
+
 # ── 生成 nginx.conf ──────────────────────────────────────────
 generate_nginx_conf() {
     log_step "生成 nginx.conf..."
@@ -488,8 +512,8 @@ generate_nginx_conf() {
         mem_mb=$(awk -v v="${HW_MEM_GB}" 'BEGIN { print int(v * 1024 + 0.5) }')
         mem_gb_display="${HW_MEM_GB}"
     else
-        mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-        mem_gb_display=$(awk -v m="${mem_mb}" 'BEGIN { print int((m + 1023) / 1024) }')
+        mem_mb=$(get_effective_memory_mb)
+        mem_gb_display=$(awk -v m="${mem_mb}" 'BEGIN { printf "%.1f", m / 1024 }')
     fi
 
     select_nginx_profile "$cpu_cores" "$mem_mb"

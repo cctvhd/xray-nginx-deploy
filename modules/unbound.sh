@@ -293,6 +293,28 @@ get_thread_count() {
     fi
 }
 
+# ── 获取用于缓存分档的有效内存 ───────────────────────────────
+get_effective_mem_gb() {
+    local mem_mb
+
+    if [[ -n "${HW_MEM_GB:-}" ]] && [[ "${HW_MEM_GB}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
+        awk -v v="${HW_MEM_GB}" 'BEGIN { print int(v + 0.5) }'
+        return
+    fi
+
+    mem_mb=$(awk '/MemTotal/{print int($2/1024 + 0.5)}' /proc/meminfo)
+
+    if (( mem_mb >= 1792 && mem_mb < 2048 )); then
+        echo 2
+    elif (( mem_mb >= 3584 && mem_mb < 4096 )); then
+        echo 4
+    elif (( mem_mb >= 7168 && mem_mb < 8192 )); then
+        echo 8
+    else
+        awk -v m="${mem_mb}" 'BEGIN { print int(m / 1024) }'
+    fi
+}
+
 # ── 检测主配置里已有的 auto-trust-anchor-file ────────────────
 get_main_conf_anchor() {
     # 找到主配置里已声明的 trust anchor 路径
@@ -314,7 +336,7 @@ generate_unbound_config() {
     threads=$(get_thread_count)
 
     local mem_gb
-    mem_gb=$(awk '/MemTotal/{printf "%d", $2/1024/1024}' /proc/meminfo)
+    mem_gb=$(get_effective_mem_gb)
 
     local msg_cache="64m"
     local rrset_cache="128m"
