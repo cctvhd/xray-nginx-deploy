@@ -106,6 +106,38 @@ is_decimal_number() {
     [[ "$1" =~ ^[0-9]+([.][0-9]+)?$ ]]
 }
 
+normalize_stack_mode() {
+    case "${1:-}" in
+        yes|dual|dualstack|ipv4v6)
+            echo "dual"
+            ;;
+        no|ipv4|v4|ipv4-only)
+            echo "ipv4"
+            ;;
+        ipv6|v6|ipv6-only)
+            echo "ipv6"
+            ;;
+        *)
+            echo "ipv4"
+            ;;
+    esac
+}
+
+detect_stack_mode() {
+    local has_v4=0 has_v6=0
+
+    ip -o -4 addr show scope global 2>/dev/null | grep -q . && has_v4=1 || true
+    ip -o -6 addr show scope global 2>/dev/null | grep -v ' fe80:' | grep -q . && has_v6=1 || true
+
+    if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then
+        echo "dual"
+    elif [[ $has_v6 -eq 1 ]]; then
+        echo "ipv6"
+    else
+        echo "ipv4"
+    fi
+}
+
 parse_memory_gb_to_mb() {
     local value="${1,,}"
 
@@ -184,13 +216,30 @@ collect_hardware_info() {
     HW_BANDWIDTH="${HW_BANDWIDTH// /}"
     HW_BANDWIDTH="${HW_BANDWIDTH%b}"
 
-    # 双栈
-    read -rp "是否支持 IPv6 双栈？[y/N]: " hw_ipv6
-    if [[ "${hw_ipv6,,}" == "y" ]]; then
-        HW_DUAL_STACK="yes"
-    else
-        HW_DUAL_STACK="no"
-    fi
+    # 网络栈
+    local detected_stack
+    detected_stack=$(detect_stack_mode)
+    echo "网络栈类型："
+    echo "  1. 双栈 IPv4 + IPv6"
+    echo "  2. 单栈 IPv4"
+    echo "  3. 单栈 IPv6"
+    case "$detected_stack" in
+        dual) log_info "自动检测建议: 双栈 IPv4 + IPv6" ;;
+        ipv6) log_info "自动检测建议: 单栈 IPv6" ;;
+        *)    log_info "自动检测建议: 单栈 IPv4" ;;
+    esac
+    local stack_choice default_choice
+    case "$detected_stack" in
+        dual) default_choice="1" ;;
+        ipv6) default_choice="3" ;;
+        *)    default_choice="2" ;;
+    esac
+    read -rp "请选择 [1-3，默认${default_choice}]: " stack_choice
+    case "${stack_choice:-$default_choice}" in
+        1) HW_DUAL_STACK="dual" ;;
+        3) HW_DUAL_STACK="ipv6" ;;
+        *) HW_DUAL_STACK="ipv4" ;;
+    esac
 
     # 磁盘类型
     read -rp "磁盘类型 [ssd/hdd，默认 ssd]: " HW_DISK_TYPE
@@ -205,7 +254,7 @@ collect_hardware_info() {
     echo "  CPU:    ${HW_CPU_CORES} 核"
     echo "  内存:   ${HW_MEM_GB} GB"
     echo "  带宽:   ${HW_BANDWIDTH}"
-    echo "  IPv6:   ${HW_DUAL_STACK}"
+    echo "  网络栈: ${HW_DUAL_STACK}"
     echo "  磁盘:   ${HW_DISK_TYPE}"
     echo ""
     read -rp "确认以上配置？[Y/n]: " confirm
@@ -397,7 +446,10 @@ optimize_sysctl() {
 
     # IPv6 参数
     local ipv6_conf=""
-    if [[ "${HW_DUAL_STACK}" == "yes" ]]; then
+    local stack_mode
+    stack_mode=$(normalize_stack_mode "${HW_DUAL_STACK:-ipv4}")
+
+    if [[ "$stack_mode" == "dual" || "$stack_mode" == "ipv6" ]]; then
         ipv6_conf="net.ipv6.conf.all.disable_ipv6     = 0
 net.ipv6.conf.default.disable_ipv6 = 0"
     else

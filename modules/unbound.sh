@@ -13,6 +13,20 @@ check_unbound_installed() {
     return 1
 }
 
+get_stack_mode() {
+    case "${HW_DUAL_STACK:-ipv4}" in
+        yes|dual|dualstack|ipv4v6)
+            echo "dual"
+            ;;
+        ipv6|v6|ipv6-only)
+            echo "ipv6"
+            ;;
+        *)
+            echo "ipv4"
+            ;;
+    esac
+}
+
 # ── 安装 Unbound ─────────────────────────────────────────────
 install_unbound() {
     log_step "安装 Unbound..."
@@ -261,7 +275,8 @@ generate_unbound_config() {
     [[ $mem_gb -ge 8 ]] && msg_cache="512m"  && rrset_cache="1024m"
 
     local conf_dir target_conf anchor_conf remote_conf
-    local transparent_zone_lines
+    local transparent_zone_lines stack_mode
+    local ipv6_interface_lines ipv6_localhost_lines ipv6_private_lines
 
     UNBOUND_SERVICE_NAME=$(infer_unbound_service_name)
     ensure_unbound_include_dir
@@ -271,6 +286,21 @@ generate_unbound_config() {
     anchor_conf="${conf_dir}/root-auto-trust-anchor-file.conf"
     remote_conf="${conf_dir}/remote-control.conf"
     transparent_zone_lines=$(build_unbound_transparent_zones)
+    stack_mode=$(get_stack_mode)
+
+    if [[ "$stack_mode" == "dual" || "$stack_mode" == "ipv6" ]]; then
+        ipv6_interface_lines='    interface: ::1
+    access-control: ::1 allow
+    access-control: ::0/0 refuse'
+        ipv6_localhost_lines='    local-data: "localhost. 10800 IN AAAA ::1"
+    local-zone: "ip6.arpa." transparent'
+        ipv6_private_lines='    private-address: fd00::/8
+    private-address: fe80::/10'
+    else
+        ipv6_interface_lines=""
+        ipv6_localhost_lines=""
+        ipv6_private_lines=""
+    fi
 
     rm -f "${conf_dir}/local-recursive.conf"
 
@@ -289,13 +319,12 @@ server:
     do-tcp: yes
 
     interface: 127.0.0.1
-    interface: ::1
+${ipv6_interface_lines:+
+${ipv6_interface_lines}}
 
     access-control: 127.0.0.0/8 allow
-    access-control: ::1 allow
     access-control: ::ffff:127.0.0.1 allow
     access-control: 0.0.0.0/0 refuse
-    access-control: ::0/0 refuse
 
     num-threads: ${threads}
     so-reuseport: yes
@@ -338,10 +367,10 @@ server:
 
     local-zone: "localhost." static
     local-data: "localhost. 10800 IN A 127.0.0.1"
-    local-data: "localhost. 10800 IN AAAA ::1"
     local-zone: "127.in-addr.arpa." static
     local-zone: "0.0.0.0/8." static
-    local-zone: "ip6.arpa." transparent
+${ipv6_localhost_lines:+
+${ipv6_localhost_lines}}
 
     local-zone: "cdnjs.cloudflare.com." transparent
     local-zone: "ajax.cloudflare.com." transparent
@@ -357,8 +386,8 @@ ${transparent_zone_lines}}
     private-address: 172.16.0.0/12
     private-address: 10.0.0.0/8
     private-address: 169.254.0.0/16
-    private-address: fd00::/8
-    private-address: fe80::/10
+${ipv6_private_lines:+
+${ipv6_private_lines}}
 
     local-zone: "version.bind." refuse
     local-zone: "authors.bind." refuse
@@ -507,6 +536,9 @@ CRON_EOF
 setup_resolv_conf() {
     log_step "配置 /etc/resolv.conf..."
 
+    local stack_mode
+    stack_mode=$(get_stack_mode)
+
     chattr -i /etc/resolv.conf 2>/dev/null || true
 
     [[ -f /etc/resolv.conf ]] && \
@@ -514,15 +546,15 @@ setup_resolv_conf() {
            "/etc/resolv.conf.bak.$(date +%Y%m%d%H%M%S)" \
            2>/dev/null || true
 
-    cat > /etc/resolv.conf << 'RESOLV_EOF'
+    cat > /etc/resolv.conf << RESOLV_EOF
 # 本地 Unbound 递归 DNS
 nameserver 127.0.0.1
-nameserver ::1
+$( [[ "$stack_mode" == "dual" || "$stack_mode" == "ipv6" ]] && echo 'nameserver ::1' )
 options ndots:3 timeout:2 attempts:3
 RESOLV_EOF
 
     chattr +i /etc/resolv.conf 2>/dev/null || true
-    log_info "/etc/resolv.conf 配置完成并已锁定"
+    log_info "/etc/resolv.conf 配置完成并已锁定（网络栈: ${stack_mode}）"
 }
 
 # ── 启动 Unbound ─────────────────────────────────────────────
