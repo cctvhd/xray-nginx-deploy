@@ -299,6 +299,9 @@ calc_mem_params() {
         (( SYSCTL_TCP_MAX_TW_BUCKETS > 1048576 )) && SYSCTL_TCP_MAX_TW_BUCKETS=1048576
     fi
 
+    # 保持系统 nofile 上限不低于 Xray 官方 service 的 1000000
+    (( NOFILE_LIMIT < 1048576 )) && NOFILE_LIMIT=1048576
+
     FILE_MAX_LIMIT=$(( NOFILE_LIMIT * 2 ))
 }
 
