@@ -75,6 +75,32 @@ collect_unbound_stack_mode() {
     log_info "Unbound 网络栈模式: ${HW_DUAL_STACK}"
 }
 
+# ── 完全清理 Unbound（重装前调用）───────────────────────────
+# FIX: 新增清理函数，确保重装时没有残留文件
+purge_unbound() {
+    log_step "清理 Unbound 残留文件..."
+
+    systemctl stop unbound 2>/dev/null || true
+    systemctl disable unbound 2>/dev/null || true
+
+    case "$OS_ID" in
+        ubuntu|debian)
+            apt-get remove -y --purge unbound unbound-anchor 2>/dev/null || true
+            ;;
+        centos|rhel|rocky|almalinux)
+            dnf remove -y unbound unbound-libs 2>/dev/null || true
+            ;;
+    esac
+
+    rm -rf /etc/unbound
+    rm -rf /var/lib/unbound
+    rm -rf /run/unbound
+    rm -f /usr/local/bin/update-root-hints.sh
+    rm -f /etc/cron.weekly/update-root-hints
+
+    log_info "Unbound 残留文件清理完成"
+}
+
 # ── 安装 Unbound ─────────────────────────────────────────────
 install_unbound() {
     log_step "安装 Unbound..."
@@ -171,10 +197,24 @@ init_trust_anchor() {
 
     mkdir -p /var/lib/unbound
 
-    # 检查系统已有的 root.key
+    # FIX: 不管文件是否存在，先校验内容合法性
+    # 多次安装会导致 root.key 存在多条 DNSKEY 记录，Unbound 启动报错
+    if [[ -f /var/lib/unbound/root.key && -s /var/lib/unbound/root.key ]]; then
+        local dnskey_count
+        dnskey_count=$(grep -cE "^\. .*DNSKEY|^\..*DNSKEY" /var/lib/unbound/root.key 2>/dev/null || echo 0)
+        if [[ "$dnskey_count" -gt 1 ]]; then
+            log_warn "root.key 存在 ${dnskey_count} 条 DNSKEY 记录（重复安装导致），强制重建..."
+            rm -f /var/lib/unbound/root.key
+        else
+            log_info "root.key 已存在且合法，跳过初始化"
+            chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+            return 0
+        fi
+    fi
+
+    # 检查系统其他路径的 root.key
     local system_key=""
     for path in \
-        /var/lib/unbound/root.key \
         /usr/share/dns/root.key \
         /etc/unbound/root.key; do
         if [[ -f "$path" && -s "$path" ]]; then
@@ -184,16 +224,13 @@ init_trust_anchor() {
     done
 
     if [[ -n "$system_key" ]]; then
-        if [[ "$system_key" != "/var/lib/unbound/root.key" ]]; then
-            cp "$system_key" /var/lib/unbound/root.key
-            log_info "使用系统自带 trust anchor: $system_key"
-        else
-            log_info "root.key 已存在，跳过初始化"
-        fi
+        cp "$system_key" /var/lib/unbound/root.key
+        log_info "使用系统自带 trust anchor: $system_key"
     else
+        # 用 unbound-anchor 生成，失败则写入 DS 格式兜底
         unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
         if [[ ! -s /var/lib/unbound/root.key ]]; then
-            log_warn "手动写入 trust anchor DS 记录..."
+            log_warn "unbound-anchor 失败，写入 DS 格式 trust anchor..."
             printf '. IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n' \
                 > /var/lib/unbound/root.key
         fi
@@ -317,7 +354,6 @@ get_effective_mem_gb() {
 
 # ── 检测主配置里已有的 auto-trust-anchor-file ────────────────
 get_main_conf_anchor() {
-    # 找到主配置里已声明的 trust anchor 路径
     grep -r "auto-trust-anchor-file" \
         /etc/unbound/unbound.conf \
         /etc/unbound/conf.d/ \
@@ -469,10 +505,21 @@ ${ipv6_private_lines}}
     extended-statistics: yes
 CONF_EOF
 
-    cat > "$anchor_conf" << CONF_EOF
+    # FIX: 生成 anchor_conf 前检查主配置是否已包含 trust-anchor
+    # 避免与系统默认配置重复导致 "trust anchor presented twice" 错误
+    local existing_anchor
+    existing_anchor=$(grep -r "auto-trust-anchor-file\|trust-anchor-file" \
+        /etc/unbound/unbound.conf 2>/dev/null | grep -v "^[[:space:]]*#" || true)
+
+    if [[ -n "$existing_anchor" ]]; then
+        log_warn "主配置已含 trust-anchor 声明，跳过生成 $anchor_conf 避免重复"
+        rm -f "$anchor_conf"
+    else
+        cat > "$anchor_conf" << CONF_EOF
 server:
     auto-trust-anchor-file: "/var/lib/unbound/root.key"
 CONF_EOF
+    fi
 
     cat > "$remote_conf" << CONF_EOF
 remote-control:
@@ -632,12 +679,14 @@ RESOLV_EOF
     log_info "/etc/resolv.conf 配置完成并已锁定（网络栈: ${stack_mode}，解析器: ${resolver_addr}）"
 }
 
-# ── 启动 Unbound ─────────────────────────────────────────────
+# ── 启动 Unbound，成功后才切换系统 DNS ──────────────────────
+# FIX: 必须确认 Unbound 正常启动且能解析，才修改 /etc/resolv.conf
+# 失败时打印日志并 exit，不修改系统 DNS，保证网络不断
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
     if ! unbound-checkconf >/dev/null 2>&1; then
-        log_error "Unbound 配置验证失败"
+        log_error "Unbound 配置验证失败，中止启动（系统 DNS 未修改）"
         unbound-checkconf || true
         exit 1
     fi
@@ -645,13 +694,32 @@ start_unbound() {
     systemctl enable --now unbound
 
     sleep 2
-    if systemctl is-active --quiet unbound; then
-        log_info "Unbound 服务启动成功"
-    else
-        log_error "Unbound 服务启动失败，查看日志："
+    if ! systemctl is-active --quiet unbound; then
+        log_error "Unbound 服务启动失败，系统 DNS 保持不变，查看日志："
         journalctl -u unbound -n 20 --no-pager
         exit 1
     fi
+
+    log_info "Unbound 服务启动成功"
+
+    # 启动成功后，再验证本地解析可用
+    log_step "验证本地解析可用后切换系统 DNS..."
+    local probe_ok=0
+    for domain in google.com github.com cloudflare.com; do
+        if dig @127.0.0.1 "$domain" +short +time=5 >/dev/null 2>&1; then
+            probe_ok=1
+            break
+        fi
+    done
+
+    if [[ $probe_ok -eq 0 ]]; then
+        log_error "Unbound 已启动但无法解析任何域名，系统 DNS 保持不变"
+        log_error "请检查网络或防火墙后手动执行: setup_resolv_conf"
+        exit 1
+    fi
+
+    # 解析正常，安全切换系统 DNS
+    setup_resolv_conf
 }
 
 # ── 验证递归解析 ─────────────────────────────────────────────
@@ -726,6 +794,7 @@ run_unbound() {
                 ;;
             2)
                 # 只更新配置
+                # FIX: 先重启确认服务正常，再切换系统 DNS
                 collect_unbound_stack_mode
                 collect_unbound_service_name
                 disable_systemd_resolved
@@ -735,22 +804,35 @@ run_unbound() {
                 init_unbound_control
                 install_root_hints_updater
                 setup_root_hints_updater
-                setup_resolv_conf
                 systemctl restart unbound
                 sleep 2
-                if systemctl is-active --quiet unbound; then
-                    log_info "Unbound 重新配置成功"
-                else
-                    log_error "Unbound 启动失败"
+                if ! systemctl is-active --quiet unbound; then
+                    log_error "Unbound 启动失败，系统 DNS 保持不变"
                     journalctl -u unbound -n 20 --no-pager
                     exit 1
                 fi
+                log_info "Unbound 重新配置成功"
+                # 验证解析正常后才切换系统 DNS
+                local probe_ok=0
+                for domain in google.com github.com cloudflare.com; do
+                    if dig @127.0.0.1 "$domain" +short +time=5 >/dev/null 2>&1; then
+                        probe_ok=1
+                        break
+                    fi
+                done
+                if [[ $probe_ok -eq 0 ]]; then
+                    log_error "Unbound 已启动但无法解析任何域名，系统 DNS 保持不变"
+                    exit 1
+                fi
+                setup_resolv_conf
                 verify_unbound
                 ;;
             3)
-                # 完整重装
+                # FIX: 完整重装前先彻底清理，避免残留 root.key 导致重复 trust anchor
+                # FIX: setup_resolv_conf 已并入 start_unbound，确认启动成功后才切换 DNS
                 collect_unbound_stack_mode
                 collect_unbound_service_name
+                purge_unbound
                 install_unbound
                 disable_systemd_resolved
                 download_root_hints
@@ -759,13 +841,13 @@ run_unbound() {
                 init_unbound_control
                 install_root_hints_updater
                 setup_root_hints_updater
-                setup_resolv_conf
                 start_unbound
                 verify_unbound
                 ;;
         esac
     else
         # 未安装，走完整安装流程
+        # FIX: setup_resolv_conf 已并入 start_unbound，确认启动成功后才切换 DNS
         collect_unbound_stack_mode
         collect_unbound_service_name
         install_unbound
@@ -776,7 +858,6 @@ run_unbound() {
         init_unbound_control
         install_root_hints_updater
         setup_root_hints_updater
-        setup_resolv_conf
         start_unbound
         verify_unbound
     fi
