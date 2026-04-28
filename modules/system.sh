@@ -50,60 +50,178 @@ detect_os() {
     log_info "系统架构: $(uname -m)"
 }
 
-# ── 检测内核版本及BBR支持 ────────────────────────────────────
+# ── 检测内核版本及 BBR 支持 ──────────────────────────────────
+# 输出变量：
+#   KERNEL_VERSION             — 完整版本字符串
+#   KERNEL_MAJOR / MINOR       — 主/次版本号
+#   BBR_LEVEL                  — none / bbr / bbr_modern / bbr3
+#     none        : 内核 < 4.9，不支持 BBR
+#     bbr         : 4.9 ≤ 内核 < 5.0，基础 BBR v1
+#     bbr_modern  : 5.0 ≤ 内核 < 6.13（含 EL10 6.12），现代 BBR v1
+#     bbr3        : 内核 ≥ 6.13（mainline），BBR v3
+#   KERNEL_UPGRADE_RECOMMENDED — true / false
+#   KERNEL_UPGRADE_POSSIBLE    — true / false
+#     AlmaLinux/Rocky/RHEL ≥ 10 暂无 ElRepo，设为 false
+# ────────────────────────────────────────────────────────────
 detect_kernel() {
     KERNEL_VERSION=$(uname -r)
     KERNEL_MAJOR=$(uname -r | cut -d. -f1)
     KERNEL_MINOR=$(uname -r | cut -d. -f2)
+
     log_info "内核版本: $KERNEL_VERSION"
 
-    if [[ $KERNEL_MAJOR -gt 4 ]] || \
-       [[ $KERNEL_MAJOR -eq 4 && $KERNEL_MINOR -ge 9 ]]; then
-        BBR_VERSION="bbr"
-        log_info "BBR 支持: mainline BBR (内核 >= 4.9)"
+    # ── BBR 支持分级 ────────────────────────────────────────
+    if [[ $KERNEL_MAJOR -gt 6 ]] || \
+       [[ $KERNEL_MAJOR -eq 6 && $KERNEL_MINOR -ge 13 ]]; then
+        # mainline BBR v3（6.13 正式合并）
+        BBR_LEVEL="bbr3"
+        KERNEL_UPGRADE_RECOMMENDED=false
+        log_info "BBR 支持: ✅ BBR v3 (mainline >= 6.13)"
+
+    elif [[ $KERNEL_MAJOR -eq 6 && $KERNEL_MINOR -ge 12 ]]; then
+        # EL10 发行版内核 6.12，未 backport BBR v3，仍为 v1
+        # 但属于现代内核，同样写入全部 BBR v3 优化参数（无副作用）
+        BBR_LEVEL="bbr_modern"
+        KERNEL_UPGRADE_RECOMMENDED=false
+        log_info "BBR 支持: ✅ BBR v1，现代内核 (EL10 6.12)"
+
+    elif [[ $KERNEL_MAJOR -ge 5 ]]; then
+        BBR_LEVEL="bbr_modern"
+        KERNEL_UPGRADE_RECOMMENDED=false
+        log_info "BBR 支持: ✅ BBR v1，现代内核 (>= 5.x)"
+
+    elif [[ $KERNEL_MAJOR -eq 4 && $KERNEL_MINOR -ge 9 ]]; then
+        BBR_LEVEL="bbr"
+        KERNEL_UPGRADE_RECOMMENDED=false
+        log_info "BBR 支持: ✅ BBR v1，基础版 (4.9 - 4.x)"
+
     else
-        BBR_VERSION="none"
-        log_warn "内核版本过低，建议升级到支持 BBR 的较新内核"
+        BBR_LEVEL="none"
+        KERNEL_UPGRADE_RECOMMENDED=true
+        log_warn "BBR 支持: ❌ 不支持 (内核 < 4.9)，建议升级内核"
+    fi
+
+    # ── 升级可行性判断 ───────────────────────────────────────
+    # ElRepo 对 EL10（AlmaLinux/Rocky/RHEL 10+）暂无稳定支持
+    KERNEL_UPGRADE_POSSIBLE=true
+    if [[ "$OS_ID" =~ ^(almalinux|rocky|centos|rhel)$ ]]; then
+        local os_major="${OS_VERSION:-0}"
+        if [[ "$os_major" -ge 10 ]]; then
+            KERNEL_UPGRADE_POSSIBLE=false
+            log_info "升级判断: $OS_NAME (EL${os_major}) — ElRepo 暂不支持该版本，跳过升级"
+        fi
     fi
 }
 
 # ── 升级内核（可选）─────────────────────────────────────────
 upgrade_kernel() {
-    if [[ "$BBR_VERSION" == "bbr" ]]; then
-        log_info "当前内核已支持 BBR，无需为了系统优化强制升级"
-        return
+    # ① 内核已满足 BBR 要求，无需升级
+    if [[ "$KERNEL_UPGRADE_RECOMMENDED" == "false" ]]; then
+        log_info "当前内核 ($KERNEL_VERSION) 已满足 BBR 运行要求，无需升级"
+        return 0
+    fi
+
+    # ② OS 层面暂无升级渠道
+    if [[ "$KERNEL_UPGRADE_POSSIBLE" == "false" ]]; then
+        log_warn "当前内核版本较低，但 $OS_NAME 暂无可用的自动升级渠道，建议手动处理"
+        return 0
     fi
 
     echo ""
-    read -rp "当前内核过低，是否升级到较新的通用内核以启用 BBR？[y/N]: " upgrade
-    [[ "${upgrade,,}" != "y" ]] && return
+    log_warn "当前内核 ($KERNEL_VERSION) 不支持 BBR，建议升级"
+    read -rp "是否自动升级到较新的通用内核？[y/N]: " upgrade_choice
+    [[ "${upgrade_choice,,}" != "y" ]] && {
+        log_warn "已跳过内核升级，BBR 相关优化将不会生效"
+        return 0
+    }
+
+    log_step "开始内核升级..."
+    local upgrade_ok=false
 
     case "$OS_ID" in
+        # ── Debian / Ubuntu ─────────────────────────────────
         ubuntu|debian)
-            log_step "安装 HWE 内核..."
-            $PKG_INSTALL \
-                linux-generic-hwe-$(lsb_release -rs) 2>/dev/null || \
-            $PKG_INSTALL linux-image-generic
+            local hwe_pkg
+            hwe_pkg="linux-generic-hwe-$(lsb_release -rs 2>/dev/null || echo '')"
+            log_info "尝试安装 HWE 内核: $hwe_pkg"
+
+            if $PKG_INSTALL "$hwe_pkg" 2>&1 | tee /tmp/kernel_upgrade.log; then
+                upgrade_ok=true
+            else
+                log_warn "HWE 内核安装失败，回退到 linux-image-generic"
+                if $PKG_INSTALL linux-image-generic 2>&1 | \
+                   tee -a /tmp/kernel_upgrade.log; then
+                    upgrade_ok=true
+                fi
+            fi
             ;;
+
+        # ── CentOS / RHEL / Rocky / AlmaLinux (EL < 10) ────
         centos|rhel|rocky|almalinux)
-            log_step "安装 elrepo mainline 内核..."
             local rhel_ver
-            rhel_ver=$(rpm -E %rhel)
-            local elrepo_url="https://www.elrepo.org/elrepo-release-${rhel_ver}.el${rhel_ver}.elrepo.noarch.rpm"
-            log_info "elrepo URL: ${elrepo_url}"
-            rpm --import \
-                https://www.elrepo.org/RPM-GPG-KEY-elrepo.org \
-                2>/dev/null || true
-            dnf install -y "${elrepo_url}" 2>/dev/null || true
-            dnf install -y --enablerepo=elrepo-kernel kernel-ml
-            grub2-set-default 0
+            rhel_ver=$(rpm -E %rhel 2>/dev/null || echo "$OS_VERSION")
+            local elrepo_rpm="https://www.elrepo.org/elrepo-release-${rhel_ver}.el${rhel_ver}.elrepo.noarch.rpm"
+            local gpg_key="https://www.elrepo.org/RPM-GPG-KEY-elrepo.org"
+
+            log_info "ElRepo 目标版本: EL${rhel_ver}"
+            log_info "ElRepo RPM URL : $elrepo_rpm"
+
+            log_info "正在导入 ElRepo GPG Key..."
+            rpm --import "$gpg_key" 2>&1 || \
+                log_warn "GPG Key 导入失败（可能已存在），继续..."
+
+            log_info "正在安装 ElRepo 仓库..."
+            if ! dnf install -y "$elrepo_rpm" 2>&1 | \
+               tee /tmp/kernel_upgrade.log; then
+                log_error "ElRepo 仓库安装失败，升级中止"
+                log_error "详细日志: /tmp/kernel_upgrade.log"
+                log_warn "请手动参考: https://elrepo.org/tiki/HomePage"
+                return 1
+            fi
+
+            log_info "正在安装 kernel-ml（mainline）..."
+            if dnf install -y --enablerepo=elrepo-kernel kernel-ml \
+               2>&1 | tee -a /tmp/kernel_upgrade.log; then
+                upgrade_ok=true
+                grub2-set-default 0 2>/dev/null || true
+                log_info "已将新内核设置为默认启动项"
+            else
+                log_error "kernel-ml 安装失败"
+                log_error "详细日志: /tmp/kernel_upgrade.log"
+                return 1
+            fi
             ;;
     esac
 
-    log_warn "内核升级完成，需要重启后再运行脚本"
-    read -rp "是否立即重启？[Y/n]: " reboot_now
-    [[ "${reboot_now,,}" != "n" ]] && reboot
-    exit 0
+    # ── 结果反馈 ────────────────────────────────────────────
+    echo ""
+    if [[ "$upgrade_ok" == "true" ]]; then
+        local new_kernel=""
+        case "$OS_ID" in
+            ubuntu|debian)
+                new_kernel=$(dpkg -l 'linux-image-*' 2>/dev/null | \
+                    awk '/^ii/{print $2}' | sort -V | tail -1)
+                ;;
+            centos|rhel|rocky|almalinux)
+                new_kernel=$(rpm -q kernel-ml 2>/dev/null | \
+                    sort -V | tail -1)
+                ;;
+        esac
+        log_info "✅ 内核升级成功"
+        [[ -n "$new_kernel" ]] && log_info "   新内核包: $new_kernel"
+        log_warn "⚠️  需要重启后新内核才会生效"
+        echo ""
+        read -rp "是否立即重启服务器？[Y/n]: " reboot_now
+        [[ "${reboot_now,,}" != "n" ]] && {
+            log_info "正在重启..."
+            reboot
+        }
+        log_warn "请手动重启后重新运行脚本以使新内核生效"
+        exit 0
+    else
+        log_error "❌ 内核升级失败，脚本将继续，但 BBR 参数可能无法生效"
+        log_warn "详细日志: /tmp/kernel_upgrade.log"
+    fi
 }
 
 # ── 硬件参数归一化辅助 ───────────────────────────────────────
@@ -113,26 +231,20 @@ is_decimal_number() {
 
 normalize_stack_mode() {
     case "${1:-}" in
-        yes|dual|dualstack|ipv4v6)
-            echo "dual"
-            ;;
-        no|ipv4|v4|ipv4-only)
-            echo "ipv4"
-            ;;
-        ipv6|v6|ipv6-only)
-            echo "ipv6"
-            ;;
-        *)
-            echo "ipv4"
-            ;;
+        yes|dual|dualstack|ipv4v6) echo "dual" ;;
+        no|ipv4|v4|ipv4-only)      echo "ipv4" ;;
+        ipv6|v6|ipv6-only)         echo "ipv6" ;;
+        *)                         echo "ipv4" ;;
     esac
 }
 
 detect_stack_mode() {
     local has_v4=0 has_v6=0
 
-    ip -o -4 addr show scope global 2>/dev/null | grep -q . && has_v4=1 || true
-    ip -o -6 addr show scope global 2>/dev/null | grep -v ' fe80:' | grep -q . && has_v6=1 || true
+    ip -o -4 addr show scope global 2>/dev/null | \
+        grep -q . && has_v4=1 || true
+    ip -o -6 addr show scope global 2>/dev/null | \
+        grep -v ' fe80:' | grep -q . && has_v6=1 || true
 
     if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then
         echo "dual"
@@ -145,7 +257,6 @@ detect_stack_mode() {
 
 parse_memory_gb_to_mb() {
     local value="${1,,}"
-
     value="${value// /}"
     value="${value%gb}"
     value="${value%g}"
@@ -154,9 +265,7 @@ parse_memory_gb_to_mb() {
 
     awk -v v="$value" 'BEGIN {
         mb = int(v * 1024 + 0.5)
-        if (mb < 1024) {
-            exit 1
-        }
+        if (mb < 1024) { exit 1 }
         print mb
     }'
 }
@@ -174,11 +283,8 @@ parse_bandwidth_to_mbps() {
     fi
 
     awk -v v="$number" -v u="$unit" 'BEGIN {
-        if (u == "g") {
-            print int(v * 1000 + 0.5)
-        } else {
-            print int(v + 0.5)
-        }
+        if (u == "g") { print int(v * 1000 + 0.5) }
+        else          { print int(v + 0.5) }
     }'
 }
 
@@ -187,21 +293,42 @@ collect_hardware_info() {
     echo ""
     log_step "配置服务器硬件信息"
     echo ""
-    log_info "请根据实际情况填写，用于优化系统参数"
+    log_info "请根据实际情况填写物理规格，用于优化系统参数"
     echo ""
 
-    # CPU 核心数
-    read -rp "CPU 核心数 [如: 1, 2, 4, 8]: " HW_CPU_CORES
+    # ── CPU 核心数 ───────────────────────────────────────────
+    local auto_cpu
+    auto_cpu=$(nproc 2>/dev/null || echo 1)
+    read -rp "CPU 核心数 [检测值 ${auto_cpu}，直接回车使用]: " HW_CPU_CORES
+    HW_CPU_CORES="${HW_CPU_CORES:-$auto_cpu}"
     while ! [[ "$HW_CPU_CORES" =~ ^[0-9]+$ ]] || \
           [[ "$HW_CPU_CORES" -lt 1 ]]; do
         log_warn "请输入有效的核心数"
         read -rp "CPU 核心数: " HW_CPU_CORES
     done
 
-    # 内存大小
-    read -rp "内存大小 GB [如: 1, 2, 2.5, 4, 8]: " HW_MEM_GB
+    # ── 内存大小 ─────────────────────────────────────────────
+    # 自动检测物理内存并取整到常见规格，避免 OS 保留导致分档偏低
+    local auto_mem_mb auto_mem_gb suggested_gb
+    auto_mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    auto_mem_gb=$(awk -v m="$auto_mem_mb" \
+        'BEGIN{printf "%.1f", m/1024}')
+
+    # 向上取整到最近的常见规格（1/2/4/8/16/32GB）
+    if   [[ $auto_mem_mb -ge 28672 ]]; then suggested_gb=32
+    elif [[ $auto_mem_mb -ge 14336 ]]; then suggested_gb=16
+    elif [[ $auto_mem_mb -ge  6144 ]]; then suggested_gb=8
+    elif [[ $auto_mem_mb -ge  3072 ]]; then suggested_gb=4
+    elif [[ $auto_mem_mb -ge  1536 ]]; then suggested_gb=2
+    else suggested_gb=1
+    fi
+
+    log_info "检测内存: ${auto_mem_gb}GB → 建议按物理规格填写: ${suggested_gb}GB"
+    read -rp "内存大小 GB [直接回车使用建议值 ${suggested_gb}GB]: " HW_MEM_GB
+    HW_MEM_GB="${HW_MEM_GB:-$suggested_gb}"
+
     while ! parse_memory_gb_to_mb "$HW_MEM_GB" >/dev/null; do
-        log_warn "请输入有效的内存大小，支持 2.5 或 2.5GB"
+        log_warn "请输入有效的内存大小，支持小数如 2.5 或 2.5GB"
         read -rp "内存大小 GB: " HW_MEM_GB
     done
     HW_MEM_GB="${HW_MEM_GB,,}"
@@ -209,7 +336,7 @@ collect_hardware_info() {
     HW_MEM_GB="${HW_MEM_GB%gb}"
     HW_MEM_GB="${HW_MEM_GB%g}"
 
-    # 网口带宽
+    # ── 网口带宽 ─────────────────────────────────────────────
     echo "网口带宽 [如: 100m, 500m, 1g, 2.5g, 10g]"
     read -rp "网口带宽: " HW_BANDWIDTH
     HW_BANDWIDTH="${HW_BANDWIDTH,,}"
@@ -221,7 +348,7 @@ collect_hardware_info() {
     HW_BANDWIDTH="${HW_BANDWIDTH// /}"
     HW_BANDWIDTH="${HW_BANDWIDTH%b}"
 
-    # 网络栈
+    # ── 网络栈 ───────────────────────────────────────────────
     local detected_stack
     detected_stack=$(detect_stack_mode)
     echo "网络栈类型："
@@ -239,21 +366,21 @@ collect_hardware_info() {
         ipv6) default_choice="3" ;;
         *)    default_choice="2" ;;
     esac
-    read -rp "请选择 [1-3，默认${default_choice}]: " stack_choice
+    read -rp "请选择 [1-3，默认 ${default_choice}]: " stack_choice
     case "${stack_choice:-$default_choice}" in
         1) HW_DUAL_STACK="dual" ;;
         3) HW_DUAL_STACK="ipv6" ;;
         *) HW_DUAL_STACK="ipv4" ;;
     esac
 
-    # 磁盘类型
+    # ── 磁盘类型 ─────────────────────────────────────────────
     read -rp "磁盘类型 [ssd/hdd，默认 ssd]: " HW_DISK_TYPE
     HW_DISK_TYPE="${HW_DISK_TYPE,,}"
     [[ -z "$HW_DISK_TYPE" ]] && HW_DISK_TYPE="ssd"
     [[ "$HW_DISK_TYPE" != "ssd" && \
        "$HW_DISK_TYPE" != "hdd" ]] && HW_DISK_TYPE="ssd"
 
-    # 汇总确认
+    # ── 汇总确认 ─────────────────────────────────────────────
     echo ""
     log_info "硬件配置确认："
     echo "  CPU:    ${HW_CPU_CORES} 核"
@@ -273,78 +400,79 @@ calc_net_params() {
     local bw_mbps
     bw_mbps=$(parse_bandwidth_to_mbps "${HW_BANDWIDTH}") || bw_mbps=1000
 
-    # 根据带宽计算缓冲区上限
-    # TCP 继续按带宽分档；同时为 QUIC/Hysteria2 保留 16MB 的低档位下限
     if [[ $bw_mbps -ge 10000 ]]; then
         # 10G+
-        NET_CORE_RMEM_MAX=33554432   # 32MB
+        NET_CORE_RMEM_MAX=33554432      # 32MB
         NET_CORE_WMEM_MAX=33554432
-        NET_RMEM="4096 87380 33554432"
-        NET_WMEM="4096 65536 33554432"
-        XRAY_PADDING="100-1000"
+        NET_RMEM="4096 262144 33554432"
+        NET_WMEM="4096 262144 33554432"
     elif [[ $bw_mbps -ge 1000 ]]; then
         # 1G
-        NET_CORE_RMEM_MAX=16777216   # 16MB
+        NET_CORE_RMEM_MAX=16777216      # 16MB
         NET_CORE_WMEM_MAX=16777216
-        NET_RMEM="4096 87380 16777216"
-        NET_WMEM="4096 65536 16777216"
-        XRAY_PADDING="100-1000"
+        NET_RMEM="4096 262144 16777216"
+        NET_WMEM="4096 262144 16777216"
     else
-        # 100M 及以下
-        NET_CORE_RMEM_MAX=16777216   # 16MB, 兼顾 QUIC/Hysteria2 的缓冲区下限
+        # 100M 及以下，rmem_max 保持 16MB 兼顾 QUIC/Hysteria2
+        NET_CORE_RMEM_MAX=16777216
         NET_CORE_WMEM_MAX=16777216
-        NET_RMEM="4096 87380 8388608"
-        NET_WMEM="4096 65536 8388608"
-        XRAY_PADDING="100-1000"
+        NET_RMEM="4096 262144 8388608"
+        NET_WMEM="4096 262144 8388608"
     fi
 }
 
 # ── 根据内存与 CPU 计算系统参数 ──────────────────────────────
+# 分档阈值较标准值下移 10%，解决 OS 保留内存导致的分档偏低问题
+# 参数值较基准上调 10%，适配代理服务器高并发场景（实测内存余量充足）
 calc_mem_params() {
     local cpu_cores="${HW_CPU_CORES:-1}"
     local mem_mb
-
     mem_mb=$(parse_memory_gb_to_mb "${HW_MEM_GB}") || mem_mb=2048
 
-    if [[ $mem_mb -ge 8192 ]]; then
-        SYSCTL_SOMAXCONN=32768
-        SYSCTL_NETDEV_BACKLOG=32768
-        SYSCTL_NF_CONNTRACK=1048576
-        SYSCTL_TCP_MAX_TW_BUCKETS=1048576
-    elif [[ $mem_mb -ge 4096 ]]; then
-        SYSCTL_SOMAXCONN=16384
-        SYSCTL_NETDEV_BACKLOG=16384
-        SYSCTL_NF_CONNTRACK=524288
-        SYSCTL_TCP_MAX_TW_BUCKETS=524288
-    elif [[ $mem_mb -ge 2048 ]]; then
-        SYSCTL_SOMAXCONN=8192
-        SYSCTL_NETDEV_BACKLOG=8192
-        SYSCTL_NF_CONNTRACK=262144
-        SYSCTL_TCP_MAX_TW_BUCKETS=262144
+    # 阈值：8GB→7372  4GB→3686  2GB→1843  其余→1GB
+    if [[ $mem_mb -ge 7372 ]]; then
+        SYSCTL_SOMAXCONN=36044
+        SYSCTL_NETDEV_BACKLOG=36044
+        SYSCTL_NF_CONNTRACK=1153433
+        SYSCTL_TCP_MAX_TW_BUCKETS=1153433
+    elif [[ $mem_mb -ge 3686 ]]; then
+        SYSCTL_SOMAXCONN=18022
+        SYSCTL_NETDEV_BACKLOG=18022
+        SYSCTL_NF_CONNTRACK=576716
+        SYSCTL_TCP_MAX_TW_BUCKETS=576716
+    elif [[ $mem_mb -ge 1843 ]]; then
+        # 物理 2GB 机器（OS 检测约 1.7GB）落入此档
+        SYSCTL_SOMAXCONN=9011
+        SYSCTL_NETDEV_BACKLOG=9011
+        SYSCTL_NF_CONNTRACK=288358
+        SYSCTL_TCP_MAX_TW_BUCKETS=288358
     else
         # 1GB 及以下
-        SYSCTL_SOMAXCONN=4096
-        SYSCTL_NETDEV_BACKLOG=4096
-        SYSCTL_NF_CONNTRACK=131072
-        SYSCTL_TCP_MAX_TW_BUCKETS=131072
+        SYSCTL_SOMAXCONN=4505
+        SYSCTL_NETDEV_BACKLOG=4505
+        SYSCTL_NF_CONNTRACK=144179
+        SYSCTL_TCP_MAX_TW_BUCKETS=144179
     fi
 
-    # 小核机器优先稳妥，避免把连接队列和 conntrack 撑得过大
+    # CPU 核数上限（代理场景，1核封顶提升至 16384）
     if [[ $cpu_cores -le 1 ]]; then
-        (( SYSCTL_SOMAXCONN > 8192 )) && SYSCTL_SOMAXCONN=8192
-        (( SYSCTL_NETDEV_BACKLOG > 8192 )) && SYSCTL_NETDEV_BACKLOG=8192
-        (( SYSCTL_NF_CONNTRACK > 262144 )) && SYSCTL_NF_CONNTRACK=262144
-        (( SYSCTL_TCP_MAX_TW_BUCKETS > 262144 )) && SYSCTL_TCP_MAX_TW_BUCKETS=262144
+        (( SYSCTL_SOMAXCONN > 16384 ))       && SYSCTL_SOMAXCONN=16384
+        (( SYSCTL_NETDEV_BACKLOG > 16384 ))  && SYSCTL_NETDEV_BACKLOG=16384
+        (( SYSCTL_NF_CONNTRACK > 288358 ))   && SYSCTL_NF_CONNTRACK=288358
+        (( SYSCTL_TCP_MAX_TW_BUCKETS > 288358 )) && \
+            SYSCTL_TCP_MAX_TW_BUCKETS=288358
     elif [[ $cpu_cores -le 2 ]]; then
-        (( SYSCTL_SOMAXCONN > 16384 )) && SYSCTL_SOMAXCONN=16384
-        (( SYSCTL_NETDEV_BACKLOG > 16384 )) && SYSCTL_NETDEV_BACKLOG=16384
-        (( SYSCTL_NF_CONNTRACK > 524288 )) && SYSCTL_NF_CONNTRACK=524288
-        (( SYSCTL_TCP_MAX_TW_BUCKETS > 524288 )) && SYSCTL_TCP_MAX_TW_BUCKETS=524288
+        (( SYSCTL_SOMAXCONN > 18022 ))       && SYSCTL_SOMAXCONN=18022
+        (( SYSCTL_NETDEV_BACKLOG > 18022 ))  && SYSCTL_NETDEV_BACKLOG=18022
+        (( SYSCTL_NF_CONNTRACK > 576716 ))   && SYSCTL_NF_CONNTRACK=576716
+        (( SYSCTL_TCP_MAX_TW_BUCKETS > 576716 )) && \
+            SYSCTL_TCP_MAX_TW_BUCKETS=576716
     elif [[ $cpu_cores -le 4 ]]; then
-        (( SYSCTL_SOMAXCONN > 32768 )) && SYSCTL_SOMAXCONN=32768
-        (( SYSCTL_NETDEV_BACKLOG > 32768 )) && SYSCTL_NETDEV_BACKLOG=32768
-        (( SYSCTL_NF_CONNTRACK > 1048576 )) && SYSCTL_NF_CONNTRACK=1048576
-        (( SYSCTL_TCP_MAX_TW_BUCKETS > 1048576 )) && SYSCTL_TCP_MAX_TW_BUCKETS=1048576
+        (( SYSCTL_SOMAXCONN > 36044 ))       && SYSCTL_SOMAXCONN=36044
+        (( SYSCTL_NETDEV_BACKLOG > 36044 ))  && SYSCTL_NETDEV_BACKLOG=36044
+        (( SYSCTL_NF_CONNTRACK > 1153433 ))  && SYSCTL_NF_CONNTRACK=1153433
+        (( SYSCTL_TCP_MAX_TW_BUCKETS > 1153433 )) && \
+            SYSCTL_TCP_MAX_TW_BUCKETS=1153433
     fi
 }
 
@@ -365,22 +493,37 @@ calc_disk_params() {
 load_kernel_modules() {
     log_step "加载内核模块..."
 
-    # 创建模块加载配置目录
     mkdir -p /etc/modules-load.d
 
     # nf_conntrack
     if ! lsmod | grep -q nf_conntrack; then
-        modprobe nf_conntrack 2>/dev/null || true
+        if modprobe nf_conntrack 2>/dev/null; then
+            log_info "nf_conntrack 模块已加载"
+        else
+            log_warn "nf_conntrack 模块加载失败（某些容器环境下属正常）"
+        fi
+    else
+        log_info "nf_conntrack 模块已就绪"
     fi
     echo "nf_conntrack" > /etc/modules-load.d/nf_conntrack.conf
 
     # tcp_bbr
-    if ! lsmod | grep -q tcp_bbr; then
-        modprobe tcp_bbr 2>/dev/null || true
+    if [[ "$BBR_LEVEL" != "none" ]]; then
+        if ! lsmod | grep -q tcp_bbr; then
+            if modprobe tcp_bbr 2>/dev/null; then
+                log_info "tcp_bbr 模块已加载"
+            else
+                log_warn "tcp_bbr 模块加载失败，将在 sysctl 应用时再次尝试"
+            fi
+        else
+            log_info "tcp_bbr 模块已就绪"
+        fi
+        echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf
+    else
+        log_warn "当前内核不支持 BBR，跳过 tcp_bbr 模块加载"
     fi
-    echo "tcp_bbr" > /etc/modules-load.d/tcp_bbr.conf
 
-    log_info "内核模块加载完成"
+    log_info "内核模块配置完成"
 }
 
 # ── 检测已有 sysctl 配置冲突 ─────────────────────────────────
@@ -398,7 +541,6 @@ check_sysctl_conflicts() {
     )
 
     local conflicts=()
-
     for param in "${params[@]}"; do
         local found
         found=$(grep -r "^${param}\s*=" \
@@ -424,21 +566,79 @@ check_sysctl_conflicts() {
     return 0
 }
 
+# ── 验证 BBR 及关键参数是否生效 ─────────────────────────────
+verify_bbr() {
+    echo ""
+    log_step "验证关键参数..."
+
+    local cc qdisc
+
+    # 拥塞控制
+    cc=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "unknown")
+    if [[ "$cc" == "bbr" ]]; then
+        log_info "✅  net.ipv4.tcp_congestion_control = bbr"
+    else
+        log_warn "⚠️  net.ipv4.tcp_congestion_control = $cc  (期望: bbr)"
+        log_warn "    请手动执行: modprobe tcp_bbr && sysctl -w net.ipv4.tcp_congestion_control=bbr"
+    fi
+
+    # 队列调度器
+    qdisc=$(sysctl -n net.core.default_qdisc 2>/dev/null || echo "unknown")
+    if [[ "$qdisc" == "fq" ]]; then
+        log_info "✅  net.core.default_qdisc = fq"
+    else
+        log_warn "⚠️  net.core.default_qdisc = $qdisc  (期望: fq)"
+    fi
+
+    # BBR 模块
+    if lsmod | grep -q tcp_bbr; then
+        log_info "✅  tcp_bbr 模块: 已加载"
+    else
+        log_warn "⚠️  tcp_bbr 模块: 未加载"
+    fi
+
+    # BBR v3 / ECN
+    if [[ "$BBR_LEVEL" == "bbr3" ]]; then
+        local ecn
+        ecn=$(sysctl -n net.ipv4.tcp_ecn 2>/dev/null || echo "unknown")
+        if [[ "$ecn" == "1" ]]; then
+            log_info "✅  net.ipv4.tcp_ecn = 1 (BBR v3 优化已启用)"
+        else
+            log_warn "⚠️  net.ipv4.tcp_ecn = $ecn  (期望: 1)"
+        fi
+    fi
+
+    # 文件描述符
+    local nr_open file_max
+    nr_open=$(sysctl -n fs.nr_open  2>/dev/null || echo "unknown")
+    file_max=$(sysctl -n fs.file-max 2>/dev/null || echo "unknown")
+    log_info "✅  fs.nr_open  = $nr_open"
+    log_info "✅  fs.file-max = $file_max"
+
+    # BBR 级别汇总
+    echo ""
+    case "$BBR_LEVEL" in
+        bbr3)       log_info "BBR 级别: BBR v3 (内核 >= 6.13，最优)" ;;
+        bbr_modern) log_info "BBR 级别: BBR v1，现代内核 (5.x / EL10 6.12)" ;;
+        bbr)        log_info "BBR 级别: BBR v1，基础版 (内核 4.9 - 4.x)" ;;
+        none)       log_warn "BBR 级别: 不可用，请升级内核" ;;
+    esac
+    echo ""
+}
+
 # ── 1.4 sysctl 优化 ──────────────────────────────────────────
 optimize_sysctl() {
     log_step "优化系统内核参数..."
 
-    # 先计算各项参数
     calc_net_params
     calc_mem_params
     calc_disk_params
 
-    # 检测冲突
     check_sysctl_conflicts || return
 
     local sysctl_conf="/etc/sysctl.d/99-xray-optimize.conf"
 
-    # IPv6 参数
+    # ── IPv6 参数块 ──────────────────────────────────────────
     local ipv6_conf=""
     local stack_mode
     stack_mode=$(normalize_stack_mode "${HW_DUAL_STACK:-ipv4}")
@@ -451,32 +651,54 @@ net.ipv6.conf.default.disable_ipv6 = 0"
 net.ipv6.conf.default.disable_ipv6 = 1"
     fi
 
+    # ── BBR / 拥塞控制块 ────────────────────────────────────
+    # tcp_ecn 对所有支持 BBR 的内核均有益无害，统一写入
+    # bbr3 专属：ECN 配合 BBR v3 多流公平性改进效果最佳
+    # bbr_modern / bbr：ECN 辅助拥塞检测，对代理交互流量有益
+    local bbr_conf=""
+    if [[ "$BBR_LEVEL" != "none" ]]; then
+        bbr_conf="net.core.default_qdisc              = fq
+net.ipv4.tcp_congestion_control     = bbr
+# ECN 显式拥塞通知：对所有 BBR 版本均有益，bbr3 效果最佳
+net.ipv4.tcp_ecn                    = 1"
+    else
+        bbr_conf="# BBR 不可用: 当前内核 ($KERNEL_VERSION) < 4.9
+# 升级内核后重新运行脚本即可自动启用
+# net.core.default_qdisc            = fq
+# net.ipv4.tcp_congestion_control   = bbr
+# net.ipv4.tcp_ecn                  = 1"
+        log_warn "内核不支持 BBR，相关参数已注释，其余优化正常写入"
+    fi
+
     cat > "$sysctl_conf" << CONF
 # ============================================================
 # xray-nginx-deploy 系统优化参数
 # 生成时间: $(date)
+# 操作系统: ${OS_NAME}
+# 内核版本: ${KERNEL_VERSION}
+# BBR 级别: ${BBR_LEVEL}
 # 硬件: ${HW_CPU_CORES}核 / ${HW_MEM_GB}GB / ${HW_BANDWIDTH}
 # ============================================================
 
 # ── 文件描述符 ────────────────────────────────────────────────
-# 保持内核层高于默认继承值，给后续服务留出余量
 fs.nr_open                          = ${GLOBAL_NR_OPEN}
 fs.file-max                         = ${GLOBAL_FILE_MAX}
 
 # ── TCP 拥塞控制 ──────────────────────────────────────────────
-net.core.default_qdisc              = fq
-net.ipv4.tcp_congestion_control     = bbr
+${bbr_conf}
 
 # ── TCP / QUIC 缓冲区 ────────────────────────────────────────
-# net.core.* 作为系统套接字上限，同时照顾 TCP 与 QUIC/Hysteria2
-# tcp_* 继续按 TCP 自动调优范围控制，避免低配机器过度放大缓冲
+# rmem_max / wmem_max 同时作为 QUIC/Hysteria2 UDP socket 缓冲区上限
+# tcp_rmem/wmem 中间值设为 262144(256KB)，减少代理短连接的扩容延迟
 net.core.rmem_max                   = ${NET_CORE_RMEM_MAX}
 net.core.wmem_max                   = ${NET_CORE_WMEM_MAX}
 net.core.rmem_default               = 262144
 net.core.wmem_default               = 262144
 net.ipv4.tcp_rmem                   = ${NET_RMEM}
 net.ipv4.tcp_wmem                   = ${NET_WMEM}
-# tcp_mem 由内核按总内存自动计算，避免手工页数配置失准
+# Hysteria2 / QUIC UDP 缓冲区下限
+net.ipv4.udp_rmem_min               = 8192
+net.ipv4.udp_wmem_min               = 8192
 
 # ── 网络连接优化 ──────────────────────────────────────────────
 net.core.somaxconn                  = ${SYSCTL_SOMAXCONN}
@@ -484,7 +706,6 @@ net.core.netdev_max_backlog         = ${SYSCTL_NETDEV_BACKLOG}
 net.ipv4.ip_local_port_range        = 1024 65535
 net.ipv4.tcp_max_syn_backlog        = ${SYSCTL_SOMAXCONN}
 net.ipv4.tcp_max_tw_buckets         = ${SYSCTL_TCP_MAX_TW_BUCKETS}
-# 仅保留 loopback 的 TIME-WAIT 复用，避免对公网连接过度激进
 net.ipv4.tcp_tw_reuse               = 2
 net.ipv4.tcp_fin_timeout            = 30
 net.ipv4.tcp_syncookies             = 1
@@ -496,9 +717,11 @@ net.ipv4.tcp_slow_start_after_idle  = 0
 net.ipv4.tcp_keepalive_time         = 300
 net.ipv4.tcp_keepalive_intvl        = 30
 net.ipv4.tcp_keepalive_probes       = 3
+# 限制 TCP 发送队列积压，降低代理交互流量延迟（浏览器/短连接场景）
+net.ipv4.tcp_notsent_lowat          = 131072
 
 # ── 连接跟踪 ─────────────────────────────────────────────────
-net.netfilter.nf_conntrack_max      = ${SYSCTL_NF_CONNTRACK}
+net.netfilter.nf_conntrack_max                     = ${SYSCTL_NF_CONNTRACK}
 net.netfilter.nf_conntrack_tcp_timeout_established = 7200
 net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 30
 
@@ -506,22 +729,34 @@ net.netfilter.nf_conntrack_tcp_timeout_time_wait   = 30
 vm.swappiness                       = ${VM_SWAPPINESS}
 vm.dirty_ratio                      = ${VM_DIRTY_RATIO}
 vm.dirty_background_ratio           = ${VM_DIRTY_BACKGROUND_RATIO}
-# 典型代理机保持内核默认的 heuristic overcommit 模式
 vm.overcommit_memory                = 0
 
 # ── IPv6 配置 ─────────────────────────────────────────────────
 ${ipv6_conf}
 CONF
 
-    # 立即应用
-    sysctl -p "$sysctl_conf" 2>&1 | while IFS= read -r line; do
-        # 过滤掉 nf_conntrack 相关警告（模块未完全加载时）
-        [[ "$line" == *"No such file"* ]] && \
-            log_warn "$line" && continue
-        log_info "$line"
-    done
+    log_info "sysctl 配置已写入: $sysctl_conf"
+    log_step "正在应用 sysctl 参数..."
 
-    log_info "sysctl 优化完成: $sysctl_conf"
+    local apply_errors=0
+    while IFS= read -r line; do
+        if [[ "$line" == *"No such file"*  ]] || \
+           [[ "$line" == *"Invalid argument"* ]] || \
+           [[ "$line" == *"error"* ]]; then
+            log_warn "sysctl 警告: $line"
+            (( apply_errors++ )) || true
+        else
+            log_info "$line"
+        fi
+    done < <(sysctl -p "$sysctl_conf" 2>&1)
+
+    if [[ $apply_errors -eq 0 ]]; then
+        log_info "sysctl 全部参数应用成功 ✓"
+    else
+        log_warn "sysctl 有 ${apply_errors} 项警告（通常为模块未加载，不影响其他参数）"
+    fi
+
+    verify_bbr
 }
 
 # ── 1.5 ulimit / limits 优化（三处必须一致）─────────────────
@@ -531,7 +766,6 @@ optimize_limits() {
     log_info "nproc 默认值:  ${GLOBAL_NPROC_LIMIT}"
     log_info "内核层保留更高余量: nr_open=${GLOBAL_NR_OPEN}, file-max=${GLOBAL_FILE_MAX}"
 
-    # 检测已有 limits 配置冲突
     local existing
     existing=$(grep -rE "nofile|nproc" \
         /etc/security/limits.conf \
@@ -554,7 +788,6 @@ optimize_limits() {
     # 第一处：limits.d
     cat > /etc/security/limits.d/99-xray.conf << LIMITS
 # xray-nginx-deploy - global nofile / nproc defaults
-# nofile 默认值低于 fs.nr_open，保留系统余量
 *    soft nofile ${GLOBAL_NOFILE_LIMIT}
 *    hard nofile ${GLOBAL_NOFILE_LIMIT}
 *    soft nproc  ${GLOBAL_NPROC_LIMIT}
@@ -574,7 +807,7 @@ DefaultLimitNOFILE=${GLOBAL_NOFILE_LIMIT}
 DefaultLimitNPROC=${GLOBAL_NPROC_LIMIT}
 SYSTEMD
 
-    # 第三处：PAM（确保 pam_limits 对不同发行版登录链路生效）
+    # 第三处：PAM
     local pam_files=()
     case "$OS_ID" in
         ubuntu|debian)
@@ -592,9 +825,7 @@ SYSTEMD
             )
             ;;
         *)
-            pam_files=(
-                /etc/pam.d/sshd
-            )
+            pam_files=(/etc/pam.d/sshd)
             ;;
     esac
     for pam_file in "${pam_files[@]}"; do
@@ -605,7 +836,6 @@ SYSTEMD
         fi
     done
 
-    # 立即应用 systemd
     systemctl daemon-reexec 2>/dev/null || true
 
     log_info "文件描述符限制配置完成"
@@ -616,7 +846,6 @@ SYSTEMD
     log_warn "预期 nofile: ${GLOBAL_NOFILE_LIMIT}"
     echo ""
 
-    # 三处一致性验证提示
     log_info "三处配置一致性检查："
     echo "  fs.nr_open    = ${GLOBAL_NR_OPEN} ✓ (sysctl 天花板)"
     echo "  fs.file-max   = ${GLOBAL_FILE_MAX} ✓ (sysctl 天花板)"
@@ -628,7 +857,6 @@ SYSTEMD
 tune_system_limits() {
     log_step "Apply system-wide runtime tuning..."
 
-    # Remove legacy Xray-specific overrides and keep all limit tuning at the system level.
     rm -rf /etc/systemd/system/xray.service.d
     rm -rf /etc/systemd/system/xray@.service.d
     rm -f /etc/sysctl.d/98-xray-service-limits.conf
@@ -642,14 +870,16 @@ install_base_tools() {
     log_step "安装基础工具..."
     $PKG_UPDATE >/dev/null 2>&1
 
-    local tools="curl wget unzip git lsof net-tools bind-utils"
-
+    local tools
     case "$OS_ID" in
         ubuntu|debian)
             tools="curl wget unzip git lsof net-tools dnsutils"
             ;;
         centos|rhel|rocky|almalinux)
             tools="curl wget unzip git lsof net-tools bind-utils"
+            ;;
+        *)
+            tools="curl wget unzip git lsof net-tools"
             ;;
     esac
 
@@ -674,18 +904,20 @@ sync_time() {
 run_system() {
     log_step "========== 系统初始化 =========="
 
-    # 1.1 检测系统
+    # 1.1 检测系统 & 内核
     detect_os
     detect_kernel
+
+    # 1.2 按需升级内核
     upgrade_kernel
 
-    # 1.2 询问硬件配置
+    # 1.3 询问硬件配置
     collect_hardware_info
 
-    # 1.3 加载内核模块（必须在 sysctl 之前）
+    # 1.4 加载内核模块（必须在 sysctl 之前）
     load_kernel_modules
 
-    # 1.4 system-wide runtime tuning (sysctl + limits)
+    # 1.5 system-wide runtime tuning (sysctl + limits + BBR 验证)
     tune_system_limits
 
     # 1.6 基础工具
