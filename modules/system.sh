@@ -542,7 +542,7 @@ optimize_limits() {
 
     if [[ -n "$existing" ]]; then
         echo ""
-        log_warn "发现已有 nofile 配置："
+        log_warn "发现已有 nofile / nproc 配置："
         echo "$existing" | while read -r line; do
             echo "  $line"
         done
@@ -574,11 +574,29 @@ DefaultLimitNOFILE=${GLOBAL_NOFILE_LIMIT}
 DefaultLimitNPROC=${GLOBAL_NPROC_LIMIT}
 SYSTEMD
 
-    # 第三处：PAM（确保 pam_limits 生效）
-    local pam_files=(
-        /etc/pam.d/common-session
-        /etc/pam.d/sshd
-    )
+    # 第三处：PAM（确保 pam_limits 对不同发行版登录链路生效）
+    local pam_files=()
+    case "$OS_ID" in
+        ubuntu|debian)
+            pam_files=(
+                /etc/pam.d/common-session
+                /etc/pam.d/sshd
+            )
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            pam_files=(
+                /etc/pam.d/system-auth
+                /etc/pam.d/password-auth
+                /etc/pam.d/sshd
+                /etc/pam.d/login
+            )
+            ;;
+        *)
+            pam_files=(
+                /etc/pam.d/sshd
+            )
+            ;;
+    esac
     for pam_file in "${pam_files[@]}"; do
         if [[ -f "$pam_file" ]] && \
            ! grep -q "pam_limits" "$pam_file"; then
