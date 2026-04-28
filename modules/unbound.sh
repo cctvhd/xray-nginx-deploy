@@ -215,8 +215,7 @@ init_trust_anchor() {
     # 检查系统其他路径的 root.key
     local system_key=""
     for path in \
-        /usr/share/dns/root.key \
-        /etc/unbound/root.key; do
+        /usr/share/dns/root.key; do
         if [[ -f "$path" && -s "$path" ]]; then
             system_key="$path"
             break
@@ -234,6 +233,14 @@ init_trust_anchor() {
             printf '. IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n' \
                 > /var/lib/unbound/root.key
         fi
+    fi
+
+    # 最终安全校验：确保 root.key 不是 BIND trusted-keys{} 格式
+    # AlmaLinux/RHEL 自带的 /etc/unbound/root.key 是 BIND 格式，Unbound 无法解析
+    if grep -q "trusted-keys" /var/lib/unbound/root.key 2>/dev/null; then
+        log_warn "root.key 为 BIND trusted-keys 格式，强制写入 DS 格式..."
+        printf '. IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n' \
+            > /var/lib/unbound/root.key
     fi
 
     chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
