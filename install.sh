@@ -321,8 +321,7 @@ do_inst_system() {
     upgrade_kernel
     collect_hardware_info
     load_kernel_modules
-    optimize_sysctl
-    optimize_limits
+    tune_system_limits
     install_base_tools
     sync_time
 
@@ -662,8 +661,7 @@ run_full_install_flow() {
     upgrade_kernel
     collect_hardware_info
     load_kernel_modules
-    optimize_sysctl
-    optimize_limits
+    tune_system_limits
     install_base_tools
     sync_time
 

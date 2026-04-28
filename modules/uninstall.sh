@@ -143,6 +143,9 @@ RESOLV
 cleanup_system_module() {
     log_step "清理 system 模块生成的优化配置..."
 
+    remove_path_if_exists "/etc/systemd/system/xray.service.d"
+    remove_path_if_exists "/etc/systemd/system/xray@.service.d"
+    remove_path_if_exists "/etc/sysctl.d/98-xray-service-limits.conf"
     remove_path_if_exists "/etc/sysctl.d/99-xray-optimize.conf"
     remove_path_if_exists "/etc/security/limits.d/99-xray.conf"
     remove_path_if_exists "/etc/systemd/system.conf.d/99-xray.conf"
@@ -277,9 +280,6 @@ cleanup_xray_module() {
     remove_path_if_exists "/usr/local/bin/xray-linux-64.zip"
     remove_path_if_exists "/etc/systemd/system/xray.service"
     remove_path_if_exists "/etc/systemd/system/xray@.service"
-    remove_path_if_exists "/etc/systemd/system/xray.service.d"
-    remove_path_if_exists "/etc/systemd/system/xray@.service.d"
-    remove_path_if_exists "/etc/sysctl.d/98-xray-service-limits.conf"
     remove_path_if_exists "/usr/bin/xray"
 
     sysctl --system >/dev/null 2>&1 || true

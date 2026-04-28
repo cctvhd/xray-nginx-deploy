@@ -12,6 +12,11 @@
 #   1.7 时间同步
 # ============================================================
 
+GLOBAL_NR_OPEN=2097152
+GLOBAL_FILE_MAX=4194304
+GLOBAL_NOFILE_LIMIT=1048576
+GLOBAL_NPROC_LIMIT=65536
+
 # ── 1.1 检测系统信息 ─────────────────────────────────────────
 detect_os() {
     if [[ -f /etc/os-release ]]; then
@@ -306,26 +311,22 @@ calc_mem_params() {
         SYSCTL_NETDEV_BACKLOG=32768
         SYSCTL_NF_CONNTRACK=1048576
         SYSCTL_TCP_MAX_TW_BUCKETS=1048576
-        NOFILE_LIMIT=1048576
     elif [[ $mem_mb -ge 4096 ]]; then
         SYSCTL_SOMAXCONN=16384
         SYSCTL_NETDEV_BACKLOG=16384
         SYSCTL_NF_CONNTRACK=524288
         SYSCTL_TCP_MAX_TW_BUCKETS=524288
-        NOFILE_LIMIT=524288
     elif [[ $mem_mb -ge 2048 ]]; then
         SYSCTL_SOMAXCONN=8192
         SYSCTL_NETDEV_BACKLOG=8192
         SYSCTL_NF_CONNTRACK=262144
         SYSCTL_TCP_MAX_TW_BUCKETS=262144
-        NOFILE_LIMIT=262144
     else
         # 1GB 及以下
         SYSCTL_SOMAXCONN=4096
         SYSCTL_NETDEV_BACKLOG=4096
         SYSCTL_NF_CONNTRACK=131072
         SYSCTL_TCP_MAX_TW_BUCKETS=131072
-        NOFILE_LIMIT=131072
     fi
 
     # 小核机器优先稳妥，避免把连接队列和 conntrack 撑得过大
@@ -334,24 +335,17 @@ calc_mem_params() {
         (( SYSCTL_NETDEV_BACKLOG > 8192 )) && SYSCTL_NETDEV_BACKLOG=8192
         (( SYSCTL_NF_CONNTRACK > 262144 )) && SYSCTL_NF_CONNTRACK=262144
         (( SYSCTL_TCP_MAX_TW_BUCKETS > 262144 )) && SYSCTL_TCP_MAX_TW_BUCKETS=262144
-        (( NOFILE_LIMIT > 262144 )) && NOFILE_LIMIT=262144
     elif [[ $cpu_cores -le 2 ]]; then
         (( SYSCTL_SOMAXCONN > 16384 )) && SYSCTL_SOMAXCONN=16384
         (( SYSCTL_NETDEV_BACKLOG > 16384 )) && SYSCTL_NETDEV_BACKLOG=16384
         (( SYSCTL_NF_CONNTRACK > 524288 )) && SYSCTL_NF_CONNTRACK=524288
         (( SYSCTL_TCP_MAX_TW_BUCKETS > 524288 )) && SYSCTL_TCP_MAX_TW_BUCKETS=524288
-        (( NOFILE_LIMIT > 524288 )) && NOFILE_LIMIT=524288
     elif [[ $cpu_cores -le 4 ]]; then
         (( SYSCTL_SOMAXCONN > 32768 )) && SYSCTL_SOMAXCONN=32768
         (( SYSCTL_NETDEV_BACKLOG > 32768 )) && SYSCTL_NETDEV_BACKLOG=32768
         (( SYSCTL_NF_CONNTRACK > 1048576 )) && SYSCTL_NF_CONNTRACK=1048576
         (( SYSCTL_TCP_MAX_TW_BUCKETS > 1048576 )) && SYSCTL_TCP_MAX_TW_BUCKETS=1048576
     fi
-
-    # 保持系统 nofile 上限不低于 Xray 官方 service 的 1000000
-    (( NOFILE_LIMIT < 1048576 )) && NOFILE_LIMIT=1048576
-
-    FILE_MAX_LIMIT=$(( NOFILE_LIMIT * 2 ))
 }
 
 # ── 根据磁盘类型计算 vm 参数 ─────────────────────────────────
@@ -465,10 +459,9 @@ net.ipv6.conf.default.disable_ipv6 = 1"
 # ============================================================
 
 # ── 文件描述符 ────────────────────────────────────────────────
-# 必须在 limits.d 设置之前确保 nr_open >= nofile hard limit
-# file-max 适当高于单进程 nofile，避免系统总 FD 上限过紧
-fs.nr_open                          = ${NOFILE_LIMIT}
-fs.file-max                         = ${FILE_MAX_LIMIT}
+# 保持内核层高于默认继承值，给后续服务留出余量
+fs.nr_open                          = ${GLOBAL_NR_OPEN}
+fs.file-max                         = ${GLOBAL_FILE_MAX}
 
 # ── TCP 拥塞控制 ──────────────────────────────────────────────
 net.core.default_qdisc              = fq
@@ -533,13 +526,14 @@ CONF
 
 # ── 1.5 ulimit / limits 优化（三处必须一致）─────────────────
 optimize_limits() {
-    log_step "优化文件描述符限制..."
-    log_info "nofile 限制值: ${NOFILE_LIMIT}"
-    log_info "与 fs.nr_open 保持一致"
+    log_step "优化 systemd / PAM 默认限制..."
+    log_info "nofile 默认值: ${GLOBAL_NOFILE_LIMIT}"
+    log_info "nproc 默认值:  ${GLOBAL_NPROC_LIMIT}"
+    log_info "内核层保留更高余量: nr_open=${GLOBAL_NR_OPEN}, file-max=${GLOBAL_FILE_MAX}"
 
     # 检测已有 limits 配置冲突
     local existing
-    existing=$(grep -r "nofile" \
+    existing=$(grep -rE "nofile|nproc" \
         /etc/security/limits.conf \
         /etc/security/limits.d/ \
         2>/dev/null | \
@@ -559,21 +553,25 @@ optimize_limits() {
 
     # 第一处：limits.d
     cat > /etc/security/limits.d/99-xray.conf << LIMITS
-# xray-nginx-deploy - nofile 限制
-# 必须与 fs.nr_open 保持一致: ${NOFILE_LIMIT}
-*    soft nofile ${NOFILE_LIMIT}
-*    hard nofile ${NOFILE_LIMIT}
-root soft nofile ${NOFILE_LIMIT}
-root hard nofile ${NOFILE_LIMIT}
+# xray-nginx-deploy - global nofile / nproc defaults
+# nofile 默认值低于 fs.nr_open，保留系统余量
+*    soft nofile ${GLOBAL_NOFILE_LIMIT}
+*    hard nofile ${GLOBAL_NOFILE_LIMIT}
+*    soft nproc  ${GLOBAL_NPROC_LIMIT}
+*    hard nproc  ${GLOBAL_NPROC_LIMIT}
+root soft nofile ${GLOBAL_NOFILE_LIMIT}
+root hard nofile ${GLOBAL_NOFILE_LIMIT}
+root soft nproc  ${GLOBAL_NPROC_LIMIT}
+root hard nproc  ${GLOBAL_NPROC_LIMIT}
 LIMITS
 
     # 第二处：systemd system.conf.d
     mkdir -p /etc/systemd/system.conf.d
     cat > /etc/systemd/system.conf.d/99-xray.conf << SYSTEMD
-# xray-nginx-deploy - systemd 文件描述符限制
-# 必须与 fs.nr_open 保持一致: ${NOFILE_LIMIT}
+# xray-nginx-deploy - systemd global service limits
 [Manager]
-DefaultLimitNOFILE=${NOFILE_LIMIT}
+DefaultLimitNOFILE=${GLOBAL_NOFILE_LIMIT}
+DefaultLimitNPROC=${GLOBAL_NPROC_LIMIT}
 SYSTEMD
 
     # 第三处：PAM（确保 pam_limits 生效）
@@ -597,15 +595,28 @@ SYSTEMD
     log_warn "⚠️  重要提示："
     log_warn "ulimit 设置需要重新登录 SSH 后才能生效"
     log_warn "验证方法：重新登录后执行 ulimit -Hn"
-    log_warn "预期结果: ${NOFILE_LIMIT}"
+    log_warn "预期 nofile: ${GLOBAL_NOFILE_LIMIT}"
     echo ""
 
     # 三处一致性验证提示
     log_info "三处配置一致性检查："
-    echo "  fs.nr_open    = ${NOFILE_LIMIT} ✓ (已写入 sysctl)"
-    echo "  limits.d      = ${NOFILE_LIMIT} ✓ (已写入)"
-    echo "  systemd       = ${NOFILE_LIMIT} ✓ (已写入)"
+    echo "  fs.nr_open    = ${GLOBAL_NR_OPEN} ✓ (sysctl 天花板)"
+    echo "  fs.file-max   = ${GLOBAL_FILE_MAX} ✓ (sysctl 天花板)"
+    echo "  limits.d      = nofile ${GLOBAL_NOFILE_LIMIT} / nproc ${GLOBAL_NPROC_LIMIT} ✓"
+    echo "  systemd       = nofile ${GLOBAL_NOFILE_LIMIT} / nproc ${GLOBAL_NPROC_LIMIT} ✓"
     echo "  ulimit -Hn    = 需重新登录验证"
+}
+
+tune_system_limits() {
+    log_step "Apply system-wide runtime tuning..."
+
+    # Remove legacy Xray-specific overrides and keep all limit tuning at the system level.
+    rm -rf /etc/systemd/system/xray.service.d
+    rm -rf /etc/systemd/system/xray@.service.d
+    rm -f /etc/sysctl.d/98-xray-service-limits.conf
+
+    optimize_sysctl
+    optimize_limits
 }
 
 # ── 1.6 安装基础工具 ─────────────────────────────────────────
@@ -656,11 +667,8 @@ run_system() {
     # 1.3 加载内核模块（必须在 sysctl 之前）
     load_kernel_modules
 
-    # 1.4 sysctl 优化（依赖硬件配置）
-    optimize_sysctl
-
-    # 1.5 ulimit/limits（依赖 sysctl 的 fs.nr_open）
-    optimize_limits
+    # 1.4 system-wide runtime tuning (sysctl + limits)
+    tune_system_limits
 
     # 1.6 基础工具
     install_base_tools
