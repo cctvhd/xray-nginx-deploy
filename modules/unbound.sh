@@ -692,6 +692,13 @@ RESOLV_EOF
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
+    # FIX: 禁用系统自带的 unbound-anchor.service
+    # 该服务每次启动前自动运行 unbound-anchor，会把 root.key 覆盖成 autotrust 双条格式
+    # 导致 Unbound 报 "trust anchor for '.' presented twice" 错误
+    systemctl disable unbound-anchor.service 2>/dev/null || true
+    systemctl mask unbound-anchor.service 2>/dev/null || true
+    log_info "已禁用 unbound-anchor.service（防止覆盖 root.key）"
+
     if ! unbound-checkconf >/dev/null 2>&1; then
         log_error "Unbound 配置验证失败，中止启动（系统 DNS 未修改）"
         unbound-checkconf || true
