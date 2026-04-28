@@ -222,23 +222,21 @@ init_trust_anchor() {
         fi
     done
 
+    # FIX: 不使用 unbound-anchor 命令，它会生成 autotrust 格式（含双条 KSK）导致启动失败
+    # 直接写入标准 DS 格式，简单可靠
     if [[ -n "$system_key" ]]; then
+        # 仅使用非 BIND 格式的系统 key（/usr/share/dns/root.key，Debian/Ubuntu）
         cp "$system_key" /var/lib/unbound/root.key
         log_info "使用系统自带 trust anchor: $system_key"
-    else
-        # 用 unbound-anchor 生成，失败则写入 DS 格式兜底
-        unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
-        if [[ ! -s /var/lib/unbound/root.key ]]; then
-            log_warn "unbound-anchor 失败，写入 DS 格式 trust anchor..."
+        # 校验不是 BIND trusted-keys{} 格式
+        if grep -q "trusted-keys" /var/lib/unbound/root.key 2>/dev/null; then
+            log_warn "系统 root.key 为 BIND 格式，改用 DS 格式..."
             printf '. IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n' \
                 > /var/lib/unbound/root.key
         fi
-    fi
-
-    # 最终安全校验：确保 root.key 不是 BIND trusted-keys{} 格式
-    # AlmaLinux/RHEL 自带的 /etc/unbound/root.key 是 BIND 格式，Unbound 无法解析
-    if grep -q "trusted-keys" /var/lib/unbound/root.key 2>/dev/null; then
-        log_warn "root.key 为 BIND trusted-keys 格式，强制写入 DS 格式..."
+    else
+        # 直接写入 DS 格式，不调用 unbound-anchor（避免生成 autotrust 双条格式）
+        log_info "写入 DS 格式 trust anchor..."
         printf '. IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D\n' \
             > /var/lib/unbound/root.key
     fi
