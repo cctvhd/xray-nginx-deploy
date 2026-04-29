@@ -382,3 +382,26 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     [[ $EUID -ne 0 ]] && { echo "必须使用 root 权限运行"; exit 1; }
     run_system
 fi
+# ── 向后兼容别名 / 补全函数（install.sh 调用）────────────────
+detect_os() { detect_virt_type "$@"; }
+
+detect_kernel() {
+    KERNEL_VER=$(uname -r)
+    log_info "当前内核版本: ${KERNEL_VER}"
+}
+
+upgrade_kernel() {
+    log_info "跳过内核升级（当前内核: ${KERNEL_VER:-$(uname -r)}）"
+}
+
+load_kernel_modules() {
+    log_step "加载内核模块..."
+    local mods=(tcp_bbr nf_conntrack)
+    for mod in "${mods[@]}"; do
+        modprobe "$mod" 2>/dev/null \
+            && log_info "模块已加载: $mod" \
+            || log_warn "模块加载失败（可忽略）: $mod"
+    done
+}
+
+tune_system_limits() { optimize_limits "$@"; }
