@@ -48,7 +48,7 @@ cleanup_old_warp() {
 # ── 安装 wgcf ────────────────────────────────────────────────
 install_wgcf() {
     if command -v wgcf &>/dev/null; then
-        log_info "wgcf 已安装: $(wgcf --version 2>&1 | head -1)，跳过下载"
+        log_info "wgcf 已安装，跳过下载"
         return
     fi
 
@@ -79,14 +79,9 @@ install_wgcf() {
 
 # ── 注册并生成 WireGuard 配置 ────────────────────────────────
 generate_wgcf_profile() {
-    local state_file="/etc/xray-deploy/config.env"
-
-    local saved_privkey
-    saved_privkey=$(grep "^WGCF_PRIVATE_KEY=" "${state_file}" 2>/dev/null | \
-        cut -d= -f2- | tr -d "'\"")
-
-    if [[ -n "${saved_privkey}" && -f "${WGCF_PROFILE}" ]]; then
-        log_info "检测到已有 wgcf 凭证，跳过注册"
+    # profile 文件已存在就直接复用，无需重新注册
+    if [[ -f "${WGCF_PROFILE}" ]]; then
+        log_info "检测到已有 wgcf-profile.conf，跳过注册"
         return
     fi
 
@@ -101,7 +96,6 @@ generate_wgcf_profile() {
 
     popd >/dev/null
 
-    # wgcf-account.toml 含有 access_token，锁权限
     chmod 600 "${WGCF_DIR}/wgcf-account.toml" 2>/dev/null || true
     chmod 600 "${WGCF_PROFILE}"               2>/dev/null || true
 
