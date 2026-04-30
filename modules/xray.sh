@@ -171,7 +171,7 @@ _build_warp_outbound_json() {
                     }
                 ],
                 "mtu":            1280,
-                "domainStrategy": "UseIPv4v6"
+                "domainStrategy": "ForceIPv4v6"
             }
         }
 WGJSON
@@ -373,7 +373,7 @@ generate_xray_config() {
             "tag":      "direct",
             "protocol": "freedom",
             "settings": {
-                "domainStrategy": "UseIPv4v6"
+                "domainStrategy": "ForceIPv4v6"
             },
             "streamSettings": {
                 "sockopt": {
