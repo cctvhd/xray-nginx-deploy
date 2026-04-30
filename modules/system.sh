@@ -383,7 +383,7 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     run_system
 fi
 # ── 向后兼容别名 / 补全函数（install.sh 调用）────────────────
-detect_os() { detect_virt_type "$@"; }
+
 
 detect_kernel() {
     KERNEL_VER=$(uname -r)
