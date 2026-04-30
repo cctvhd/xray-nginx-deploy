@@ -2,7 +2,7 @@
 # ============================================================
 # modules/singbox.sh
 # Sing-Box 安装 + AnyTLS 配置生成
-# 自动识别系统：Ubuntu/Debian/CentOS/RHEL/Rocky/Alma
+# warp 出站：内嵌 wireguard（由 warp.sh 提供凭证），不依赖本地 SOCKS5
 # ============================================================
 
 # ── 安装 Sing-Box（官方仓库）────────────────────────────────
@@ -14,21 +14,17 @@ install_singbox() {
         ubuntu|debian)
             log_step "使用 apt 仓库安装..."
 
-            # 导入 GPG key
             mkdir -p /etc/apt/keyrings
             curl -fsSL https://sing-box.app/gpg.key \
                 -o /etc/apt/keyrings/sagernet.asc
             chmod a+r /etc/apt/keyrings/sagernet.asc
 
-            # 判断 apt 版本是否支持 .sources 格式（apt >= 1.6）
-            local apt_ver
+            local apt_ver apt_major
             apt_ver=$(apt-get --version 2>&1 | grep -oP '[\d.]+' | head -1)
-            local apt_major
             apt_major=$(echo "$apt_ver" | cut -d. -f1)
 
             if [[ "$apt_major" -ge 2 ]] || \
                [[ "$apt_major" -eq 1 && $(echo "$apt_ver" | cut -d. -f2) -ge 6 ]]; then
-                # 支持 .sources 格式
                 cat > /etc/apt/sources.list.d/sagernet.sources << REPO
 Types: deb
 URIs: https://deb.sagernet.org/
@@ -38,7 +34,6 @@ Enabled: yes
 Signed-By: /etc/apt/keyrings/sagernet.asc
 REPO
             else
-                # 降级使用传统 .list 格式
                 echo "deb [signed-by=/etc/apt/keyrings/sagernet.asc] \
 https://deb.sagernet.org/ * *" \
                     > /etc/apt/sources.list.d/sagernet.list
@@ -51,11 +46,9 @@ https://deb.sagernet.org/ * *" \
         centos|rhel|rocky|almalinux|fedora)
             log_step "使用 dnf 仓库安装..."
 
-            # 添加官方 repo
             dnf config-manager addrepo \
                 --from-repofile=https://sing-box.app/sing-box.repo \
                 2>/dev/null || {
-                # 兼容旧版 dnf 没有 addrepo 子命令
                 curl -fsSL https://sing-box.app/sing-box.repo \
                     -o /etc/yum.repos.d/sing-box.repo
             }
@@ -69,7 +62,6 @@ https://deb.sagernet.org/ * *" \
             ;;
     esac
 
-    # 验证安装
     if ! command -v sing-box &>/dev/null; then
         log_error "Sing-Box 安装失败"
         exit 1
@@ -79,9 +71,7 @@ https://deb.sagernet.org/ * *" \
     sb_ver=$(sing-box version 2>&1 | grep -oP '[\d.]+' | head -1)
     log_info "Sing-Box 安装成功: v${sb_ver}"
 
-    # 创建必要目录
-    mkdir -p /etc/sing-box
-    mkdir -p /var/lib/sing-box
+    mkdir -p /etc/sing-box /var/lib/sing-box
     chmod 755 /var/lib/sing-box
 }
 
@@ -91,7 +81,7 @@ generate_singbox_params() {
 
     local state_file="/etc/xray-deploy/config.env"
     local saved_password
-    saved_password=$(grep "^SINGBOX_PASSWORD=" "$state_file" 2>/dev/null | \
+    saved_password=$(grep "^SINGBOX_PASSWORD=" "${state_file}" 2>/dev/null | \
         cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")
 
     if [[ -n "${saved_password}" ]]; then
@@ -104,7 +94,9 @@ generate_singbox_params() {
     fi
 
     log_info "AnyTLS 密码: ${SINGBOX_PASSWORD}"
-    if [[ "${SINGBOX_PASSWORD}" == *"#"* || "${SINGBOX_PASSWORD}" == *"?"* || "${SINGBOX_PASSWORD}" == *"&"* ]]; then
+    if [[ "${SINGBOX_PASSWORD}" == *"#"* || \
+          "${SINGBOX_PASSWORD}" == *"?"* || \
+          "${SINGBOX_PASSWORD}" == *"&"* ]]; then
         log_warn "当前 AnyTLS 密码包含 URI 保留字符，部分客户端导入链接时可能需要手动填写原始密码"
     fi
 }
@@ -121,7 +113,6 @@ collect_singbox_params() {
         read -rp "输入 AnyTLS 域名: " ANYTLS_DOMAIN
     fi
 
-    # 自动查找证书
     local root_domain
     root_domain=$(echo "$ANYTLS_DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
 
@@ -140,45 +131,86 @@ collect_singbox_params() {
     log_info "证书路径: ${SINGBOX_CERT}"
 }
 
+# ── 构建 wireguard endpoint JSON（供 generate_singbox_config 调用）─
+# sing-box 新版 wireguard 放在顶层 "endpoints" 数组，不在 "outbounds" 里
+# 格式参考：endpoints[].type=wireguard, address[], peers[]{address,port,public_key,reserved,allowed_ips}
+_build_warp_endpoint_json_sb() {
+    if [[ -z "${WGCF_PRIVATE_KEY:-}" ]]; then
+        log_error "WGCF_* 凭证未设置，请确认 run_warp() 已在 run_singbox() 前执行"
+        exit 1
+    fi
+
+    # 将逗号分隔的 Address 转换为 JSON 数组
+    local addr_json=""
+    IFS=',' read -ra addr_arr <<< "${WGCF_ADDRESS}"
+    for addr in "${addr_arr[@]}"; do
+        addr=$(echo "${addr}" | tr -d ' ')
+        addr_json+="\"${addr}\","
+    done
+    addr_json="${addr_json%,}"
+
+    cat << WGJSON
+    {
+      "type":        "wireguard",
+      "tag":         "warp",
+      "address":     [${addr_json}],
+      "private_key": "${WGCF_PRIVATE_KEY}",
+      "peers": [
+        {
+          "address":     "${WGCF_ENDPOINT_HOST}",
+          "port":        ${WGCF_ENDPOINT_PORT},
+          "public_key":  "${WGCF_PEER_PUBKEY}",
+          "reserved":    [0, 0, 0],
+          "allowed_ips": ["0.0.0.0/0", "::/0"]
+        }
+      ],
+      "mtu": 1280
+    }
+WGJSON
+}
+
 # ── 生成 config.json ─────────────────────────────────────────
 generate_singbox_config() {
     log_step "生成 Sing-Box 配置文件..."
 
+    local warp_endpoint
+    warp_endpoint=$(_build_warp_endpoint_json_sb)
+
     cat > /etc/sing-box/config.json << CONF
 {
   "log": {
-    "level": "warn",
+    "level":     "warn",
     "timestamp": true
   },
   "dns": {
     "servers": [
       {
-        "tag": "warp-dns",
-        "type": "udp",
-        "server": "1.1.1.1",
+        "tag":         "warp-dns",
+        "type":        "udp",
+        "server":      "1.1.1.1",
         "server_port": 53,
-        "detour": "warp"
+        "detour":      "warp"
       },
       {
-        "tag": "local_recursive",
+        "tag":  "local_recursive",
         "type": "local"
       }
     ],
     "rules": [
       {
         "rule_set": ["geosite-cn"],
-        "server": "warp-dns"
+        "server":   "warp-dns"
       }
     ],
-    "final": "local_recursive",
-    "strategy": "prefer_ipv4",
+    "final":           "local_recursive",
+    "strategy":        "prefer_ipv4",
     "reverse_mapping": true
   },
   "inbounds": [
     {
-      "type": "anytls",
-      "tag": "anytls-in",
-      "listen": "127.0.0.1",
+      "type":        "anytls",
+      "tag":         "anytls-in",
+      "listen":      "127.0.0.1",
       "listen_port": 8443,
       "users": [
         {
@@ -197,64 +229,61 @@ generate_singbox_config() {
         "7=300-800,1000-1600,c"
       ],
       "tls": {
-        "enabled": true,
-        "server_name": "${ANYTLS_DOMAIN}",
+        "enabled":          true,
+        "server_name":      "${ANYTLS_DOMAIN}",
         "certificate_path": "${SINGBOX_CERT}",
-        "key_path": "${SINGBOX_KEY}",
-        "alpn": ["h2", "http/1.1"],
-        "min_version": "1.3",
-        "max_version": "1.3"
+        "key_path":         "${SINGBOX_KEY}",
+        "alpn":             ["h2", "http/1.1"],
+        "min_version":      "1.3",
+        "max_version":      "1.3"
       }
     }
+  ],
+  "endpoints": [
+    ${warp_endpoint}
   ],
   "outbounds": [
     {
       "type": "direct",
-      "tag": "direct"
+      "tag":  "direct"
     },
     {
       "type": "block",
-      "tag": "block"
-    },
-    {
-      "type": "socks",
-      "tag": "warp",
-      "server": "127.0.0.1",
-      "server_port": ${WARP_PROXY_PORT:-40000}
+      "tag":  "block"
     }
   ],
   "route": {
-    "auto_detect_interface": true,
+    "auto_detect_interface":  true,
     "default_domain_resolver": "local_recursive",
     "rule_set": [
       {
-        "tag": "geosite-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
+        "tag":             "geosite-cn",
+        "type":            "remote",
+        "format":          "binary",
+        "url":             "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geosite/cn.srs",
         "update_interval": "1d"
       },
       {
-        "tag": "geoip-cn",
-        "type": "remote",
-        "format": "binary",
-        "url": "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
+        "tag":             "geoip-cn",
+        "type":            "remote",
+        "format":          "binary",
+        "url":             "https://raw.githubusercontent.com/MetaCubeX/meta-rules-dat/sing/geo/geoip/cn.srs",
         "update_interval": "1d"
       }
     ],
     "rules": [
       {
-        "action": "sniff",
+        "action":  "sniff",
         "sniffer": ["dns", "http", "tls", "quic"],
         "timeout": "300ms"
       },
       {
         "protocol": "dns",
-        "action": "hijack-dns"
+        "action":   "hijack-dns"
       },
       {
         "ip_is_private": true,
-        "action": "reject"
+        "action":        "reject"
       },
       {
         "rule_set": ["geosite-cn"],
@@ -269,8 +298,8 @@ generate_singbox_config() {
   },
   "experimental": {
     "cache_file": {
-      "enabled": true,
-      "path": "/var/lib/sing-box/cache.db",
+      "enabled":     true,
+      "path":        "/var/lib/sing-box/cache.db",
       "store_fakeip": false
     }
   }

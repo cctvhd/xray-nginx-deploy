@@ -2,6 +2,7 @@
 # ============================================================
 # modules/xray.sh
 # Xray 安装 + 三协议配置生成
+# warp 出站：内嵌 wireguard（由 warp.sh 提供凭证），不依赖本地 SOCKS5
 # ============================================================
 
 # ── 安装 Xray（官方脚本）────────────────────────────────────
@@ -19,7 +20,6 @@ install_xray() {
     xray_ver=$(xray version 2>&1 | grep -oP '[\d.]+' | head -1)
     log_info "Xray 安装成功: v${xray_ver}"
 
-    # 创建日志目录
     mkdir -p /var/log/xray
     chmod 755 /var/log/xray
 }
@@ -29,9 +29,8 @@ generate_xray_params() {
     log_step "生成 Xray 随机参数..."
     local state_file="/etc/xray-deploy/config.env"
 
-    # UUID：已有则复用
     local saved_uuid
-    saved_uuid=$(grep "^XRAY_UUID=" "$state_file" 2>/dev/null | \
+    saved_uuid=$(grep "^XRAY_UUID=" "${state_file}" 2>/dev/null | \
         cut -d= -f2 | tr -d "'\"")
     if [[ -n "${saved_uuid}" ]]; then
         XRAY_UUID="${saved_uuid}"
@@ -41,27 +40,24 @@ generate_xray_params() {
         log_info "生成新 UUID: ${XRAY_UUID}"
     fi
 
-    # x25519 密钥对：已有则复用
     local saved_privkey
-    saved_privkey=$(grep "^XRAY_PRIVATE_KEY=" "$state_file" 2>/dev/null | \
+    saved_privkey=$(grep "^XRAY_PRIVATE_KEY=" "${state_file}" 2>/dev/null | \
         cut -d= -f2 | tr -d "'\"")
     if [[ -n "${saved_privkey}" ]]; then
         XRAY_PRIVATE_KEY="${saved_privkey}"
-        XRAY_PUBLIC_KEY=$(grep "^XRAY_PUBLIC_KEY=" "$state_file" 2>/dev/null | \
+        XRAY_PUBLIC_KEY=$(grep "^XRAY_PUBLIC_KEY=" "${state_file}" 2>/dev/null | \
             cut -d= -f2 | tr -d "'\"")
         log_info "复用已有密钥对"
     else
         local keypair
         keypair=$(xray x25519)
         XRAY_PRIVATE_KEY=$(echo "$keypair" | grep -i "private" | awk '{print $NF}')
-        XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | \
-            awk '{print $NF}')
+        XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
         log_info "生成新密钥对"
     fi
 
-    # xhttp path：已有则复用，没有才生成
     local saved_path
-    saved_path=$(grep "^XHTTP_PATH=" "$state_file" 2>/dev/null | \
+    saved_path=$(grep "^XHTTP_PATH=" "${state_file}" 2>/dev/null | \
         cut -d= -f2 | tr -d "'\"")
     if [[ -n "${saved_path}" ]]; then
         XHTTP_PATH="${saved_path}"
@@ -71,7 +67,6 @@ generate_xray_params() {
         log_info "生成新 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
-    # Reality shortIds
     REALITY_SHORT_IDS=(
         ""
         "$(openssl rand -hex 4)"
@@ -81,7 +76,6 @@ generate_xray_params() {
         "$(openssl rand -hex 8)"
     )
 
-    # Reality spiderX
     REALITY_SPIDER_X="/api/health"
 
     log_info "UUID:        ${XRAY_UUID}"
@@ -95,7 +89,6 @@ collect_reality_params() {
     log_step "配置 Reality 伪装参数"
     echo ""
 
-    # Reality dest（伪装目标）
     echo "常用伪装目标（需要支持TLS 1.3 + H2）："
     echo "  1. solanolibrary.com:443（美国）"
     echo "  2. yandex.com.tr:443（土耳其）"
@@ -116,7 +109,6 @@ collect_reality_params() {
            read -rp "输入 serverName（多个用空格分隔）: " -a REALITY_SERVER_NAMES ;;
     esac
 
-    # 自有域名是否加入 Reality serverNames
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
         echo ""
         log_info "检测到自有 Reality 域名: ${REALITY_DOMAIN}"
@@ -127,7 +119,6 @@ collect_reality_params() {
         fi
     fi
 
-    # 去重，避免同一个 serverName 重复写入 xray / nginx 配置
     local deduped_server_names=()
     local seen_server_names=""
     local sn
@@ -140,12 +131,50 @@ collect_reality_params() {
     done
     REALITY_SERVER_NAMES=("${deduped_server_names[@]}")
 
-    # spiderX
     read -rp "Reality spiderX [默认 /api/health]: " spider_x
     REALITY_SPIDER_X="${spider_x:-/api/health}"
 
     log_info "Reality dest:        ${REALITY_DEST}"
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
+}
+
+# ── 构建 wireguard 出站 JSON（供 generate_xray_config 调用）──
+_build_warp_outbound_json() {
+    # 必须由 warp.sh 的 run_warp() 预先填充这些变量
+    if [[ -z "${WGCF_PRIVATE_KEY:-}" ]]; then
+        log_error "WGCF_* 凭证未设置，请确认 run_warp() 已在 run_xray() 前执行"
+        exit 1
+    fi
+
+    # 将逗号分隔的 Address 转换为 JSON 数组
+    # 例: "172.16.0.2/32,fd01:5ca1:ab1e::1/128"
+    local addr_json=""
+    IFS=',' read -ra addr_arr <<< "${WGCF_ADDRESS}"
+    for addr in "${addr_arr[@]}"; do
+        addr=$(echo "${addr}" | tr -d ' ')
+        addr_json+="\"${addr}\","
+    done
+    addr_json="${addr_json%,}"
+
+    cat << WGJSON
+        {
+            "tag":      "warp",
+            "protocol": "wireguard",
+            "settings": {
+                "secretKey": "${WGCF_PRIVATE_KEY}",
+                "address":   [${addr_json}],
+                "peers": [
+                    {
+                        "publicKey":  "${WGCF_PEER_PUBKEY}",
+                        "endpoint":   "${WGCF_ENDPOINT}",
+                        "allowedIPs": ["0.0.0.0/0", "::/0"]
+                    }
+                ],
+                "mtu":            1280,
+                "domainStrategy": "UseIPv6v4"
+            }
+        }
+WGJSON
 }
 
 # ── 生成 xray config.json ────────────────────────────────────
@@ -154,28 +183,26 @@ generate_xray_config() {
 
     local x_padding="${XRAY_PADDING:-}"
     case "${x_padding}" in
-        ""|"128-2048"|"128-1024")
-            x_padding="100-1000"
-            ;;
+        ""|"128-2048"|"128-1024") x_padding="100-1000" ;;
     esac
+    XRAY_PADDING="${x_padding}"
 
     local user_timeout=30000
 
-    XRAY_PADDING="${x_padding}"
-
-    # 构建 Reality serverNames JSON 数组
     local sn_json=""
     for sn in "${REALITY_SERVER_NAMES[@]}"; do
         sn_json+="\"${sn}\","
     done
     sn_json="${sn_json%,}"
 
-    # 构建 shortIds JSON 数组
     local sid_json=""
     for sid in "${REALITY_SHORT_IDS[@]}"; do
         sid_json+="\"${sid}\","
     done
     sid_json="${sid_json%,}"
+
+    local warp_outbound
+    warp_outbound=$(_build_warp_outbound_json)
 
     mkdir -p /usr/local/etc/xray
 
@@ -183,17 +210,17 @@ generate_xray_config() {
 {
     "log": {
         "loglevel": "warn",
-        "access": "none",
-        "error": "/var/log/xray/error.log"
+        "access":   "none",
+        "error":    "/var/log/xray/error.log"
     },
 
     "dns": {
         "servers": [
             {
-                "tag": "local-dns",
-                "address": "localhost",
-                "port": 53,
-                "domains": [
+                "tag":      "local-dns",
+                "address":  "localhost",
+                "port":     53,
+                "domains":  [
                     "geosite:geolocation-!cn",
                     "geosite:google",
                     "geosite:github",
@@ -201,41 +228,41 @@ generate_xray_config() {
                     "geosite:netflix",
                     "geosite:openai"
                 ],
-                "expectIPs": ["geoip:!cn"],
+                "expectIPs":    ["geoip:!cn"],
                 "skipFallback": true
             },
             {
-                "tag": "warp-dns",
-                "address": "1.1.1.1",
-                "domains": [
+                "tag":      "warp-dns",
+                "address":  "1.1.1.1",
+                "domains":  [
                     "geosite:cn",
                     "geosite:tld-cn"
                 ],
                 "expectIPs": ["geoip:cn"],
-                "proxyTag": "warp"
+                "proxyTag":  "warp"
             }
         ],
-        "disableCache": false,
+        "disableCache":    false,
         "disableFallback": true,
-        "queryStrategy": "UseIPv6v4"
+        "queryStrategy":   "UseIPv6v4"
     },
 
     "routing": {
         "domainStrategy": "IPIfNonMatch",
         "rules": [
             {
-                "type": "field",
-                "ip": ["geoip:private"],
+                "type":        "field",
+                "ip":          ["geoip:private"],
                 "outboundTag": "block"
             },
             {
-                "type": "field",
-                "domain": ["geosite:cn", "geosite:tld-cn"],
+                "type":        "field",
+                "domain":      ["geosite:cn", "geosite:tld-cn"],
                 "outboundTag": "warp"
             },
             {
-                "type": "field",
-                "ip": ["geoip:cn"],
+                "type":        "field",
+                "ip":          ["geoip:cn"],
                 "outboundTag": "warp"
             }
         ]
@@ -243,26 +270,24 @@ generate_xray_config() {
 
     "inbounds": [
         {
-            "tag": "vless-xhttp-cdn",
-            "listen": "127.0.0.1",
-            "port": 8001,
+            "tag":      "vless-xhttp-cdn",
+            "listen":   "127.0.0.1",
+            "port":     8001,
             "protocol": "vless",
             "settings": {
-                "clients": [
-                    {"id": "${XRAY_UUID}"}
-                ],
-                "decryption": "none"
+                "clients":     [{"id": "${XRAY_UUID}"}],
+                "decryption":  "none"
             },
             "streamSettings": {
-                "network": "xhttp",
+                "network":  "xhttp",
                 "security": "none",
                 "xhttpSettings": {
                     "path": "${XHTTP_PATH}",
                     "host": "${XHTTP_DOMAIN:-}",
                     "extra": {
-                        "enc": "packet",
+                        "enc":           "packet",
                         "xPaddingBytes": "${x_padding}",
-                        "headers": {"User-Agent": "chrome"}
+                        "headers":       {"User-Agent": "chrome"}
                     }
                 },
                 "sockopt": {
@@ -277,18 +302,16 @@ generate_xray_config() {
         },
 
         {
-            "tag": "vless-grpc-cdn",
-            "listen": "127.0.0.1",
-            "port": 8002,
+            "tag":      "vless-grpc-cdn",
+            "listen":   "127.0.0.1",
+            "port":     8002,
             "protocol": "vless",
             "settings": {
-                "clients": [
-                    {"id": "${XRAY_UUID}"}
-                ],
+                "clients":    [{"id": "${XRAY_UUID}"}],
                 "decryption": "none"
             },
             "streamSettings": {
-                "network": "grpc",
+                "network":  "grpc",
                 "security": "none",
                 "grpcSettings": {
                     "serviceName":          "grpc.Service",
@@ -305,9 +328,9 @@ generate_xray_config() {
         },
 
         {
-            "tag": "reality-direct",
-            "listen": "127.0.0.1",
-            "port": 9443,
+            "tag":      "reality-direct",
+            "listen":   "127.0.0.1",
+            "port":     9443,
             "protocol": "vless",
             "settings": {
                 "clients": [
@@ -317,7 +340,7 @@ generate_xray_config() {
                     }
                 ],
                 "decryption": "none",
-                "fallbacks": [
+                "fallbacks":  [
                     {"dest": "127.0.0.1:10080", "xver": 0}
                 ]
             },
@@ -325,16 +348,16 @@ generate_xray_config() {
                 "network":  "tcp",
                 "security": "reality",
                 "realitySettings": {
-                    "show":       false,
-                    "dest":       "${REALITY_DEST}",
-                    "xver":       0,
+                    "show":        false,
+                    "dest":        "${REALITY_DEST}",
+                    "xver":        0,
                     "serverNames": [${sn_json}],
-                    "privateKey": "${XRAY_PRIVATE_KEY}",
-                    "shortIds":   [${sid_json}],
-                    "spiderX":    "${REALITY_SPIDER_X}"
+                    "privateKey":  "${XRAY_PRIVATE_KEY}",
+                    "shortIds":    [${sid_json}],
+                    "spiderX":     "${REALITY_SPIDER_X}"
                 },
                 "sockopt": {
-                    "acceptProxyProtocol":  true
+                    "acceptProxyProtocol": true
                 }
             },
             "sniffing": {
@@ -364,13 +387,7 @@ generate_xray_config() {
             "tag":      "block",
             "protocol": "blackhole"
         },
-        {
-            "tag":      "warp",
-            "protocol": "socks",
-            "settings": {
-                "servers": [{"address": "127.0.0.1", "port": ${WARP_PROXY_PORT:-40000}}]
-            }
-        }
+        ${warp_outbound}
     ]
 }
 CONF
@@ -381,7 +398,6 @@ CONF
 # ── 启动 Xray ────────────────────────────────────────────────
 start_xray() {
     log_step "启动 Xray 服务..."
-
 
     if ! xray run -test -config /usr/local/etc/xray/config.json; then
         log_error "Xray 配置验证失败"
@@ -411,9 +427,9 @@ run_xray() {
     log_info "========== Xray 安装配置完成 =========="
     echo ""
     log_info "关键参数（请保存）："
-    echo "  UUID:       ${XRAY_UUID}"
-    echo "  公钥:       ${XRAY_PUBLIC_KEY}"
-    echo "  私钥:       ${XRAY_PRIVATE_KEY}"
-    echo "  xhttp路径:  ${XHTTP_PATH}"
+    echo "  UUID:         ${XRAY_UUID}"
+    echo "  公钥:         ${XRAY_PUBLIC_KEY}"
+    echo "  私钥:         ${XRAY_PRIVATE_KEY}"
+    echo "  xhttp路径:    ${XHTTP_PATH}"
     echo "  Reality dest: ${REALITY_DEST}"
 }

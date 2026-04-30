@@ -111,7 +111,13 @@ REALITY_SHORT_ID=''
 REALITY_SPIDER_X=''
 
 SINGBOX_PASSWORD=''
-WARP_PROXY_PORT='40000'
+
+WGCF_PRIVATE_KEY=''
+WGCF_PEER_PUBKEY=''
+WGCF_ADDRESS=''
+WGCF_ENDPOINT=''
+WGCF_ENDPOINT_HOST=''
+WGCF_ENDPOINT_PORT=''
 
 INST_SYSTEM='0'
 INST_UNBOUND='0'
@@ -148,7 +154,14 @@ ENV
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XRAY_PADDING=$(get_state "XRAY_PADDING")
-    WARP_PROXY_PORT=$(get_state "WARP_PROXY_PORT" "40000")
+
+    # WARP / wgcf 凭证（供 xray.sh / singbox.sh 的 generate_*_config 直接使用）
+    WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
+    WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
+    WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
+    WGCF_ENDPOINT=$(get_state "WGCF_ENDPOINT")
+    WGCF_ENDPOINT_HOST=$(get_state "WGCF_ENDPOINT_HOST")
+    WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT")
 }
 
 load_module() {
@@ -267,7 +280,7 @@ main_menu() {
     echo "  === 其他 ==="
     echo "  a. 生成客户端链接"
     echo "  b. 查看当前状态"
-    echo "  w. 安装 / 配置 Cloudflare WARP"
+    echo "  w. 配置 WARP WireGuard 凭证（步骤 8/9 的前置依赖）"
     echo "  u. 卸载 / 清理模块"
     echo "  r. 全部重装（先清理再执行 1-9）"
     echo "  0. 全流程一键安装（步骤 1-9）"
@@ -305,6 +318,34 @@ main_menu() {
             main_menu
             ;;
     esac
+}
+
+# ── WGCF 凭证保障：若变量为空则先从 state 恢复，仍空则触发 run_warp ──────
+_ensure_wgcf() {
+    # 先尝试从 state_file 恢复（init_state 已做，这里是二次保险）
+    [[ -z "${WGCF_PRIVATE_KEY:-}" ]] && WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
+    [[ -z "${WGCF_PEER_PUBKEY:-}" ]] && WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
+    [[ -z "${WGCF_ADDRESS:-}"     ]] && WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
+    [[ -z "${WGCF_ENDPOINT:-}"    ]] && WGCF_ENDPOINT=$(get_state "WGCF_ENDPOINT")
+    [[ -z "${WGCF_ENDPOINT_HOST:-}" ]] && WGCF_ENDPOINT_HOST=$(get_state "WGCF_ENDPOINT_HOST")
+    [[ -z "${WGCF_ENDPOINT_PORT:-}" ]] && WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT")
+
+    if [[ -z "${WGCF_PRIVATE_KEY:-}" ]]; then
+        log_warn "未找到 WARP WireGuard 凭证，自动执行 WARP 配置（菜单选项 w）..."
+        load_os_info
+        load_module warp
+        run_warp
+        # run_warp 内部已通过 save_wgcf_to_state 写入 state_file
+        # 同步到全局变量
+        WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
+        WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
+        WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
+        WGCF_ENDPOINT=$(get_state "WGCF_ENDPOINT")
+        WGCF_ENDPOINT_HOST=$(get_state "WGCF_ENDPOINT_HOST")
+        WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT")
+        save_state "INST_WARP" "1"
+        save_state "CONF_WARP" "1"
+    fi
 }
 
 done_return() {
@@ -521,6 +562,9 @@ do_conf_xray() {
     restore_domain_arrays
     XRAY_PADDING=$(get_state "XRAY_PADDING" "128-2048")
 
+    # 保证 WGCF 凭证就位（wireguard 出站依赖）
+    _ensure_wgcf
+
     load_module xray
     local saved_path
     saved_path=$(get_state "XHTTP_PATH")
@@ -561,13 +605,15 @@ do_conf_singbox() {
     fi
 
     if [[ "$(get_step CONF_NGINX)" != "1" ]]; then
-        log_warn "建议先完成步骤 7（配置 Nginx），AnyTLS 依赖 443 SNI 分流"
-        read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        log_info "提示：Nginx 尚未配置（步骤 7），443 SNI 分流暂不可用；"
+        log_info "      Sing-Box 本身可正常启动，待 Nginx 配置完成后流量即自动接通。"
     fi
 
     load_os_info
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+
+    # 保证 WGCF 凭证就位（wireguard 出站依赖）
+    _ensure_wgcf
 
     load_module singbox
     generate_singbox_params
@@ -590,12 +636,18 @@ do_client() {
 do_warp() {
     load_os_info
     load_module warp
-    WARP_PROXY_PORT=$(get_state "WARP_PROXY_PORT" "40000")
     run_warp
 
-    save_state "WARP_PROXY_PORT" "${WARP_PROXY_PORT:-40000}"
-    save_state "INST_WARP"       "1"
-    save_state "CONF_WARP"       "1"
+    # run_warp -> save_wgcf_to_state 已用裸 echo >> 写入，
+    # 这里再用 save_state 统一格式，确保 get_state 能正确读到
+    save_state "WGCF_PRIVATE_KEY"   "${WGCF_PRIVATE_KEY:-}"
+    save_state "WGCF_PEER_PUBKEY"   "${WGCF_PEER_PUBKEY:-}"
+    save_state "WGCF_ADDRESS"       "${WGCF_ADDRESS:-}"
+    save_state "WGCF_ENDPOINT"      "${WGCF_ENDPOINT:-}"
+    save_state "WGCF_ENDPOINT_HOST" "${WGCF_ENDPOINT_HOST:-}"
+    save_state "WGCF_ENDPOINT_PORT" "${WGCF_ENDPOINT_PORT:-}"
+    save_state "INST_WARP"          "1"
+    save_state "CONF_WARP"          "1"
 
     done_return
 }
@@ -745,6 +797,18 @@ run_full_install_flow() {
     setup_cf_ip_updater
     run_cf_ip_updater
     save_state "CONF_NGINX" "1"
+
+    # ── WARP WireGuard 凭证（xray / singbox wireguard 出站必需）────────────
+    load_module warp
+    run_warp
+    save_state "WGCF_PRIVATE_KEY"   "${WGCF_PRIVATE_KEY:-}"
+    save_state "WGCF_PEER_PUBKEY"   "${WGCF_PEER_PUBKEY:-}"
+    save_state "WGCF_ADDRESS"       "${WGCF_ADDRESS:-}"
+    save_state "WGCF_ENDPOINT"      "${WGCF_ENDPOINT:-}"
+    save_state "WGCF_ENDPOINT_HOST" "${WGCF_ENDPOINT_HOST:-}"
+    save_state "WGCF_ENDPOINT_PORT" "${WGCF_ENDPOINT_PORT:-}"
+    save_state "INST_WARP"          "1"
+    save_state "CONF_WARP"          "1"
 
     load_module xray
     install_xray

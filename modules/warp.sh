@@ -1,140 +1,164 @@
 #!/usr/bin/env bash
 # ============================================================
 # modules/warp.sh
-# Cloudflare WARP 安装 + Proxy 模式配置
+# 用 wgcf 获取 WARP WireGuard 凭证
+# Xray / Sing-Box 内嵌 wireguard 出站，不再启动独立代理进程
 # ============================================================
 
-ensure_warp_port() {
-    WARP_PROXY_PORT="${WARP_PROXY_PORT:-40000}"
-}
+WGCF_DIR="/etc/wgcf"
+WGCF_PROFILE="${WGCF_DIR}/wgcf-profile.conf"
 
-install_warp() {
-    log_step "安装 Cloudflare WARP..."
-    ensure_warp_port
-
-    case "$OS_ID" in
-        ubuntu|debian)
-            mkdir -p /usr/share/keyrings
-            curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | \
-                gpg --yes --dearmor \
-                    -o /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-
-            cat > /etc/apt/sources.list.d/cloudflare-client.list << REPO
-deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main
-REPO
-
-            apt-get update -y >/dev/null 2>&1
-            apt-get install -y cloudflare-warp >/dev/null 2>&1
-            ;;
-
-        centos|rhel|rocky|almalinux)
-            rpm --import https://pkg.cloudflareclient.com/pubkey.gpg
-            curl -fsSL https://pkg.cloudflareclient.com/cloudflare-warp-ascii.repo \
-                -o /etc/yum.repos.d/cloudflare-warp.repo
-
-            if command -v dnf &>/dev/null; then
-                dnf install -y cloudflare-warp >/dev/null 2>&1
-            else
-                yum install -y cloudflare-warp >/dev/null 2>&1
-            fi
-            ;;
-
-        *)
-            log_error "Cloudflare WARP 暂不支持当前系统: $OS_NAME"
-            exit 1
-            ;;
-    esac
-
-    if ! command -v warp-cli &>/dev/null; then
-        log_error "Cloudflare WARP 安装失败"
-        exit 1
-    fi
-
-    log_info "Cloudflare WARP 安装完成"
-}
-
-start_warp_service() {
-    log_step "启动 Cloudflare WARP 守护进程..."
-
-    systemctl enable --now warp-svc
-    sleep 2
-
-    if systemctl is-active --quiet warp-svc; then
-        log_info "warp-svc 已启动"
-    else
-        log_error "warp-svc 启动失败，请检查 systemctl status warp-svc"
-        exit 1
-    fi
-}
-
-ensure_warp_registered() {
-    log_step "检查 WARP 注册状态..."
-
-    if warp-cli --accept-tos registration show >/dev/null 2>&1; then
-        log_info "WARP 已注册，跳过首次注册"
+# ── 清理旧版 cloudflare-warp ─────────────────────────────────
+cleanup_old_warp() {
+    if ! command -v warp-cli &>/dev/null && \
+       ! systemctl list-unit-files warp-svc.service &>/dev/null 2>&1; then
+        log_info "未检测到旧版 Cloudflare WARP，跳过清理"
         return
     fi
 
-    log_step "首次注册 WARP..."
-    warp-cli --accept-tos registration new
-    log_info "WARP 首次注册完成"
+    log_step "清理旧版 Cloudflare WARP 客户端..."
+
+    warp-cli --accept-tos disconnect >/dev/null 2>&1 || true
+    systemctl stop    warp-svc >/dev/null 2>&1 || true
+    systemctl disable warp-svc >/dev/null 2>&1 || true
+
+    case "${OS_ID}" in
+        ubuntu|debian)
+            apt-get remove -y --purge cloudflare-warp >/dev/null 2>&1 || true
+            apt-get autoremove -y >/dev/null 2>&1 || true
+            rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+            rm -f /etc/apt/sources.list.d/cloudflare-client.list
+            ;;
+        centos|rhel|rocky|almalinux)
+            if command -v dnf &>/dev/null; then
+                dnf remove -y cloudflare-warp >/dev/null 2>&1 || true
+            else
+                yum remove -y cloudflare-warp >/dev/null 2>&1 || true
+            fi
+            rm -f /etc/yum.repos.d/cloudflare-warp.repo
+            ;;
+    esac
+
+    rm -rf /var/lib/cloudflare-warp
+    rm -f  /usr/bin/warp-cli /usr/bin/warp-taskbar
+
+    log_info "旧版 Cloudflare WARP 清理完成"
 }
 
-set_warp_proxy_mode() {
-    log_step "切换 WARP 为 Proxy 模式..."
-    ensure_warp_port
+# ── 安装 wgcf ────────────────────────────────────────────────
+install_wgcf() {
+    if command -v wgcf &>/dev/null; then
+        log_info "wgcf 已安装: $(wgcf --version 2>&1 | head -1)，跳过下载"
+        return
+    fi
 
-    # 官方文档明确 Local proxy mode 需要 MASQUE。
-    warp-cli --accept-tos tunnel protocol set MASQUE
+    log_step "下载 wgcf 最新版本..."
 
-    # 根据不同客户端版本兼容两套命令。
-    warp-cli --accept-tos mode proxy >/dev/null 2>&1 || \
-    warp-cli --accept-tos set-mode proxy >/dev/null 2>&1 || {
-        log_error "切换 WARP Proxy 模式失败"
+    local download_url
+    download_url=$(curl -fsSL \
+        https://api.github.com/repos/ViRb3/wgcf/releases/latest \
+        | grep browser_download_url \
+        | cut -d '"' -f 4 \
+        | grep 'linux_amd64$')
+
+    if [[ -z "${download_url}" ]]; then
+        log_error "无法获取 wgcf 下载地址，请检查网络或 GitHub API 限速"
         exit 1
-    }
-
-    warp-cli --accept-tos set-proxy-port "${WARP_PROXY_PORT}" >/dev/null 2>&1 || true
-
-    log_info "WARP 已切换到 Proxy 模式，端口: ${WARP_PROXY_PORT}"
-    log_warn "如果你使用 Cloudflare One，请确认设备配置文件的 Service mode 已设置为 Local proxy mode，且 Device tunnel protocol 为 MASQUE"
-}
-
-connect_warp() {
-    log_step "连接 WARP..."
-
-    warp-cli --accept-tos connect
-    sleep 3
-
-    local status_out
-    status_out=$(warp-cli --accept-tos status 2>&1 || true)
-    echo "$status_out"
-
-    if ss -lnt 2>/dev/null | grep -q ":${WARP_PROXY_PORT} "; then
-        log_info "检测到本地代理监听在 127.0.0.1:${WARP_PROXY_PORT}"
-    else
-        log_warn "暂未检测到本地代理端口 ${WARP_PROXY_PORT} 正在监听"
-        log_warn "如果你使用的是 Cloudflare One，这通常意味着设备配置文件尚未启用 Local proxy mode"
     fi
+
+    curl -fsSL "${download_url}" -o /usr/local/bin/wgcf
+    chmod +x /usr/local/bin/wgcf
+
+    if ! command -v wgcf &>/dev/null; then
+        log_error "wgcf 安装失败"
+        exit 1
+    fi
+
+    log_info "wgcf 安装成功: $(wgcf --version 2>&1 | head -1)"
 }
 
+# ── 注册并生成 WireGuard 配置 ────────────────────────────────
+generate_wgcf_profile() {
+    local state_file="/etc/xray-deploy/config.env"
+
+    local saved_privkey
+    saved_privkey=$(grep "^WGCF_PRIVATE_KEY=" "${state_file}" 2>/dev/null | \
+        cut -d= -f2- | tr -d "'\"")
+
+    if [[ -n "${saved_privkey}" && -f "${WGCF_PROFILE}" ]]; then
+        log_info "检测到已有 wgcf 凭证，跳过注册"
+        return
+    fi
+
+    log_step "注册 WARP 账号并生成 WireGuard 配置..."
+
+    mkdir -p "${WGCF_DIR}"
+    chmod 700 "${WGCF_DIR}"
+    pushd "${WGCF_DIR}" >/dev/null
+
+    wgcf register --accept-tos
+    wgcf generate
+
+    popd >/dev/null
+
+    # wgcf-account.toml 含有 access_token，锁权限
+    chmod 600 "${WGCF_DIR}/wgcf-account.toml" 2>/dev/null || true
+    chmod 600 "${WGCF_PROFILE}"               2>/dev/null || true
+
+    if [[ ! -f "${WGCF_PROFILE}" ]]; then
+        log_error "wgcf-profile.conf 未生成，注册可能失败"
+        exit 1
+    fi
+
+    log_info "wgcf-profile.conf 生成完成"
+}
+
+# ── 解析凭证到全局变量 ───────────────────────────────────────
+parse_wgcf_credentials() {
+    log_step "解析 wgcf WireGuard 凭证..."
+
+    if [[ ! -f "${WGCF_PROFILE}" ]]; then
+        log_error "找不到 ${WGCF_PROFILE}，请先运行 generate_wgcf_profile"
+        exit 1
+    fi
+
+    WGCF_PRIVATE_KEY=$(awk -F' = ' '/^PrivateKey/{print $2}' "${WGCF_PROFILE}" | tr -d '[:space:]')
+    WGCF_ADDRESS=$(awk -F' = ' '/^Address/{print $2}'    "${WGCF_PROFILE}" | tr -d '[:space:]')
+    WGCF_PEER_PUBKEY=$(awk -F' = ' '/^PublicKey/{print $2}' "${WGCF_PROFILE}" | tr -d '[:space:]')
+    WGCF_ENDPOINT=$(awk -F' = ' '/^Endpoint/{print $2}'  "${WGCF_PROFILE}" | tr -d '[:space:]')
+
+    WGCF_ENDPOINT_HOST="${WGCF_ENDPOINT%:*}"
+    WGCF_ENDPOINT_PORT="${WGCF_ENDPOINT##*:}"
+
+    if [[ -z "${WGCF_PRIVATE_KEY}" || -z "${WGCF_PEER_PUBKEY}" ]]; then
+        log_error "凭证解析失败，请检查 ${WGCF_PROFILE}"
+        exit 1
+    fi
+
+    log_info "PrivateKey : ${WGCF_PRIVATE_KEY}"
+    log_info "PeerPubKey : ${WGCF_PEER_PUBKEY}"
+    log_info "Address    : ${WGCF_ADDRESS}"
+    log_info "Endpoint   : ${WGCF_ENDPOINT}"
+}
+
+# ── 模块入口 ─────────────────────────────────────────────────
 run_warp() {
-    log_step "========== Cloudflare WARP 安装配置 =========="
-    ensure_warp_port
+    log_step "========== WARP WireGuard 凭证配置 =========="
 
-    if ! command -v warp-cli &>/dev/null; then
-        install_warp
-    else
-        log_info "检测到已安装 Cloudflare WARP，跳过安装"
-    fi
+    cleanup_old_warp
+    install_wgcf
+    generate_wgcf_profile
+    parse_wgcf_credentials
+    # 凭证持久化统一由 install.sh 的 save_state 负责（do_warp / run_full_install_flow）
+    # warp.sh 不再自行写 state_file，避免格式冲突
 
-    start_warp_service
-    ensure_warp_registered
-    set_warp_proxy_mode
-    connect_warp
-
-    log_info "========== Cloudflare WARP 安装配置完成 =========="
+    log_info "========== WARP 凭证配置完成 =========="
     echo ""
-    log_info "本地代理地址: 127.0.0.1:${WARP_PROXY_PORT}"
-    log_info "当前脚本中的 Xray / Sing-Box warp 出站默认依赖此地址"
+    log_info "凭证将由 Xray / Sing-Box 内嵌 wireguard 出站直接使用"
+    log_info "无需额外代理进程，内存占用大幅降低"
+    echo ""
+    log_info "  PrivateKey : ${WGCF_PRIVATE_KEY}"
+    log_info "  PeerPubKey : ${WGCF_PEER_PUBKEY}"
+    log_info "  Address    : ${WGCF_ADDRESS}"
+    log_info "  Endpoint   : ${WGCF_ENDPOINT}"
 }
