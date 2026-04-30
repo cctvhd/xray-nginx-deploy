@@ -3,8 +3,6 @@
 # modules/system.sh
 # 系统初始化模块 - 2026 最终独立版
 # 策略：激进上限 + 内核自适应，让软件按需使用内存
-# 修正：daemon-reexec / 旧配置清理 / check_tools /
-#       摘要信息补全 / 验证命令补全
 # ============================================================
 
 # ── 全局资源常量 ─────────────────────────────────────────────
@@ -17,6 +15,7 @@ GLOBAL_NPROC_LIMIT=65536
 log_step() { echo -e "\e[36m[STEP]\e[0m $*"; }
 log_info()  { echo -e "\e[32m[INFO]\e[0m $*"; }
 log_warn()  { echo -e "\e[33m[WARN]\e[0m $*"; }
+log_error() { echo -e "\e[31m[ERROR]\e[0m $*"; }
 
 # save_state 空实现（与主脚本配合时会被覆盖）
 save_state() { :; }
@@ -27,10 +26,10 @@ run_system() {
 
     detect_virt_type
     collect_hardware_info
+    install_base_tools           # 先装工具，后续优化依赖 ethtool/tc
     optimize_hardware_interrupts
     optimize_sysctl
     optimize_limits
-    install_base_tools
     sync_time
     print_optimization_summary
 
@@ -66,12 +65,6 @@ detect_virt_type() {
 # ── 1. 硬件中断与多队列优化 ──────────────────────────────────
 optimize_hardware_interrupts() {
     log_step "优化硬件中断与网络队列 (IRQ / XPS / RPS / RFS)..."
-
-    if command -v apt-get >/dev/null 2>&1; then
-        apt-get install -y ethtool iproute2 >/dev/null 2>&1 || true
-    else
-        dnf install -y ethtool iproute iproute-tc >/dev/null 2>&1 || true
-    fi
 
     main_iface=$(ip -o link show | awk -F': ' \
         '$3 !~ /lo|veth|docker|br-|virbr|bond|team|tap|tun/ {print $2; exit}')
@@ -271,8 +264,6 @@ DefaultLimitNOFILE=${GLOBAL_NOFILE_LIMIT}
 DefaultLimitNPROC=${GLOBAL_NPROC_LIMIT}
 USERCONF
 
-    # daemon-reexec 让 systemd 本身重新加载使 system.conf.d 生效
-    # daemon-reload 重载 unit 文件
     systemctl daemon-reexec >/dev/null 2>&1 || true
     systemctl daemon-reload >/dev/null 2>&1 || true
 
@@ -299,6 +290,14 @@ install_base_tools() {
             htop iftop iotop net-tools \
             >/dev/null 2>&1 || true
         log_info "RHEL/AlmaLinux 基础工具安装完成"
+
+    elif command -v yum >/dev/null 2>&1; then
+        yum install -y \
+            ethtool iproute sysstat procps-ng \
+            curl wget ca-certificates \
+            htop net-tools \
+            >/dev/null 2>&1 || true
+        log_info "CentOS/RHEL(yum) 基础工具安装完成"
 
     else
         log_warn "未知包管理器，跳过基础工具安装"
@@ -382,8 +381,61 @@ if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     [[ $EUID -ne 0 ]] && { echo "必须使用 root 权限运行"; exit 1; }
     run_system
 fi
+
 # ── 向后兼容别名 / 补全函数（install.sh 调用）────────────────
 
+detect_os() {
+    detect_virt_type "$@"
+
+    local os_id os_name
+    if [[ -f /etc/os-release ]]; then
+        os_id=$(grep "^ID=" /etc/os-release | cut -d= -f2 | tr -d '"' | tr '[:upper:]' '[:lower:]')
+        os_name=$(grep "^NAME=" /etc/os-release | cut -d= -f2 | tr -d '"')
+    fi
+
+    case "${os_id}" in
+        ubuntu|debian)
+            OS_ID="${os_id}"
+            OS_NAME="${os_name}"
+            PKG_MANAGER="apt"
+            PKG_UPDATE="apt-get update -y"
+            PKG_INSTALL="apt-get install -y"
+            ;;
+        centos|rhel|rocky|almalinux|fedora)
+            OS_ID="${os_id}"
+            OS_NAME="${os_name}"
+            PKG_MANAGER="dnf"
+            PKG_UPDATE="dnf makecache -y"
+            PKG_INSTALL="dnf install -y"
+            ;;
+        *)
+            # ID_LIKE 兜底（amzn、openeuler 等衍生系统）
+            local os_like
+            os_like=$(grep "^ID_LIKE=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+            if echo "${os_like}" | grep -qE 'rhel|fedora|centos'; then
+                OS_ID="${os_id}"
+                OS_NAME="${os_name}"
+                PKG_MANAGER="dnf"
+                PKG_UPDATE="dnf makecache -y"
+                PKG_INSTALL="dnf install -y"
+            elif echo "${os_like}" | grep -qE 'debian|ubuntu'; then
+                OS_ID="${os_id}"
+                OS_NAME="${os_name}"
+                PKG_MANAGER="apt"
+                PKG_UPDATE="apt-get update -y"
+                PKG_INSTALL="apt-get install -y"
+            else
+                log_error "不支持的系统: ${os_id:-未知}"
+                exit 1
+            fi
+            ;;
+    esac
+
+    log_info "系统: ${OS_NAME} (${OS_ID}) | 包管理器: ${PKG_MANAGER}"
+    save_state "OS_ID"       "${OS_ID}"
+    save_state "OS_NAME"     "${OS_NAME}"
+    save_state "PKG_MANAGER" "${PKG_MANAGER}"
+}
 
 detect_kernel() {
     KERNEL_VER=$(uname -r)
