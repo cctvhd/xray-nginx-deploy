@@ -2,7 +2,7 @@
 # ============================================================
 # modules/unbound.sh
 # Unbound 本地递归 DNS 安装配置
-# 修复：trust anchor 冲突 / AlmaLinux 兼容 / 包管理器兜底
+# 修复：trust anchor 冲突 / AlmaLinux/Fedora 兼容 / 包管理器兜底
 # ============================================================
 
 check_unbound_installed() {
@@ -85,12 +85,18 @@ _pkg_remove() {
     fi
 }
 
+# ── 检测是否使用 Fedora/RHEL 系统的 auto-trust-anchor 机制 ──
+_use_auto_trust_anchor() {
+    grep -q "auto-trust-anchor-file" \
+        /usr/share/unbound/fedora-defaults.conf 2>/dev/null
+}
+
 purge_unbound() {
     log_step "彻底清理 Unbound 残留..."
-    systemctl stop    unbound               2>/dev/null || true
-    systemctl disable unbound               2>/dev/null || true
+    systemctl stop    unbound                      2>/dev/null || true
+    systemctl disable unbound                      2>/dev/null || true
     systemctl disable --now unbound-anchor.service 2>/dev/null || true
-    systemctl mask    unbound-anchor.service 2>/dev/null || true
+    systemctl mask    unbound-anchor.service        2>/dev/null || true
 
     if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]] || command -v apt-get >/dev/null 2>&1; then
         _pkg_remove unbound unbound-anchor
@@ -108,10 +114,8 @@ install_unbound() {
 
     if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]] || command -v apt-get >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1
-        _pkg_install unbound
-    else
-        _pkg_install unbound
     fi
+    _pkg_install unbound
 
     if ! command -v unbound &>/dev/null; then
         log_error "Unbound 安装失败"
@@ -174,11 +178,24 @@ HINTS_EOF
 }
 
 init_trust_anchor() {
-    log_step "初始化 DNSSEC trust anchor (静态 DS 格式)..."
+    log_step "初始化 DNSSEC trust anchor..."
     mkdir -p /var/lib/unbound
     chown unbound:unbound /var/lib/unbound 2>/dev/null || true
+
+    if _use_auto_trust_anchor; then
+        # Fedora/RHEL 系：fedora-defaults.conf 已有 auto-trust-anchor-file
+        # 直接用系统机制初始化，不写静态 trust-anchor-file（否则冲突）
+        if [[ ! -s /var/lib/unbound/root.key ]]; then
+            unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
+            chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+        fi
+        log_info "Fedora/RHEL 系统：使用 auto-trust-anchor-file，跳过静态写入"
+        return
+    fi
+
+    # Debian/Ubuntu 系：写入静态 DNSKEY 格式
     cat > /var/lib/unbound/root.key << 'EOF'
-. IN DS 20326 8 2 E06D44B80B8F1D39A95C0B0D7C65D08458E880409BBC683457104237C7F8EC8D
+. 172800 IN DNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+sqqls3eNbuv7pr+eoZG+SrDK6nWeL3c6H5Apxz7LjVc1uTIdsIXxuOLYA4/ilBmSVIi4eIo5T8lDlCyXJMH+GEEJlm1O6WGh2MkBOHUkJKJWFKmZ2rnJn5AKM0ESkQMJFXBxQ0RDBQ0=
 EOF
     chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
     chmod 644 /var/lib/unbound/root.key
@@ -220,14 +237,13 @@ ensure_unbound_include_dir() {
     conf_dir=$(get_unbound_conf_dir)
     mkdir -p "$conf_dir"
 
+    main_conf="/etc/unbound/unbound.conf"
     if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]]; then
-        main_conf="/etc/unbound/unbound.conf"
         if [[ -f "$main_conf" ]] && ! grep -q 'unbound\.conf\.d/\*\.conf' "$main_conf"; then
             echo 'include: "/etc/unbound/unbound.conf.d/*.conf"' >> "$main_conf"
         fi
     else
-        # RHEL 系：确保主配置包含 conf.d
-        main_conf="/etc/unbound/unbound.conf"
+        # RHEL 系：conf.d 通常已在主配置里 include，确认一下
         if [[ -f "$main_conf" ]] && ! grep -q 'conf\.d/\*\.conf' "$main_conf"; then
             echo 'include: "/etc/unbound/conf.d/*.conf"' >> "$main_conf"
         fi
@@ -251,6 +267,15 @@ get_effective_mem_gb() {
     else awk -v m="$mem_mb" 'BEGIN { print int(m/1024) }'; fi
 }
 
+# ── 判断 module-config 是否需要包含 ipsecmod ────────────────
+_get_module_config() {
+    if grep -q "ipsecmod" /usr/share/unbound/fedora-defaults.conf 2>/dev/null; then
+        echo "ipsecmod validator iterator"
+    else
+        echo "validator iterator"
+    fi
+}
+
 generate_unbound_config() {
     log_step "生成 Unbound 配置..."
 
@@ -261,25 +286,29 @@ generate_unbound_config() {
     rrset_cache="256m"
     [[ $mem_gb -ge 8 ]] && msg_cache="512m" && rrset_cache="1024m"
 
-    local conf_dir target_conf remote_conf
+    local conf_dir target_conf remote_conf module_config
     UNBOUND_SERVICE_NAME=$(infer_unbound_service_name)
     ensure_unbound_include_dir
     conf_dir=$(get_unbound_conf_dir)
     target_conf="${conf_dir}/${UNBOUND_SERVICE_NAME}.conf"
     remote_conf="${conf_dir}/remote-control.conf"
+    module_config=$(_get_module_config)
 
     # 清理旧配置
     rm -f "${conf_dir}"/root-*.conf
 
-    local stack_mode
-    stack_mode=$(get_stack_mode)
-
-    # IPv6 监听行（缩进与配置块对齐）
-    local ipv6_line=""
-    if [[ "$stack_mode" == "dual" || "$stack_mode" == "ipv6" ]]; then
+    # IPv6 监听行
+    local ipv6_line
+    if [[ "$(get_stack_mode)" == "dual" || "$(get_stack_mode)" == "ipv6" ]]; then
         ipv6_line="    interface: ::1"
     else
         ipv6_line="    # interface: ::1  # IPv4-only mode"
+    fi
+
+    # Fedora/RHEL 系统由 fedora-defaults.conf 管理 trust anchor，不在此处写
+    local trust_anchor_line=""
+    if ! _use_auto_trust_anchor; then
+        trust_anchor_line="    trust-anchor-file: \"/var/lib/unbound/root.key\""
     fi
 
     cat > "$target_conf" << CONF_EOF
@@ -305,10 +334,8 @@ ${ipv6_line}
     directory: "/etc/unbound"
     chroot: ""
     pidfile: "/run/unbound.pid"
-    module-config: "validator iterator"
-
-    trust-anchor-file: "/var/lib/unbound/root.key"
-
+    module-config: "${module_config}"
+${trust_anchor_line}
     local-zone: "localhost." static
     local-data: "localhost. 10800 IN A 127.0.0.1"
     do-not-query-localhost: yes
@@ -334,9 +361,11 @@ init_unbound_control() {
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
-    # 彻底禁用 unbound-anchor，防止与静态 trust-anchor-file 冲突
-    systemctl disable --now unbound-anchor.service 2>/dev/null || true
-    systemctl mask    unbound-anchor.service        2>/dev/null || true
+    # Fedora/RHEL 系用 auto-trust-anchor，不需要 unbound-anchor.service 干扰
+    if _use_auto_trust_anchor; then
+        systemctl disable --now unbound-anchor.service 2>/dev/null || true
+        systemctl mask    unbound-anchor.service        2>/dev/null || true
+    fi
 
     if ! unbound-checkconf >/dev/null 2>&1; then
         log_error "配置验证失败"
