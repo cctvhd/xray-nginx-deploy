@@ -219,16 +219,23 @@ restore_domain_arrays() {
 }
 
 show_status() {
+    # 实际安装状态：state=1 OR 二进制存在，取其一即为 OK
+    local s_nginx s_xray s_singbox s_warp
+    { [[ "$(get_step INST_NGINX)"   == "1" ]] || command -v nginx    &>/dev/null; } && s_nginx="OK"    || s_nginx="--"
+    { [[ "$(get_step INST_XRAY)"    == "1" ]] || command -v xray     &>/dev/null; } && s_xray="OK"     || s_xray="--"
+    { [[ "$(get_step INST_SINGBOX)" == "1" ]] || command -v sing-box &>/dev/null; } && s_singbox="OK"  || s_singbox="--"
+    { [[ "$(get_step INST_WARP)"    == "1" ]] || command -v wgcf     &>/dev/null; } && s_warp="OK"     || s_warp="--"
+
     echo ""
     echo -e "${BLUE}================ 当前状态 ================${NC}"
     echo "  [安装]"
-    printf "    %-20s %s\n" "System"   "$([[ "$(get_step INST_SYSTEM)"   == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "Unbound"  "$([[ "$(get_step INST_UNBOUND)"  == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "Nginx"    "$([[ "$(get_step INST_NGINX)"    == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "Cert"     "$([[ "$(get_step INST_CERT)"     == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "Xray"     "$([[ "$(get_step INST_XRAY)"     == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "Sing-Box" "$([[ "$(get_step INST_SINGBOX)"  == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "WARP"     "$([[ "$(get_step INST_WARP)"     == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "System"   "$([[ "$(get_step INST_SYSTEM)"  == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Unbound"  "$([[ "$(get_step INST_UNBOUND)" == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Nginx"    "${s_nginx}"
+    printf "    %-20s %s\n" "Cert"     "$([[ "$(get_step INST_CERT)"    == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Xray"     "${s_xray}"
+    printf "    %-20s %s\n" "Sing-Box" "${s_singbox}"
+    printf "    %-20s %s\n" "WARP"     "${s_warp}"
 
     echo ""
     echo "  [配置]"
@@ -500,10 +507,14 @@ do_inst_singbox() {
 }
 
 do_conf_nginx() {
-    if [[ "$(get_step INST_NGINX)" != "1" ]]; then
+    if [[ "$(get_step INST_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
         log_warn "请先完成步骤 3（安装 Nginx）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
+    fi
+    # nginx 已存在但 state 未记录，补写
+    if command -v nginx &>/dev/null && [[ "$(get_step INST_NGINX)" != "1" ]]; then
+        save_state "INST_NGINX" "1"
     fi
 
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
@@ -546,13 +557,16 @@ do_conf_nginx() {
 }
 
 do_conf_xray() {
-    if [[ "$(get_step INST_XRAY)" != "1" ]]; then
+    if [[ "$(get_step INST_XRAY)" != "1" ]] && ! command -v xray &>/dev/null; then
         log_warn "请先完成步骤 5（安装 Xray）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
+    if command -v xray &>/dev/null && [[ "$(get_step INST_XRAY)" != "1" ]]; then
+        save_state "INST_XRAY" "1"
+    fi
 
-    if [[ "$(get_step CONF_NGINX)" != "1" ]]; then
+    if [[ "$(get_step CONF_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
         log_warn "建议先完成步骤 7（配置 Nginx）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
@@ -592,10 +606,13 @@ do_conf_xray() {
 }
 
 do_conf_singbox() {
-    if [[ "$(get_step INST_SINGBOX)" != "1" ]]; then
+    if [[ "$(get_step INST_SINGBOX)" != "1" ]] && ! command -v sing-box &>/dev/null; then
         log_warn "请先完成步骤 6（安装 Sing-Box）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
+    fi
+    if command -v sing-box &>/dev/null && [[ "$(get_step INST_SINGBOX)" != "1" ]]; then
+        save_state "INST_SINGBOX" "1"
     fi
 
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
