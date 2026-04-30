@@ -171,7 +171,7 @@ _build_warp_outbound_json() {
                     }
                 ],
                 "mtu":            1280,
-                "domainStrategy": "UseIPv6v4"
+                "domainStrategy": "UseIPv4v6"
             }
         }
 WGJSON
@@ -244,7 +244,7 @@ generate_xray_config() {
         ],
         "disableCache":    false,
         "disableFallback": true,
-        "queryStrategy":   "UseIPv6v4"
+        "queryStrategy":   "UseIPv4v6"
     },
 
     "routing": {
@@ -373,7 +373,7 @@ generate_xray_config() {
             "tag":      "direct",
             "protocol": "freedom",
             "settings": {
-                "domainStrategy": "UseIPv6v4"
+                "domainStrategy": "UseIPv4v6"
             },
             "streamSettings": {
                 "sockopt": {
