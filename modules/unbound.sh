@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
 # modules/unbound.sh
-# Unbound 本地递归 DNS 安装配置 - 稳定优化版（已解决 trust anchor 冲突）
+# Unbound 本地递归 DNS 安装配置 - 最终稳定版（修复 trust anchor 冲突）
 # ============================================================
 
+# ── 基础检测函数 ─────────────────────────────────────
 check_unbound_installed() {
     if command -v unbound &>/dev/null && systemctl is-active --quiet unbound 2>/dev/null; then
         return 0
@@ -21,8 +22,8 @@ get_stack_mode() {
 
 detect_unbound_stack_mode() {
     local has_v4=0 has_v6=0
-    ip -o -4 addr show scope global 2>/dev/null | grep -q . && has_v4=1
-    ip -o -6 addr show scope global 2>/dev/null | grep -v ' fe80:' | grep -q . && has_v6=1
+    ip -o -4 addr show scope global 2>/dev/null | grep -q . && has_v4=1 || true
+    ip -o -6 addr show scope global 2>/dev/null | grep -v ' fe80:' | grep -q . && has_v6=1 || true
     if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then
         echo "dual"
     elif [[ $has_v6 -eq 1 ]]; then
@@ -43,9 +44,9 @@ collect_unbound_stack_mode() {
     echo " 2. 单栈 IPv4"
     echo " 3. 单栈 IPv6"
     case "$detected_stack" in
-        dual) log_info "自动检测建议: 双栈" ;;
-        ipv6) log_info "自动检测建议: IPv6" ;;
-        *) log_info "自动检测建议: IPv4" ;;
+        dual) log_info "自动检测建议: 双栈 IPv4 + IPv6" ;;
+        ipv6) log_info "自动检测建议: 单栈 IPv6" ;;
+        *) log_info "自动检测建议: 单栈 IPv4" ;;
     esac
 
     case "$default_stack" in
@@ -63,7 +64,7 @@ collect_unbound_stack_mode() {
     log_info "Unbound 网络栈模式: ${HW_DUAL_STACK}"
 }
 
-# ====================== 清理 ======================
+# ── 彻底清理 ─────────────────────────────────────────────
 purge_unbound() {
     log_step "彻底清理 Unbound 残留..."
     systemctl stop unbound 2>/dev/null || true
@@ -72,10 +73,8 @@ purge_unbound() {
     systemctl mask unbound-anchor.service 2>/dev/null || true
 
     case "$OS_ID" in
-        ubuntu|debian)
-            apt-get remove -y --purge unbound unbound-anchor 2>/dev/null || true ;;
-        centos|rhel|rocky|almalinux)
-            dnf remove -y unbound unbound-libs 2>/dev/null || true ;;
+        ubuntu|debian) apt-get remove -y --purge unbound unbound-anchor 2>/dev/null || true ;;
+        centos|rhel|rocky|almalinux) dnf remove -y unbound unbound-libs 2>/dev/null || true ;;
     esac
 
     rm -rf /etc/unbound /var/lib/unbound /run/unbound
@@ -84,7 +83,7 @@ purge_unbound() {
     log_info "Unbound 清理完成"
 }
 
-# ====================== 安装 ======================
+# ── 安装 ─────────────────────────────────────────────────
 install_unbound() {
     log_step "安装 Unbound..."
     case "$OS_ID" in
@@ -100,7 +99,7 @@ install_unbound() {
             exit 1
             ;;
     esac
-    log_info "Unbound 安装成功: $(unbound -V 2>&1 | head -1)"
+    log_info "Unbound 安装成功"
 }
 
 disable_systemd_resolved() {
@@ -110,23 +109,41 @@ disable_systemd_resolved() {
         systemctl disable systemd-resolved
         log_info "systemd-resolved 已禁用"
     fi
-    if [[ -L /etc/resolv.conf ]]; then
-        rm -f /etc/resolv.conf
-    fi
+    [[ -L /etc/resolv.conf ]] && rm -f /etc/resolv.conf
 }
 
 download_root_hints() {
     log_step "下载 root.hints..."
     mkdir -p /var/lib/unbound
     curl -fsSL https://www.internic.net/domain/named.root -o /var/lib/unbound/root.hints 2>/dev/null || true
-
     if [[ ! -s /var/lib/unbound/root.hints ]]; then
-        log_warn "下载失败，使用内置 root.hints"
+        log_warn "下载失败，使用内置列表..."
         cat > /var/lib/unbound/root.hints << 'HINTS_EOF'
 . 3600000 NS A.ROOT-SERVERS.NET.
 A.ROOT-SERVERS.NET. 3600000 A 198.41.0.4
 A.ROOT-SERVERS.NET. 3600000 AAAA 2001:503:ba3e::2:30
-# （此处省略其他根服务器记录，建议保留你原来的完整列表）
+. 3600000 NS B.ROOT-SERVERS.NET.
+B.ROOT-SERVERS.NET. 3600000 A 170.247.170.2
+. 3600000 NS C.ROOT-SERVERS.NET.
+C.ROOT-SERVERS.NET. 3600000 A 192.33.4.12
+. 3600000 NS D.ROOT-SERVERS.NET.
+D.ROOT-SERVERS.NET. 3600000 A 199.7.91.13
+. 3600000 NS E.ROOT-SERVERS.NET.
+E.ROOT-SERVERS.NET. 3600000 A 192.203.230.10
+. 3600000 NS F.ROOT-SERVERS.NET.
+F.ROOT-SERVERS.NET. 3600000 A 192.5.5.241
+. 3600000 NS G.ROOT-SERVERS.NET.
+G.ROOT-SERVERS.NET. 3600000 A 192.112.36.4
+. 3600000 NS H.ROOT-SERVERS.NET.
+H.ROOT-SERVERS.NET. 3600000 A 198.97.190.53
+. 3600000 NS I.ROOT-SERVERS.NET.
+I.ROOT-SERVERS.NET. 3600000 A 192.36.148.17
+. 3600000 NS J.ROOT-SERVERS.NET.
+J.ROOT-SERVERS.NET. 3600000 A 192.58.128.30
+. 3600000 NS K.ROOT-SERVERS.NET.
+K.ROOT-SERVERS.NET. 3600000 A 193.0.14.129
+. 3600000 NS L.ROOT-SERVERS.NET.
+L.ROOT-SERVERS.NET. 3600000 A 199.7.83.42
 . 3600000 NS M.ROOT-SERVERS.NET.
 M.ROOT-SERVERS.NET. 3600000 A 202.12.27.33
 HINTS_EOF
@@ -134,8 +151,9 @@ HINTS_EOF
     chown unbound:unbound /var/lib/unbound/root.hints 2>/dev/null || true
 }
 
+# ── DNSSEC 初始化（核心修复） ─────────────────────────────
 init_trust_anchor() {
-    log_step "初始化 DNSSEC trust anchor (静态 DS)..."
+    log_step "初始化 DNSSEC trust anchor (静态 DS 格式)..."
     mkdir -p /var/lib/unbound
 
     cat > /var/lib/unbound/root.key << 'EOF'
@@ -147,14 +165,74 @@ EOF
     log_info "DNSSEC trust anchor 初始化完成"
 }
 
-# ====================== 配置生成 ======================
+# ── 服务名称处理 ─────────────────────────────────────────
+sanitize_unbound_service_name() {
+    local value="${1:-}"
+    value=$(echo "${value,,}" | sed -E 's/[^a-z0-9._-]+/-/g; s/^-+//; s/-+$//')
+    [[ -n "$value" ]] || value="$(hostname -s 2>/dev/null || echo unbound)"
+    echo "$value"
+}
+
+infer_unbound_service_name() {
+    local candidate="${UNBOUND_SERVICE_NAME:-}"
+    [[ -z "$candidate" ]] && candidate="$(hostname -s 2>/dev/null || echo unbound)"
+    sanitize_unbound_service_name "$candidate"
+}
+
+collect_unbound_service_name() {
+    local default_name input
+    default_name=$(infer_unbound_service_name)
+    read -rp "Unbound 服务名称（默认 ${default_name}）: " input
+    UNBOUND_SERVICE_NAME=$(sanitize_unbound_service_name "${input:-$default_name}")
+    log_info "Unbound 服务配置文件名: ${UNBOUND_SERVICE_NAME}.conf"
+}
+
+get_unbound_conf_dir() {
+    case "$OS_ID" in
+        ubuntu|debian) echo "/etc/unbound/unbound.conf.d" ;;
+        centos|rhel|rocky|almalinux) echo "/etc/unbound/conf.d" ;;
+        *) echo "/etc/unbound/conf.d" ;;
+    esac
+}
+
+ensure_unbound_include_dir() {
+    local conf_dir main_conf
+    conf_dir=$(get_unbound_conf_dir)
+    mkdir -p "$conf_dir"
+    if [[ "$OS_ID" =~ ^(ubuntu|debian)$ ]]; then
+        main_conf="/etc/unbound/unbound.conf"
+        if [[ -f "$main_conf" ]] && ! grep -q 'unbound\.conf\.d/\*\.conf' "$main_conf"; then
+            echo 'include: "/etc/unbound/unbound.conf.d/*.conf"' >> "$main_conf"
+        fi
+    fi
+}
+
+get_thread_count() {
+    local cores=$(nproc)
+    if [[ $cores -ge 4 ]]; then echo 4
+    elif [[ $cores -ge 2 ]]; then echo 2
+    else echo 1; fi
+}
+
+get_effective_mem_gb() {
+    local mem_mb=$(awk '/MemTotal/{print int($2/1024 + 0.5)}' /proc/meminfo)
+    if (( mem_mb >= 1792 && mem_mb < 2048 )); then echo 2
+    elif (( mem_mb >= 3584 && mem_mb < 4096 )); then echo 4
+    elif (( mem_mb >= 7168 && mem_mb < 8192 )); then echo 8
+    else echo $((mem_mb / 1024)); fi
+}
+
+build_unbound_transparent_zones() {
+    # 如果你有需要透明解析的域名，可以在这里添加，暂时留空
+    echo ""
+}
+
+# ── 生成配置（核心修改） ─────────────────────────────────────
 generate_unbound_config() {
     log_step "生成 Unbound 配置..."
     local threads=$(get_thread_count)
     local mem_gb=$(get_effective_mem_gb)
-    local msg_cache="64m" rrset_cache="128m"
-    [[ $mem_gb -ge 2 ]] && msg_cache="128m" && rrset_cache="256m"
-    [[ $mem_gb -ge 4 ]] && msg_cache="256m" && rrset_cache="512m"
+    local msg_cache="128m" rrset_cache="256m"
     [[ $mem_gb -ge 8 ]] && msg_cache="512m" && rrset_cache="1024m"
 
     local conf_dir target_conf remote_conf
@@ -162,33 +240,31 @@ generate_unbound_config() {
     target_conf="${conf_dir}/${UNBOUND_SERVICE_NAME}.conf"
     remote_conf="${conf_dir}/remote-control.conf"
 
+    ensure_unbound_include_dir
     mkdir -p "$conf_dir"
-    rm -f "${conf_dir}"/root-*.conf   # 清理旧 anchor 文件
+    rm -f "${conf_dir}"/root-*.conf   # 清理旧的 anchor 文件
 
     local stack_mode=$(get_stack_mode)
-    local ipv6_lines=""
-    [[ "$stack_mode" == "dual" || "$stack_mode" == "ipv6" ]] && ipv6_lines='    interface: ::1
-    access-control: ::1 allow'
+    local ipv6_interface=""
+    [[ "$stack_mode" == "dual" || "$stack_mode" == "ipv6" ]] && ipv6_interface="    interface: ::1"
 
     cat > "$target_conf" << CONF_EOF
 server:
     verbosity: 1
     port: 53
     interface: 127.0.0.1
-${ipv6_lines}
+${ipv6_interface}
     access-control: 127.0.0.0/8 allow
     access-control: 0.0.0.0/0 refuse
     num-threads: ${threads}
+    so-reuseport: yes
     msg-cache-size: ${msg_cache}
     rrset-cache-size: ${rrset_cache}
     cache-max-ttl: 86400
-    cache-min-ttl: 300
     prefetch: yes
     root-hints: "/var/lib/unbound/root.hints"
     serve-expired: yes
     harden-glue: yes
-    harden-referral-path: yes
-    harden-below-nxdomain: yes
     hide-identity: yes
     hide-version: yes
     username: "unbound"
@@ -197,13 +273,11 @@ ${ipv6_lines}
     pidfile: "/run/unbound.pid"
     module-config: "validator iterator"
 
-    # DNSSEC 配置（关键：使用静态 trust-anchor-file）
+    # === DNSSEC 关键配置 ===
     trust-anchor-file: "/var/lib/unbound/root.key"
 
     local-zone: "localhost." static
     local-data: "localhost. 10800 IN A 127.0.0.1"
-    local-zone: "127.in-addr.arpa." static
-    local-zone: "0.0.0.0/8." static
     do-not-query-localhost: yes
     private-address: 10.0.0.0/8
     private-address: 172.16.0.0/12
@@ -212,19 +286,20 @@ ${ipv6_lines}
 
 CONF_EOF
 
-    cat > "$remote_conf" << EOF
+    cat > "$remote_conf" << 'EOF'
 remote-control:
     control-enable: yes
     control-interface: /run/unbound.ctl
 EOF
 
-    log_info "Unbound 配置生成完成"
+    log_info "Unbound 配置生成完成 → ${target_conf}"
 }
 
-# 其他辅助函数（get_thread_count、get_effective_mem_gb、get_unbound_conf_dir 等）
-# 请保留你原来的这些函数，这里为了简洁省略，你可以把你原来的对应函数粘贴回来
+init_unbound_control() {
+    log_info "remote-control 使用 UNIX socket"
+}
 
-# ====================== 启动与验证 ======================
+# ── 启动 Unbound ─────────────────────────────────────────────
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
@@ -232,7 +307,8 @@ start_unbound() {
     systemctl mask unbound-anchor.service 2>/dev/null || true
 
     if ! unbound-checkconf; then
-        log_error "配置验证失败"
+        log_error "配置验证失败！"
+        unbound-checkconf
         exit 1
     fi
 
@@ -245,38 +321,44 @@ start_unbound() {
         verify_unbound
     else
         log_error "Unbound 启动失败"
-        journalctl -u unbound -n 20 --no-pager
+        journalctl -u unbound -n 30 --no-pager
         exit 1
     fi
 }
 
 setup_resolv_conf() {
-    local addr=$([[ "$(get_stack_mode)" == "ipv6" ]] && echo "::1" || echo "127.0.0.1")
+    local addr="127.0.0.1"
+    [[ "$(get_stack_mode)" == "ipv6" ]] && addr="::1"
+
+    chattr -i /etc/resolv.conf 2>/dev/null || true
     cat > /etc/resolv.conf << EOF
 nameserver ${addr}
 options ndots:1 timeout:2 attempts:2
 EOF
     chattr +i /etc/resolv.conf 2>/dev/null || true
-    log_info "resolv.conf 已配置并锁定"
+    log_info "/etc/resolv.conf 已配置并锁定"
 }
 
 verify_unbound() {
-    log_step "验证解析..."
-    for d in google.com github.com; do
-        if dig @127.0.0.1 "$d" +short >/dev/null 2>&1; then
-            log_info "解析成功: $d"
+    log_step "验证本地解析..."
+    for domain in google.com github.com cloudflare.com; do
+        if dig @127.0.0.1 "$domain" +short +time=3 >/dev/null 2>&1; then
+            log_info "解析成功: $domain"
         else
-            log_warn "解析失败: $d"
+            log_warn "解析失败: $domain"
         fi
     done
 }
 
-# ====================== 主入口 ======================
+# ── 主入口 ─────────────────────────────────────────────────
 run_unbound() {
     log_step "========== Unbound 安装配置 =========="
 
     if check_unbound_installed; then
-        echo "1. 跳过   2. 重新配置   3. 完整重装"
+        echo ""
+        echo " 1. 跳过"
+        echo " 2. 重新配置"
+        echo " 3. 完整重装"
         read -rp "请选择 [默认1]: " choice
         case "${choice:-1}" in
             3)
@@ -298,10 +380,11 @@ run_unbound() {
                 init_trust_anchor
                 generate_unbound_config
                 systemctl restart unbound
+                sleep 2
                 setup_resolv_conf
                 verify_unbound
                 ;;
-            *) log_info "已跳过" ;;
+            *) log_info "已跳过 Unbound" ;;
         esac
     else
         collect_unbound_stack_mode
@@ -315,5 +398,4 @@ run_unbound() {
     fi
 
     log_info "========== Unbound 配置完成 =========="
-    log_info "本地 DNS: 127.0.0.1:53"
 }
