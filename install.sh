@@ -61,15 +61,27 @@ save_state() {
     chmod 600 "$STATE_FILE"
 
     escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
-    if grep -q "^${key}=" "$STATE_FILE" 2>/dev/null; then
-        sed -i "s|^${key}=.*|${key}='${escaped}'|" "$STATE_FILE"
-    else
-        echo "${key}='${escaped}'" >> "$STATE_FILE"
-    fi
+    # 先删除所有该 key 的行（防止重复行），再追加一行
+    sed -i "/^${key}=/d" "$STATE_FILE" 2>/dev/null || true
+    echo "${key}='${escaped}'" >> "$STATE_FILE"
 }
 
 get_step() {
     get_state "$1" "0"
+}
+
+# ── 根据实际服务状态自动补全 state ──────────────────────────
+_sync_inst_state() {
+    command -v nginx    &>/dev/null && [[ "$(get_step INST_NGINX)"   != "1" ]] && save_state "INST_NGINX"   "1" || true
+    command -v xray     &>/dev/null && [[ "$(get_step INST_XRAY)"    != "1" ]] && save_state "INST_XRAY"    "1" || true
+    command -v sing-box &>/dev/null && [[ "$(get_step INST_SINGBOX)" != "1" ]] && save_state "INST_SINGBOX" "1" || true
+    command -v wgcf     &>/dev/null && [[ "$(get_step INST_WARP)"    != "1" ]] && save_state "INST_WARP"    "1" || true
+    command -v unbound  &>/dev/null && [[ "$(get_step INST_UNBOUND)" != "1" ]] && save_state "INST_UNBOUND" "1" || true
+    systemctl is-active --quiet nginx    2>/dev/null && [[ "$(get_step CONF_NGINX)"   != "1" ]] && save_state "CONF_NGINX"   "1" || true
+    systemctl is-active --quiet xray     2>/dev/null && [[ "$(get_step CONF_XRAY)"    != "1" ]] && save_state "CONF_XRAY"    "1" || true
+    systemctl is-active --quiet sing-box 2>/dev/null && [[ "$(get_step CONF_SINGBOX)" != "1" ]] && save_state "CONF_SINGBOX" "1" || true
+    [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]] && \
+        [[ "$(get_step CONF_WARP)" != "1" ]] && save_state "CONF_WARP" "1" || true
 }
 
 init_state() {
@@ -162,6 +174,9 @@ ENV
     WGCF_ENDPOINT=$(get_state "WGCF_ENDPOINT")
     WGCF_ENDPOINT_HOST=$(get_state "WGCF_ENDPOINT_HOST")
     WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT")
+
+    # 根据实际服务状态自动补全 state（解决手动配置后状态栏不正常问题）
+    _sync_inst_state
 }
 
 load_module() {
@@ -219,30 +234,73 @@ restore_domain_arrays() {
 }
 
 show_status() {
-    # 实际安装状态：state=1 OR 二进制存在，取其一即为 OK
-    local s_nginx s_xray s_singbox s_warp
-    { [[ "$(get_step INST_NGINX)"   == "1" ]] || command -v nginx    &>/dev/null; } && s_nginx="OK"    || s_nginx="--"
-    { [[ "$(get_step INST_XRAY)"    == "1" ]] || command -v xray     &>/dev/null; } && s_xray="OK"     || s_xray="--"
-    { [[ "$(get_step INST_SINGBOX)" == "1" ]] || command -v sing-box &>/dev/null; } && s_singbox="OK"  || s_singbox="--"
-    { [[ "$(get_step INST_WARP)"    == "1" ]] || command -v wgcf     &>/dev/null; } && s_warp="OK"     || s_warp="--"
+    local s_system s_unbound s_nginx s_cert s_xray s_singbox s_warp
+    local c_nginx c_xray c_singbox c_warp
+
+    # 安装状态：state=1 OR 实际检测到，取其一即为 OK
+    { [[ "$(get_step INST_SYSTEM)"  == "1" ]] || \
+      sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q 'bbr'; } \
+      && s_system="OK"  || s_system="--"
+
+    { [[ "$(get_step INST_UNBOUND)" == "1" ]] || \
+      command -v unbound &>/dev/null; } \
+      && s_unbound="OK" || s_unbound="--"
+
+    { [[ "$(get_step INST_NGINX)"   == "1" ]] || \
+      command -v nginx &>/dev/null; } \
+      && s_nginx="OK"   || s_nginx="--"
+
+    { [[ "$(get_step INST_CERT)"    == "1" ]] || \
+      find /etc/ssl/xray-deploy -name '*.pem' -quit 2>/dev/null | grep -q . || \
+      find "${HOME}/.acme.sh" -name '*.cer' -quit 2>/dev/null | grep -q .; } \
+      && s_cert="OK"    || s_cert="--"
+
+    { [[ "$(get_step INST_XRAY)"    == "1" ]] || \
+      command -v xray &>/dev/null; } \
+      && s_xray="OK"    || s_xray="--"
+
+    { [[ "$(get_step INST_SINGBOX)" == "1" ]] || \
+      command -v sing-box &>/dev/null; } \
+      && s_singbox="OK" || s_singbox="--"
+
+    { [[ "$(get_step INST_WARP)"    == "1" ]] || \
+      command -v wgcf &>/dev/null; } \
+      && s_warp="OK"    || s_warp="--"
+
+    # 配置状态：state=1 OR 服务正在运行，取其一即为 OK
+    { [[ "$(get_step CONF_NGINX)"   == "1" ]] || \
+      systemctl is-active --quiet nginx 2>/dev/null; } \
+      && c_nginx="OK"   || c_nginx="--"
+
+    { [[ "$(get_step CONF_XRAY)"    == "1" ]] || \
+      systemctl is-active --quiet xray 2>/dev/null; } \
+      && c_xray="OK"    || c_xray="--"
+
+    { [[ "$(get_step CONF_SINGBOX)" == "1" ]] || \
+      systemctl is-active --quiet sing-box 2>/dev/null; } \
+      && c_singbox="OK" || c_singbox="--"
+
+    { [[ "$(get_step CONF_WARP)"    == "1" ]] || \
+      [[ -f /etc/wgcf/wgcf-profile.conf ]]; } \
+      && c_warp="OK"    || c_warp="--"
 
     echo ""
     echo -e "${BLUE}================ 当前状态 ================${NC}"
     echo "  [安装]"
-    printf "    %-20s %s\n" "System"   "$([[ "$(get_step INST_SYSTEM)"  == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "Unbound"  "$([[ "$(get_step INST_UNBOUND)" == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "System"   "${s_system}"
+    printf "    %-20s %s\n" "Unbound"  "${s_unbound}"
     printf "    %-20s %s\n" "Nginx"    "${s_nginx}"
-    printf "    %-20s %s\n" "Cert"     "$([[ "$(get_step INST_CERT)"    == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Cert"     "${s_cert}"
     printf "    %-20s %s\n" "Xray"     "${s_xray}"
     printf "    %-20s %s\n" "Sing-Box" "${s_singbox}"
     printf "    %-20s %s\n" "WARP"     "${s_warp}"
 
     echo ""
     echo "  [配置]"
-    printf "    %-20s %s\n" "Nginx"    "$([[ "$(get_step CONF_NGINX)"    == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "Xray"     "$([[ "$(get_step CONF_XRAY)"     == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "Sing-Box" "$([[ "$(get_step CONF_SINGBOX)"  == "1" ]] && echo "OK" || echo "--")"
-    printf "    %-20s %s\n" "WARP"     "$([[ "$(get_step CONF_WARP)"     == "1" ]] && echo "OK" || echo "--")"
+    printf "    %-20s %s\n" "Nginx"    "${c_nginx}"
+    printf "    %-20s %s\n" "Xray"     "${c_xray}"
+    printf "    %-20s %s\n" "Sing-Box" "${c_singbox}"
+    printf "    %-20s %s\n" "WARP"     "${c_warp}"
 
     echo ""
     echo "  [域名]"
@@ -329,11 +387,10 @@ main_menu() {
 
 # ── WGCF 凭证保障：若变量为空则先从 state 恢复，仍空则触发 run_warp ──────
 _ensure_wgcf() {
-    # 先尝试从 state_file 恢复（init_state 已做，这里是二次保险）
-    [[ -z "${WGCF_PRIVATE_KEY:-}" ]] && WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
-    [[ -z "${WGCF_PEER_PUBKEY:-}" ]] && WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
-    [[ -z "${WGCF_ADDRESS:-}"     ]] && WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
-    [[ -z "${WGCF_ENDPOINT:-}"    ]] && WGCF_ENDPOINT=$(get_state "WGCF_ENDPOINT")
+    [[ -z "${WGCF_PRIVATE_KEY:-}"   ]] && WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
+    [[ -z "${WGCF_PEER_PUBKEY:-}"   ]] && WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
+    [[ -z "${WGCF_ADDRESS:-}"       ]] && WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
+    [[ -z "${WGCF_ENDPOINT:-}"      ]] && WGCF_ENDPOINT=$(get_state "WGCF_ENDPOINT")
     [[ -z "${WGCF_ENDPOINT_HOST:-}" ]] && WGCF_ENDPOINT_HOST=$(get_state "WGCF_ENDPOINT_HOST")
     [[ -z "${WGCF_ENDPOINT_PORT:-}" ]] && WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT")
 
@@ -342,8 +399,6 @@ _ensure_wgcf() {
         load_os_info
         load_module warp
         run_warp
-        # run_warp 内部已通过 save_wgcf_to_state 写入 state_file
-        # 同步到全局变量
         WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
         WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
         WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
@@ -373,17 +428,17 @@ do_inst_system() {
     install_base_tools
     sync_time
 
-    save_state "OS_ID"           "$OS_ID"
-    save_state "OS_NAME"         "$OS_NAME"
-    save_state "PKG_MANAGER"     "$PKG_MANAGER"
-    save_state "BBR_VERSION"     "${BBR_VERSION:-bbr}"
-    save_state "HW_CPU_CORES"    "$HW_CPU_CORES"
-    save_state "HW_MEM_GB"       "$HW_MEM_GB"
-    save_state "HW_BANDWIDTH"    "$HW_BANDWIDTH"
-    save_state "HW_DUAL_STACK"   "$HW_DUAL_STACK"
-    save_state "HW_DISK_TYPE"    "$HW_DISK_TYPE"
-    save_state "XRAY_PADDING"    "${XRAY_PADDING:-128-2048}"
-    save_state "INST_SYSTEM"     "1"
+    save_state "OS_ID"        "$OS_ID"
+    save_state "OS_NAME"      "$OS_NAME"
+    save_state "PKG_MANAGER"  "$PKG_MANAGER"
+    save_state "BBR_VERSION"  "${BBR_VERSION:-bbr}"
+    save_state "HW_CPU_CORES" "$HW_CPU_CORES"
+    save_state "HW_MEM_GB"    "$HW_MEM_GB"
+    save_state "HW_BANDWIDTH" "$HW_BANDWIDTH"
+    save_state "HW_DUAL_STACK" "$HW_DUAL_STACK"
+    save_state "HW_DISK_TYPE" "$HW_DISK_TYPE"
+    save_state "XRAY_PADDING" "${XRAY_PADDING:-128-2048}"
+    save_state "INST_SYSTEM"  "1"
 
     done_return
 }
@@ -395,9 +450,9 @@ do_inst_unbound() {
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
     run_unbound
 
-    save_state "HW_DUAL_STACK" "${HW_DUAL_STACK:-}"
+    save_state "HW_DUAL_STACK"        "${HW_DUAL_STACK:-}"
     save_state "UNBOUND_SERVICE_NAME" "${UNBOUND_SERVICE_NAME:-}"
-    save_state "INST_UNBOUND" "1"
+    save_state "INST_UNBOUND"         "1"
     done_return
 }
 
@@ -512,7 +567,6 @@ do_conf_nginx() {
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
-    # nginx 已存在但 state 未记录，补写
     if command -v nginx &>/dev/null && [[ "$(get_step INST_NGINX)" != "1" ]]; then
         save_state "INST_NGINX" "1"
     fi
@@ -576,7 +630,6 @@ do_conf_xray() {
     restore_domain_arrays
     XRAY_PADDING=$(get_state "XRAY_PADDING" "128-2048")
 
-    # 保证 WGCF 凭证就位（wireguard 出站依赖）
     _ensure_wgcf
 
     load_module xray
@@ -629,7 +682,6 @@ do_conf_singbox() {
     load_os_info
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
 
-    # 保证 WGCF 凭证就位（wireguard 出站依赖）
     _ensure_wgcf
 
     load_module singbox
@@ -655,8 +707,6 @@ do_warp() {
     load_module warp
     run_warp
 
-    # run_warp -> save_wgcf_to_state 已用裸 echo >> 写入，
-    # 这里再用 save_state 统一格式，确保 get_state 能正确读到
     save_state "WGCF_PRIVATE_KEY"   "${WGCF_PRIVATE_KEY:-}"
     save_state "WGCF_PEER_PUBKEY"   "${WGCF_PEER_PUBKEY:-}"
     save_state "WGCF_ADDRESS"       "${WGCF_ADDRESS:-}"
@@ -703,6 +753,7 @@ do_uninstall_menu() {
                 return
             fi
             cleanup_all_modules
+            rm -f "$STATE_FILE"
             init_state
             ;;
         q|Q)
@@ -734,25 +785,25 @@ run_full_install_flow() {
     install_base_tools
     sync_time
 
-    save_state "OS_ID"           "$OS_ID"
-    save_state "OS_NAME"         "$OS_NAME"
-    save_state "PKG_MANAGER"     "$PKG_MANAGER"
-    save_state "BBR_VERSION"     "${BBR_VERSION:-bbr}"
-    save_state "HW_CPU_CORES"    "$HW_CPU_CORES"
-    save_state "HW_MEM_GB"       "$HW_MEM_GB"
-    save_state "HW_BANDWIDTH"    "$HW_BANDWIDTH"
-    save_state "HW_DUAL_STACK"   "$HW_DUAL_STACK"
-    save_state "HW_DISK_TYPE"    "$HW_DISK_TYPE"
-    save_state "XRAY_PADDING"    "${XRAY_PADDING:-128-2048}"
-    save_state "INST_SYSTEM"     "1"
+    save_state "OS_ID"        "$OS_ID"
+    save_state "OS_NAME"      "$OS_NAME"
+    save_state "PKG_MANAGER"  "$PKG_MANAGER"
+    save_state "BBR_VERSION"  "${BBR_VERSION:-bbr}"
+    save_state "HW_CPU_CORES" "$HW_CPU_CORES"
+    save_state "HW_MEM_GB"    "$HW_MEM_GB"
+    save_state "HW_BANDWIDTH" "$HW_BANDWIDTH"
+    save_state "HW_DUAL_STACK" "$HW_DUAL_STACK"
+    save_state "HW_DISK_TYPE" "$HW_DISK_TYPE"
+    save_state "XRAY_PADDING" "${XRAY_PADDING:-128-2048}"
+    save_state "INST_SYSTEM"  "1"
 
     load_module unbound
     restore_domain_arrays
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
     run_unbound
-    save_state "HW_DUAL_STACK" "${HW_DUAL_STACK:-}"
+    save_state "HW_DUAL_STACK"        "${HW_DUAL_STACK:-}"
     save_state "UNBOUND_SERVICE_NAME" "${UNBOUND_SERVICE_NAME:-}"
-    save_state "INST_UNBOUND" "1"
+    save_state "INST_UNBOUND"         "1"
 
     load_os_info
     load_module nginx
@@ -815,7 +866,6 @@ run_full_install_flow() {
     run_cf_ip_updater
     save_state "CONF_NGINX" "1"
 
-    # ── WARP WireGuard 凭证（xray / singbox wireguard 出站必需）────────────
     load_module warp
     run_warp
     save_state "WGCF_PRIVATE_KEY"   "${WGCF_PRIVATE_KEY:-}"
@@ -879,6 +929,7 @@ do_reinstall_all() {
 
     load_module uninstall
     cleanup_all_modules
+    rm -f "$STATE_FILE"
     init_state
     run_full_install_flow
     done_return
