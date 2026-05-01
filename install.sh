@@ -233,6 +233,27 @@ restore_domain_arrays() {
     XHTTP_PATH=$(get_state "XHTTP_PATH")
 }
 
+refresh_unbound_after_cert() {
+    if ! command -v unbound &>/dev/null; then
+        return 0
+    fi
+
+    load_module unbound
+
+    if ! check_unbound_installed; then
+        log_warn "Unbound 已安装但当前未运行，跳过自动刷新，请先执行步骤 2 修复 Unbound"
+        return 0
+    fi
+
+    restore_domain_arrays
+    UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
+    if refresh_unbound_generated_config; then
+        log_info "Unbound 配置已按当前设置刷新"
+    else
+        log_warn "Unbound 配置刷新失败，请先根据上面的诊断信息修复后再执行步骤 2"
+    fi
+}
+
 show_status() {
     local s_system s_unbound s_nginx s_cert s_xray s_singbox s_warp
     local c_nginx c_xray c_singbox c_warp
@@ -499,15 +520,8 @@ do_inst_cert() {
     save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
     save_state "INST_CERT"      "1"
 
-    if [[ "$(get_step INST_UNBOUND)" == "1" ]] && command -v unbound &>/dev/null; then
-        load_module unbound
-        restore_domain_arrays
-        UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
-        if refresh_unbound_generated_config; then
-            log_info "Unbound 已按当前域名配置刷新"
-        else
-            log_warn "Unbound 域名配置刷新失败，请稍后重试步骤 2"
-        fi
+    if [[ "$(get_step INST_UNBOUND)" == "1" ]] || command -v unbound &>/dev/null; then
+        refresh_unbound_after_cert
     fi
 
     done_return
@@ -827,15 +841,8 @@ run_full_install_flow() {
     save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
     save_state "INST_CERT"      "1"
 
-    if [[ "$(get_step INST_UNBOUND)" == "1" ]] && command -v unbound &>/dev/null; then
-        load_module unbound
-        restore_domain_arrays
-        UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
-        if refresh_unbound_generated_config; then
-            log_info "Unbound 已按当前域名刷新"
-        else
-            log_warn "Unbound 刷新失败，请稍后手动执行步骤 2"
-        fi
+    if [[ "$(get_step INST_UNBOUND)" == "1" ]] || command -v unbound &>/dev/null; then
+        refresh_unbound_after_cert
     fi
 
     restore_domain_arrays

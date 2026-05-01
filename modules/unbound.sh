@@ -358,6 +358,18 @@ init_unbound_control() {
     log_info "使用 UNIX socket remote-control"
 }
 
+print_unbound_diagnostics() {
+    local reason="${1:-Unbound 诊断信息}"
+
+    log_warn "${reason}"
+    echo "----- unbound-checkconf -----"
+    unbound-checkconf 2>&1 || true
+    echo "----- systemctl status unbound -----"
+    systemctl status unbound --no-pager 2>&1 || true
+    echo "----- journalctl -u unbound -----"
+    journalctl -u unbound -n 30 --no-pager 2>&1 || true
+}
+
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
@@ -369,7 +381,7 @@ start_unbound() {
 
     if ! unbound-checkconf >/dev/null 2>&1; then
         log_error "配置验证失败"
-        unbound-checkconf
+        print_unbound_diagnostics "Unbound 配置校验未通过"
         exit 1
     fi
 
@@ -382,7 +394,7 @@ start_unbound() {
         verify_unbound
     else
         log_error "Unbound 启动失败"
-        journalctl -u unbound -n 30 --no-pager
+        print_unbound_diagnostics "Unbound 服务未能成功启动"
         exit 1
     fi
 }
@@ -412,9 +424,28 @@ verify_unbound() {
 
 # ── 供 install.sh 调用的刷新函数 ─────────────────────────────
 refresh_unbound_generated_config() {
-    generate_unbound_config && systemctl restart unbound 2>/dev/null || return 1
+    generate_unbound_config || return 1
+
+    if ! unbound-checkconf >/dev/null 2>&1; then
+        log_error "Unbound 配置校验失败，取消刷新"
+        print_unbound_diagnostics "刷新前配置校验失败"
+        return 1
+    fi
+
+    if ! systemctl restart unbound; then
+        log_error "Unbound 重启失败"
+        print_unbound_diagnostics "刷新后服务重启失败"
+        return 1
+    fi
+
     sleep 2
-    systemctl is-active --quiet unbound || return 1
+
+    if ! systemctl is-active --quiet unbound; then
+        log_error "Unbound 重启后未处于运行状态"
+        print_unbound_diagnostics "刷新后服务未处于 active 状态"
+        return 1
+    fi
+
     log_info "Unbound 配置已刷新"
     return 0
 }
