@@ -26,6 +26,8 @@ run_system() {
 
     detect_virt_type
     collect_hardware_info
+    detect_kernel                # 检测当前内核版本
+    upgrade_kernel               # 升级到 ELRepo mainline（仅 RHEL 系）
     install_base_tools           # 先装工具，后续优化依赖 ethtool/tc
     optimize_hardware_interrupts
     optimize_sysctl
@@ -361,6 +363,9 @@ print_optimization_summary() {
     log_info "缓冲区上限 : rmem/wmem = 128MB (内核自适应分配)"
     log_info "TCP 内存池 : 物理内存 2%~25% (压力时自动回收)"
     log_info "nofile 限制: ${GLOBAL_NOFILE_LIMIT}"
+    if [[ "${KERNEL_UPGRADED:-0}" == "1" ]]; then
+        log_warn "内核已升级，请执行 'reboot' 重启后生效"
+    fi
     echo ""
     log_info "─── 推荐验证命令 ───────────────────────"
     echo "  mpstat -P ALL 1"
@@ -443,7 +448,69 @@ detect_kernel() {
 }
 
 upgrade_kernel() {
-    log_info "跳过内核升级（当前内核: ${KERNEL_VER:-$(uname -r)}）"
+    log_step "检测并升级内核（ELRepo kernel-ml）..."
+
+    # 仅对 RHEL 系生效，Debian/Ubuntu 跳过
+    if ! command -v dnf >/dev/null 2>&1 && ! command -v yum >/dev/null 2>&1; then
+        log_info "非 RHEL 系系统，跳过内核升级"
+        return 0
+    fi
+
+    log_info "当前内核: ${KERNEL_VER:-$(uname -r)}"
+
+    # 获取 RHEL 主版本号
+    local rhel_major
+    rhel_major=$(rpm -E '%{rhel}' 2>/dev/null | grep -oE '^[0-9]+')
+    if [[ -z "$rhel_major" ]]; then
+        log_warn "无法获取 RHEL 主版本号，跳过内核升级"
+        return 0
+    fi
+    log_info "RHEL 主版本: ${rhel_major}"
+
+    # 导入 ELRepo GPG key
+    rpm --import https://www.elrepo.org/RPM-GPG-KEY-elrepo.org 2>/dev/null || true
+
+    # 安装 elrepo-release（幂等）
+    if ! rpm -q elrepo-release >/dev/null 2>&1; then
+        local elrepo_url="https://www.elrepo.org/elrepo-release-${rhel_major}.el${rhel_major}.elrepo.noarch.rpm"
+        log_info "安装 ELRepo: ${elrepo_url}"
+        dnf install -y "$elrepo_url" >/dev/null 2>&1 \
+            || yum install -y "$elrepo_url" >/dev/null 2>&1 \
+            || { log_warn "ELRepo 安装失败，跳过内核升级"; return 0; }
+        log_info "ELRepo 安装完成"
+    else
+        log_info "ELRepo 已安装，跳过重复安装"
+    fi
+
+    # 检查是否已装 kernel-ml，已装则跳过
+    if rpm -q kernel-ml >/dev/null 2>&1; then
+        local ml_ver
+        ml_ver=$(rpm -q kernel-ml --qf '%{VERSION}-%{RELEASE}.%{ARCH}\n' | head -1)
+        log_info "kernel-ml 已安装: ${ml_ver}，跳过重复安装"
+    else
+        log_info "安装 kernel-ml（mainline，含 BBR3）..."
+        dnf --enablerepo=elrepo-kernel install -y kernel-ml >/dev/null 2>&1 \
+            || yum --enablerepo=elrepo-kernel install -y kernel-ml >/dev/null 2>&1 \
+            || { log_warn "kernel-ml 安装失败，跳过内核升级"; return 0; }
+        log_info "kernel-ml 安装完成"
+    fi
+
+    # 设置新内核为默认启动项
+    grub2-set-default 0 2>/dev/null || true
+
+    # 兼容 UEFI 和 BIOS 两种 grub 路径
+    local efi_dir
+    efi_dir=$(ls /boot/efi/EFI/ 2>/dev/null | grep -v '^BOOT$' | head -1)
+    if [[ -n "$efi_dir" && -f "/boot/efi/EFI/${efi_dir}/grub.cfg" ]]; then
+        grub2-mkconfig -o "/boot/efi/EFI/${efi_dir}/grub.cfg" >/dev/null 2>&1 || true
+        log_info "UEFI grub 配置已更新 (/boot/efi/EFI/${efi_dir}/grub.cfg)"
+    else
+        grub2-mkconfig -o /boot/grub2/grub.cfg >/dev/null 2>&1 || true
+        log_info "BIOS grub 配置已更新 (/boot/grub2/grub.cfg)"
+    fi
+
+    log_warn "内核升级完成，需要重启后生效，重启命令: reboot"
+    save_state "KERNEL_UPGRADED" "1"
 }
 
 load_kernel_modules() {
