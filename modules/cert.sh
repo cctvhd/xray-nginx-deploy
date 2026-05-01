@@ -364,10 +364,10 @@ collect_domains() {
     DOMAIN_CF_ACCOUNT_VALS=()
 
     echo "  域名用途说明："
-    echo "    1. xhttp-CDN   - VLESS+XHTTP 经 CF CDN 中转（开启CF代理）"
-    echo "    2. gRPC-CDN    - VLESS+gRPC  经 CF CDN 中转（开启CF代理）"
-    echo "    3. Reality     - VLESS+Reality 直连伪装域名（关闭CF代理）"
-    echo "    4. AnyTLS      - Sing-Box AnyTLS 直连（关闭CF代理）"
+    echo "    xhttp    - VLESS+XHTTP 经 CF CDN 中转（开启 CF 代理）"
+    echo "    grpc     - VLESS+gRPC 经 CF CDN 中转（开启 CF 代理）"
+    echo "    reality  - VLESS+Reality 直连伪装域名（关闭 CF 代理）"
+    echo "    anytls   - Sing-Box AnyTLS 直连（关闭 CF 代理）"
     echo ""
 
     read -rp "共需要配置几个域名？: " domain_count
@@ -378,36 +378,35 @@ collect_domains() {
         read -rp "  域名: " domain
         domain="${domain,,}"
 
-        echo "  用途选择："
-        echo "    1. xhttp-CDN"
-        echo "    2. gRPC-CDN"
-        echo "    3. Reality 伪装域名"
-        echo "    4. AnyTLS"
-        read -rp "  请选择 [1-4]: " usage_choice
+        echo "  这个域名要用于什么用途？"
+        echo "    可输入：xhttp / grpc / reality / anytls"
+        read -rp "  用途: " usage_choice
+        usage_choice="${usage_choice,,}"
 
         case "$usage_choice" in
-            1)
+            1|xhttp|xhttp-cdn)
                 XHTTP_DOMAIN="$domain"
                 CDN_DOMAINS+=("$domain")
                 log_info "域名 $domain → xhttp-CDN"
                 ;;
-            2)
+            2|grpc|grpc-cdn)
                 GRPC_DOMAIN="$domain"
                 CDN_DOMAINS+=("$domain")
                 log_info "域名 $domain → gRPC-CDN"
                 ;;
-            3)
+            3|reality)
                 REALITY_DOMAIN="$domain"
                 DIRECT_DOMAINS+=("$domain")
                 log_info "域名 $domain → Reality"
                 ;;
-            4)
+            4|anytls)
                 ANYTLS_DOMAIN="$domain"
                 DIRECT_DOMAINS+=("$domain")
                 log_info "域名 $domain → AnyTLS"
                 ;;
             *)
-                log_warn "无效选择，跳过 $domain"
+                log_warn "无效用途：$usage_choice，跳过 $domain"
+                log_info "可用用途：xhttp / grpc / reality / anytls"
                 continue
                 ;;
         esac
@@ -565,8 +564,8 @@ request_certificates() {
         log_info "使用配置: $ini_file"
 
         # FIX Bug1: 用进程替换代替管道，避免子 shell 吃掉变量写入
-        local certbot_output
-        certbot_output=$(certbot certonly \
+        local certbot_output certbot_rc
+        if certbot_output=$(certbot certonly \
             --dns-cloudflare \
             --dns-cloudflare-credentials "$ini_file" \
             --dns-cloudflare-propagation-seconds 30 \
@@ -575,14 +574,18 @@ request_certificates() {
             --email "admin@${root_domain}" \
             --agree-tos \
             --non-interactive \
-            --expand 2>&1)
+            --expand 2>&1); then
+            certbot_rc=0
+        else
+            certbot_rc=$?
+        fi
 
         # 把输出打印出来（缩进美化）
         while IFS= read -r line; do
             echo "  $line"
         done <<< "$certbot_output"
 
-        if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
+        if [[ $certbot_rc -eq 0 && -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
             log_info "证书申请成功: *.${root_domain}"
             CERT_SUCCESS_ROOTS+=("$root_domain")
             ROOT_DOMAIN_DONE["$root_domain"]="1"
@@ -590,12 +593,14 @@ request_certificates() {
             deploy_cert_for_domain "$root_domain"
         else
             log_error "证书申请失败: ${root_domain}"
+            log_warn "certbot 退出码: ${certbot_rc}"
             CERT_FAILED_ROOTS+=("$root_domain")
             FAILED_CF_ACCOUNTS+=("$cf_idx")
             log_warn "请检查："
             echo "  1. 域名是否在该CF账号下"
             echo "  2. API Token 是否有 Zone:DNS:Edit 权限"
             echo "  3. 域名是否已添加到CF"
+            echo "  4. 上面 certbot 输出中的具体报错"
         fi
     done
 
