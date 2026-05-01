@@ -172,6 +172,12 @@ load_domain_config() {
     if [[ ${#CF_INI_FILES[@]} -eq 0 ]]; then
         rebuild_cf_ini_files
     fi
+    if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
+        [[ -n "${XHTTP_DOMAIN:-}"   ]] && ALL_DOMAINS+=("$XHTTP_DOMAIN")   && CDN_DOMAINS+=("$XHTTP_DOMAIN")
+        [[ -n "${GRPC_DOMAIN:-}"    ]] && ALL_DOMAINS+=("$GRPC_DOMAIN")    && CDN_DOMAINS+=("$GRPC_DOMAIN")
+        [[ -n "${REALITY_DOMAIN:-}" ]] && ALL_DOMAINS+=("$REALITY_DOMAIN") && DIRECT_DOMAINS+=("$REALITY_DOMAIN")
+        [[ -n "${ANYTLS_DOMAIN:-}"  ]] && ALL_DOMAINS+=("$ANYTLS_DOMAIN")  && DIRECT_DOMAINS+=("$ANYTLS_DOMAIN")
+    fi
     return 0
 }
 
@@ -630,33 +636,7 @@ setup_auto_renew() {
     # FIX Bug4: hook 同时重新部署证书并重载所有服务
     cat > /etc/letsencrypt/renewal-hooks/deploy/xray-nginx-deploy-reload.sh << HOOK
 #!/bin/bash
-# 续期后重新部署证书到统一目录，并重载各服务
-
-systemctl reload  nginx    2>/dev/null && echo "nginx reloaded"    || true
-systemctl restart xray     2>/dev/null && echo "xray restarted"    || true
-systemctl restart sing-box 2>/dev/null && echo "sing-box restarted" || true
-exit 0
-
-DEPLOY_CERT_DIR="${DEPLOY_CERT_DIR}"
-
-for live_dir in /etc/letsencrypt/live/*/; do
-    root_domain="\$(basename "\$live_dir")"
-    dst_dir="\${DEPLOY_CERT_DIR}/\${root_domain}"
-
-    [[ -d "\$live_dir" ]] || continue
-    mkdir -p "\$dst_dir"
-    chmod 755 "\$dst_dir"
-
-    install -m 644 "\${live_dir}fullchain.pem" "\${dst_dir}/fullchain.pem"
-    install -m 644 "\${live_dir}chain.pem"     "\${dst_dir}/chain.pem"     2>/dev/null || true
-    install -m 640 "\${live_dir}privkey.pem"   "\${dst_dir}/privkey.pem"
-    chown root:nobody "\${dst_dir}/privkey.pem" 2>/dev/null || \
-        chown root:nogroup "\${dst_dir}/privkey.pem" 2>/dev/null || true
-
-    echo "Deployed cert for \${root_domain} to \${dst_dir}"
-done
-
-# 重载所有服务
+# renew hook: reload services to pick up updated LetsEncrypt certs
 systemctl reload  nginx    2>/dev/null && echo "nginx reloaded"    || true
 systemctl restart xray     2>/dev/null && echo "xray restarted"    || true
 systemctl restart sing-box 2>/dev/null && echo "sing-box restarted" || true
