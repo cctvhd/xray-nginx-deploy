@@ -181,6 +181,23 @@ load_domain_config() {
     return 0
 }
 
+normalize_domain_arrays() {
+    local normalized_all=()
+    local normalized_cdn=()
+    local normalized_direct=()
+
+    [[ -n "${XHTTP_DOMAIN:-}"   ]] && normalized_all+=("$XHTTP_DOMAIN")   && normalized_cdn+=("$XHTTP_DOMAIN")
+    [[ -n "${GRPC_DOMAIN:-}"    ]] && normalized_all+=("$GRPC_DOMAIN")    && normalized_cdn+=("$GRPC_DOMAIN")
+    [[ -n "${REALITY_DOMAIN:-}" ]] && normalized_all+=("$REALITY_DOMAIN") && normalized_direct+=("$REALITY_DOMAIN")
+    [[ -n "${ANYTLS_DOMAIN:-}"  ]] && normalized_all+=("$ANYTLS_DOMAIN")  && normalized_direct+=("$ANYTLS_DOMAIN")
+
+    if [[ ${#normalized_all[@]} -gt 0 ]]; then
+        ALL_DOMAINS=("${normalized_all[@]}")
+        CDN_DOMAINS=("${normalized_cdn[@]}")
+        DIRECT_DOMAINS=("${normalized_direct[@]}")
+    fi
+}
+
 # ── 保存证书请求状态 ─────────────────────────────────────────
 save_cert_request_status() {
     mkdir -p "$CF_CONFIG_DIR"
@@ -353,6 +370,7 @@ collect_domains() {
         echo ""
         read -rp "是否直接复用已有域名配置？[Y/n]: " reuse_domains
         if [[ "${reuse_domains,,}" != "n" ]]; then
+            normalize_domain_arrays
             log_info "复用已有域名配置"
             return
         fi
@@ -514,6 +532,11 @@ check_existing_certs() {
     CERT_EXISTING_ROOTS=()
     local all_exist=true
     local checked_roots=()   # FIX Bug3: 不带 :-，正确初始化
+
+    if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
+        log_warn "未找到有效域名配置，不能跳过证书申请"
+        return 1
+    fi
 
     for domain in "${ALL_DOMAINS[@]}"; do
         local root_domain
