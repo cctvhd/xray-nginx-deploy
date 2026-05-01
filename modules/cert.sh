@@ -363,71 +363,85 @@ collect_domains() {
     DOMAIN_CF_ACCOUNT_KEYS=()
     DOMAIN_CF_ACCOUNT_VALS=()
 
-    echo "  域名用途说明："
-    echo "    xhttp    - VLESS+XHTTP 经 CF CDN 中转（开启 CF 代理）"
-    echo "    grpc     - VLESS+gRPC 经 CF CDN 中转（开启 CF 代理）"
-    echo "    reality  - VLESS+Reality 直连伪装域名（关闭 CF 代理）"
-    echo "    anytls   - Sing-Box AnyTLS 直连（关闭 CF 代理）"
-    echo ""
+    choose_cf_account_for_domain() {
+        local domain="$1"
+        local cf_idx
 
-    read -rp "共需要配置几个域名？: " domain_count
+        CHOSEN_CF_IDX="1"
 
-    for i in $(seq 1 "$domain_count"); do
+        if [[ "${CF_ACCOUNT_COUNT:-1}" -le 1 ]]; then
+            return
+        fi
+
         echo ""
-        log_info "── 配置第 ${i} 个域名 ──"
-        read -rp "  域名: " domain
+        echo "  为域名 ${domain} 选择 Cloudflare 账号："
+        for j in $(seq 1 "$CF_ACCOUNT_COUNT"); do
+            echo "    账号${j}: $(grep 'api_token' \
+                "${CF_CONFIG_DIR}/cf_account_${j}.ini" | \
+                awk '{print $3}' | cut -c1-12)..."
+        done
+
+        read -rp "  使用第几个 CF 账号？[1-${CF_ACCOUNT_COUNT}]: " cf_idx
+        CHOSEN_CF_IDX="${cf_idx:-1}"
+    }
+
+    add_domain_with_usage() {
+        local usage_key="$1"
+        local prompt_text="$2"
+        local domain
+
+        echo ""
+        read -rp "${prompt_text}" domain
         domain="${domain,,}"
 
-        echo "  这个域名要用于什么用途？"
-        echo "    可输入：xhttp / grpc / reality / anytls"
-        read -rp "  用途: " usage_choice
-        usage_choice="${usage_choice,,}"
+        [[ -z "$domain" ]] && return
 
-        case "$usage_choice" in
-            1|xhttp|xhttp-cdn)
+        choose_cf_account_for_domain "$domain"
+
+        case "$usage_key" in
+            xhttp)
                 XHTTP_DOMAIN="$domain"
                 CDN_DOMAINS+=("$domain")
                 log_info "域名 $domain → xhttp-CDN"
                 ;;
-            2|grpc|grpc-cdn)
+            grpc)
                 GRPC_DOMAIN="$domain"
                 CDN_DOMAINS+=("$domain")
                 log_info "域名 $domain → gRPC-CDN"
                 ;;
-            3|reality)
+            reality)
                 REALITY_DOMAIN="$domain"
                 DIRECT_DOMAINS+=("$domain")
                 log_info "域名 $domain → Reality"
                 ;;
-            4|anytls)
+            anytls)
                 ANYTLS_DOMAIN="$domain"
                 DIRECT_DOMAINS+=("$domain")
                 log_info "域名 $domain → AnyTLS"
                 ;;
             *)
-                log_warn "无效用途：$usage_choice，跳过 $domain"
-                log_info "可用用途：xhttp / grpc / reality / anytls"
-                continue
+                log_warn "未知用途: ${usage_key}"
+                return
                 ;;
         esac
 
-        if [[ "${CF_ACCOUNT_COUNT:-1}" -gt 1 ]]; then
-            echo ""
-            for j in $(seq 1 "$CF_ACCOUNT_COUNT"); do
-                echo "    账号${j}: $(grep 'api_token' \
-                    "${CF_CONFIG_DIR}/cf_account_${j}.ini" | \
-                    awk '{print $3}' | cut -c1-12)..."
-            done
-            read -rp "  域名 $domain 使用第几个CF账号？[1-${CF_ACCOUNT_COUNT}]: " cf_idx
-            cf_idx="${cf_idx:-1}"
-        else
-            cf_idx="1"
-        fi
-
         DOMAIN_CF_ACCOUNT_KEYS+=("$domain")
-        DOMAIN_CF_ACCOUNT_VALS+=("$cf_idx")
+        DOMAIN_CF_ACCOUNT_VALS+=("$CHOSEN_CF_IDX")
         ALL_DOMAINS+=("$domain")
-    done
+    }
+
+    echo "  域名用途说明："
+    echo "    xhttp    - VLESS+XHTTP 经 CF CDN 中转（开启 CF 代理）"
+    echo "    grpc     - VLESS+gRPC 经 CF CDN 中转（开启 CF 代理）"
+    echo "    reality  - VLESS+Reality 直连伪装域名（关闭 CF 代理）"
+    echo "    anytls   - Sing-Box AnyTLS 直连（关闭 CF 代理）"
+    echo "  没有某一类域名时可直接留空跳过。"
+    echo ""
+
+    add_domain_with_usage "xhttp"   "请输入 xhttp 域名（没有可留空）: "
+    add_domain_with_usage "grpc"    "请输入 grpc 域名（没有可留空）: "
+    add_domain_with_usage "reality" "请输入 reality 域名（没有可留空）: "
+    add_domain_with_usage "anytls"  "请输入 anytls 域名（没有可留空）: "
 
     echo ""
     log_info "域名配置汇总："
