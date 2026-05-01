@@ -9,7 +9,6 @@ CF_DOMAIN_MAP_FILE="${CF_CONFIG_DIR}/domain_map.conf"
 CF_CERT_STATUS_FILE="${CF_CONFIG_DIR}/cert_request_status.conf"
 
 # 证书统一存放目录（供 Xray / Nginx / Sing-Box 读取）
-DEPLOY_CERT_DIR="/etc/xray-deploy/certs"
 
 # ── 检测 Certbot 是否已安装 ──────────────────────────────────
 check_certbot_installed() {
@@ -476,6 +475,7 @@ get_domain_cf_idx() {
 # ── FIX Bug4: 将证书部署到统一目录，并修正权限 ──────────────
 # 供 Xray / Nginx / Sing-Box 读取
 deploy_cert_for_domain() {
+    return 0
     local root_domain="$1"
     local src_dir="/etc/letsencrypt/live/${root_domain}"
     local dst_dir="${DEPLOY_CERT_DIR}/${root_domain}"
@@ -570,7 +570,6 @@ request_certificates() {
             CERT_EXISTING_ROOTS+=("$root_domain")
             ROOT_DOMAIN_DONE["$root_domain"]="1"
             # FIX Bug4: 即使证书已存在也要确保部署目录是最新的
-            deploy_cert_for_domain "$root_domain"
             continue
         fi
 
@@ -629,9 +628,14 @@ setup_auto_renew() {
     mkdir -p /etc/letsencrypt/renewal-hooks/deploy
 
     # FIX Bug4: hook 同时重新部署证书并重载所有服务
-    cat > /etc/letsencrypt/renewal-hooks/deploy/xray-deploy-reload.sh << HOOK
+    cat > /etc/letsencrypt/renewal-hooks/deploy/xray-nginx-deploy-reload.sh << HOOK
 #!/bin/bash
 # 续期后重新部署证书到统一目录，并重载各服务
+
+systemctl reload  nginx    2>/dev/null && echo "nginx reloaded"    || true
+systemctl restart xray     2>/dev/null && echo "xray restarted"    || true
+systemctl restart sing-box 2>/dev/null && echo "sing-box restarted" || true
+exit 0
 
 DEPLOY_CERT_DIR="${DEPLOY_CERT_DIR}"
 
@@ -657,7 +661,7 @@ systemctl reload  nginx    2>/dev/null && echo "nginx reloaded"    || true
 systemctl restart xray     2>/dev/null && echo "xray restarted"    || true
 systemctl restart sing-box 2>/dev/null && echo "sing-box restarted" || true
 HOOK
-    chmod +x /etc/letsencrypt/renewal-hooks/deploy/xray-deploy-reload.sh
+    chmod +x /etc/letsencrypt/renewal-hooks/deploy/xray-nginx-deploy-reload.sh
 
     if certbot_uses_snap; then
         crontab -l 2>/dev/null | grep -v certbot | crontab - || true
@@ -710,7 +714,7 @@ run_cert() {
 
     log_info "========== SSL 证书模块完成 =========="
     echo ""
-    log_info "证书统一路径（Nginx/Xray/Sing-Box 请用此路径）："
-    echo "  fullchain: ${DEPLOY_CERT_DIR}/<域名>/fullchain.pem"
-    echo "  privkey:   ${DEPLOY_CERT_DIR}/<域名>/privkey.pem"
+    log_info "Cert path (use Let's Encrypt default directory):"
+    echo "  fullchain: /etc/letsencrypt/live/<root-domain>/fullchain.pem"
+    echo "  privkey:   /etc/letsencrypt/live/<root-domain>/privkey.pem"
 }

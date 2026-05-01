@@ -248,6 +248,9 @@ cleanup_cert_module() {
     local root_domain
     remove_path_if_exists "/etc/cloudflare"
     remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
+    remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/xray-deploy-reload.sh"
+    remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/xray-nginx-deploy-reload.sh"
+    remove_path_if_exists "/etc/xray-deploy/certs"
     remove_crontab_entry "certbot renew --quiet"
 
     while IFS= read -r root_domain; do
