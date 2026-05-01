@@ -675,8 +675,8 @@ run_cert() {
 
         # FIX Bug4: 即使跳过申请，也要确保证书已部署到统一目录
         declare -A _seen_deploy=()
+        local _root
         for domain in "${ALL_DOMAINS[@]}"; do
-            local _root
             _root=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
             [[ -n "${_seen_deploy[$_root]:-}" ]] && continue
             _seen_deploy["$_root"]=1
