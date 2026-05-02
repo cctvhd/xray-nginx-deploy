@@ -180,8 +180,6 @@ init_trust_anchor() {
     mkdir -p /var/lib/unbound
     chown unbound:unbound /var/lib/unbound 2>/dev/null || true
 
-    # 统一用 auto-trust-anchor-file，兼容所有发行版
-    # 只在文件不存在或为空时初始化，不覆盖已有文件
     if [[ ! -s /var/lib/unbound/root.key ]]; then
         unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
         chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
@@ -324,6 +322,7 @@ ${iface_ipv6}
     hide-trustanchor: yes
 
     # === DNSSEC ===
+    # chroot: "" 确保路径从系统根目录解析，不受 directory 影响
     auto-trust-anchor-file: "/var/lib/unbound/root.key"
     root-hints: "/etc/unbound/root.hints"
 
@@ -335,6 +334,7 @@ ${iface_ipv6}
     # === 系统参数 ===
     username: "unbound"
     directory: "/etc/unbound"
+    chroot: ""
     pidfile: "/run/unbound.pid"
     use-systemd: yes
     module-config: "validator iterator"
@@ -363,7 +363,6 @@ generate_custom_config() {
     UNBOUND_SERVICE_NAME=$(infer_unbound_service_name)
     mkdir -p /etc/unbound/conf.d
 
-    # 清理旧的自定义配置（保留系统自带的 example.com.conf 等不动）
     rm -f "/etc/unbound/conf.d/${UNBOUND_SERVICE_NAME}.conf"
 
     local own_domain_zones
@@ -561,7 +560,6 @@ TIMER_EOF
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
-    # 禁用系统自带的 unbound-anchor.service，避免与 auto-trust-anchor-file 竞争
     systemctl disable --now unbound-anchor.service 2>/dev/null || true
     systemctl mask    unbound-anchor.service        2>/dev/null || true
 
