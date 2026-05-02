@@ -82,6 +82,69 @@ _sync_inst_state() {
     systemctl is-active --quiet sing-box 2>/dev/null && [[ "$(get_step CONF_SINGBOX)" != "1" ]] && save_state "CONF_SINGBOX" "1" || true
     [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]] && \
         [[ "$(get_step CONF_WARP)" != "1" ]] && save_state "CONF_WARP" "1" || true
+
+    # ── 自动同步 cert 状态 ──────────────────────────────────
+    # 检查 certbot (Let's Encrypt) 证书是否存在
+    _sync_cert_state
+}
+
+# ── 从实际证书文件 + domain_map.conf 同步 cert 状态 ─────────
+_sync_cert_state() {
+    # 已经是 1 就不需要重复同步
+    [[ "$(get_step INST_CERT)" == "1" ]] && return 0
+
+    local CF_DOMAIN_MAP="/etc/cloudflare/domain_map.conf"
+    [[ -f "$CF_DOMAIN_MAP" ]] || return 0
+
+    # 从 domain_map.conf 读取域名
+    local xhttp grpc reality anytls
+    xhttp=$(   grep "^XHTTP_DOMAIN="   "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
+    grpc=$(    grep "^GRPC_DOMAIN="    "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
+    reality=$( grep "^REALITY_DOMAIN=" "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
+    anytls=$(  grep "^ANYTLS_DOMAIN="  "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
+
+    # 检查是否有至少一个域名的 Let's Encrypt 证书存在
+    local cert_ok=false
+    for d in "$xhttp" "$grpc" "$reality" "$anytls"; do
+        [[ -z "$d" ]] && continue
+        local root
+        root=$(echo "$d" | awk -F. '{print $(NF-1)"."$NF}')
+        if [[ -f "/etc/letsencrypt/live/${root}/fullchain.pem" ]]; then
+            cert_ok=true
+            break
+        fi
+    done
+
+    $cert_ok || return 0
+
+    # 证书确实存在，同步域名变量到 config.env
+    [[ -n "$xhttp"   ]] && save_state "XHTTP_DOMAIN"   "$xhttp"
+    [[ -n "$grpc"    ]] && save_state "GRPC_DOMAIN"     "$grpc"
+    [[ -n "$reality" ]] && save_state "REALITY_DOMAIN"  "$reality"
+    [[ -n "$anytls"  ]] && save_state "ANYTLS_DOMAIN"   "$anytls"
+
+    # 重建 ALL/CDN/DIRECT_DOMAINS 字符串（仅当 config.env 里为空时）
+    local cur_all
+    cur_all=$(get_state "ALL_DOMAINS")
+    if [[ -z "$cur_all" ]]; then
+        local all_d="" cdn_d="" direct_d=""
+        [[ -n "$xhttp"   ]] && all_d+=" $xhttp"   && cdn_d+=" $xhttp"
+        [[ -n "$grpc"    ]] && all_d+=" $grpc"     && cdn_d+=" $grpc"
+        [[ -n "$reality" ]] && all_d+=" $reality"  && direct_d+=" $reality"
+        [[ -n "$anytls"  ]] && all_d+=" $anytls"   && direct_d+=" $anytls"
+        save_state "ALL_DOMAINS"    "${all_d# }"
+        save_state "CDN_DOMAINS"    "${cdn_d# }"
+        save_state "DIRECT_DOMAINS" "${direct_d# }"
+    fi
+
+    save_state "INST_CERT" "1"
+    log_info "已自动同步证书状态（检测到有效的 Let's Encrypt 证书）"
+
+    # 同步到当前 shell 变量，让 show_status 域名栏立即生效
+    [[ -n "$xhttp"   ]] && XHTTP_DOMAIN="$xhttp"
+    [[ -n "$grpc"    ]] && GRPC_DOMAIN="$grpc"
+    [[ -n "$reality" ]] && REALITY_DOMAIN="$reality"
+    [[ -n "$anytls"  ]] && ANYTLS_DOMAIN="$anytls"
 }
 
 init_state() {
@@ -271,10 +334,10 @@ show_status() {
       command -v nginx &>/dev/null; } \
       && s_nginx="OK"   || s_nginx="--"
 
-    { [[ "$(get_step INST_CERT)"    == "1" ]] || \
-      find /etc/ssl/xray-deploy -name '*.pem' -quit 2>/dev/null | grep -q . || \
-      find "${HOME}/.acme.sh" -name '*.cer' -quit 2>/dev/null | grep -q .; } \
-      && s_cert="OK"    || s_cert="--"
+    # ── Cert：检查 Let's Encrypt 实际证书目录 ────────────────
+    { [[ "$(get_step INST_CERT)" == "1" ]] || \
+      find /etc/letsencrypt/live -name 'fullchain.pem' -quit 2>/dev/null | grep -q .; } \
+      && s_cert="OK" || s_cert="--"
 
     { [[ "$(get_step INST_XRAY)"    == "1" ]] || \
       command -v xray &>/dev/null; } \
@@ -585,7 +648,12 @@ do_conf_nginx() {
         save_state "INST_NGINX" "1"
     fi
 
-    if [[ "$(get_step INST_CERT)" != "1" ]]; then
+    # ── Cert 检查：state=1 OR 实际有证书文件，均视为已完成 ──
+    local cert_ready=false
+    [[ "$(get_step INST_CERT)" == "1" ]] && cert_ready=true
+    find /etc/letsencrypt/live -name 'fullchain.pem' -quit 2>/dev/null | grep -q . && cert_ready=true
+
+    if ! $cert_ready; then
         log_warn "请先完成步骤 4（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
