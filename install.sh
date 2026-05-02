@@ -483,14 +483,17 @@ _ensure_wgcf() {
         load_os_info
         load_module warp
         run_warp
-        WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
-        WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
-        WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
-        WGCF_ENDPOINT=$(get_state "WGCF_ENDPOINT")
-        WGCF_ENDPOINT_HOST=$(get_state "WGCF_ENDPOINT_HOST")
-        WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT")
-        save_state "INST_WARP" "1"
-        save_state "CONF_WARP" "1"
+        # ── BUG FIX：run_warp 执行后变量已在 shell 中，立即持久化到 config.env ──
+        # 原代码此处用 get_state 读取，但 warp.sh 注释说"不自行写 state_file"，
+        # 导致 config.env 里始终为空，下次调用仍触发 run_warp，形成死循环。
+        save_state "WGCF_PRIVATE_KEY"   "${WGCF_PRIVATE_KEY:-}"
+        save_state "WGCF_PEER_PUBKEY"   "${WGCF_PEER_PUBKEY:-}"
+        save_state "WGCF_ADDRESS"       "${WGCF_ADDRESS:-}"
+        save_state "WGCF_ENDPOINT"      "${WGCF_ENDPOINT:-}"
+        save_state "WGCF_ENDPOINT_HOST" "${WGCF_ENDPOINT_HOST:-}"
+        save_state "WGCF_ENDPOINT_PORT" "${WGCF_ENDPOINT_PORT:-}"
+        save_state "INST_WARP"          "1"
+        save_state "CONF_WARP"          "1"
     fi
 }
 
