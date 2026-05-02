@@ -2,7 +2,7 @@
 # ============================================================
 # modules/unbound.sh
 # Unbound 本地递归 DNS 安装配置
-# 功能：安装/配置/自有域名透传/CDN优化/root自动更新定时任务
+# 策略：完全替换 unbound.conf，conf.d 写自定义配置
 # 兼容：Debian/Ubuntu/AlmaLinux/RHEL/Fedora
 # ============================================================
 
@@ -86,21 +86,6 @@ _pkg_remove() {
     fi
 }
 
-# ── 检测是否使用 Fedora/RHEL 系的 auto-trust-anchor 机制 ────
-_use_auto_trust_anchor() {
-    grep -q "auto-trust-anchor-file" \
-        /usr/share/unbound/fedora-defaults.conf 2>/dev/null
-}
-
-# ── 判断 module-config ───────────────────────────────────────
-_get_module_config() {
-    if grep -q "ipsecmod" /usr/share/unbound/fedora-defaults.conf 2>/dev/null; then
-        echo "ipsecmod validator iterator"
-    else
-        echo "validator iterator"
-    fi
-}
-
 purge_unbound() {
     log_step "彻底清理 Unbound 残留..."
     systemctl stop    unbound                      2>/dev/null || true
@@ -125,12 +110,10 @@ purge_unbound() {
 
 install_unbound() {
     log_step "安装 Unbound..."
-
     if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]] || command -v apt-get >/dev/null 2>&1; then
         apt-get update -y >/dev/null 2>&1
     fi
     _pkg_install unbound
-
     if ! command -v unbound &>/dev/null; then
         log_error "Unbound 安装失败"
         exit 1
@@ -152,13 +135,13 @@ disable_systemd_resolved() {
 
 download_root_hints() {
     log_step "下载 root.hints..."
-    mkdir -p /var/lib/unbound
+    mkdir -p /etc/unbound /var/lib/unbound
     curl -fsSL https://www.internic.net/domain/named.root \
-        -o /var/lib/unbound/root.hints 2>/dev/null || true
+        -o /etc/unbound/root.hints 2>/dev/null || true
 
-    if [[ ! -s /var/lib/unbound/root.hints ]]; then
+    if [[ ! -s /etc/unbound/root.hints ]]; then
         log_warn "下载失败，使用内置列表..."
-        cat > /var/lib/unbound/root.hints << 'HINTS_EOF'
+        cat > /etc/unbound/root.hints << 'HINTS_EOF'
 . 3600000 NS A.ROOT-SERVERS.NET.
 A.ROOT-SERVERS.NET. 3600000 A 198.41.0.4
 A.ROOT-SERVERS.NET. 3600000 AAAA 2001:503:ba3e::2:30
@@ -188,7 +171,8 @@ L.ROOT-SERVERS.NET. 3600000 A 199.7.83.42
 M.ROOT-SERVERS.NET. 3600000 A 202.12.27.33
 HINTS_EOF
     fi
-    chown unbound:unbound /var/lib/unbound/root.hints 2>/dev/null || true
+    chown unbound:unbound /etc/unbound/root.hints 2>/dev/null || true
+    log_info "root.hints 准备完成"
 }
 
 init_trust_anchor() {
@@ -196,24 +180,15 @@ init_trust_anchor() {
     mkdir -p /var/lib/unbound
     chown unbound:unbound /var/lib/unbound 2>/dev/null || true
 
-    if _use_auto_trust_anchor; then
-        # Fedora/RHEL：fedora-defaults.conf 已有 auto-trust-anchor-file
-        # 只在文件不存在时初始化，不覆盖已有文件
-        if [[ ! -s /var/lib/unbound/root.key ]]; then
-            unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
-            chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
-        fi
-        log_info "Fedora/RHEL：使用 auto-trust-anchor-file，跳过静态写入"
-        return
+    # 统一用 auto-trust-anchor-file，兼容所有发行版
+    # 只在文件不存在或为空时初始化，不覆盖已有文件
+    if [[ ! -s /var/lib/unbound/root.key ]]; then
+        unbound-anchor -a /var/lib/unbound/root.key 2>/dev/null || true
+        chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
+        log_info "root.key 已生成"
+    else
+        log_info "root.key 已存在，跳过生成"
     fi
-
-    # Debian/Ubuntu：写入静态 DNSKEY 格式
-    cat > /var/lib/unbound/root.key << 'EOF'
-. 172800 IN DNSKEY 257 3 8 AwEAAaz/tAm8yTn4Mfeh5eyI96WSVexTBAvkMgJzkKTOiW1vkIbzxeF3+/4RgWOq7HrxRixHlFlExOLAJr5emLvN7SWXgnLh4+B5xQlNVz8Og8kvArMtNROxVQuCaSnIDdD5LKyWbRd2n9WGe2R8PzgCmr3EgVLrjyBxWezF0jLHwVN8efS3rCj/EWgvIWgb9tarpVUDK/b58Da+sqqls3eNbuv7pr+eoZG+SrDK6nWeL3c6H5Apxz7LjVc1uTIdsIXxuOLYA4/ilBmSVIi4eIo5T8lDlCyXJMH+GEEJlm1O6WGh2MkBOHUkJKJWFKmZ2rnJn5AKM0ESkQMJFXBxQ0RDBQ0=
-EOF
-    chown unbound:unbound /var/lib/unbound/root.key 2>/dev/null || true
-    chmod 644 /var/lib/unbound/root.key
-    log_info "DNSSEC trust anchor 初始化完成"
 }
 
 sanitize_unbound_service_name() {
@@ -239,30 +214,6 @@ collect_unbound_service_name() {
     log_info "Unbound 服务配置文件名: ${UNBOUND_SERVICE_NAME}.conf"
 }
 
-get_unbound_conf_dir() {
-    case "${OS_ID:-}" in
-        ubuntu|debian) echo "/etc/unbound/unbound.conf.d" ;;
-        *)             echo "/etc/unbound/conf.d" ;;
-    esac
-}
-
-ensure_unbound_include_dir() {
-    local conf_dir main_conf
-    conf_dir=$(get_unbound_conf_dir)
-    mkdir -p "$conf_dir"
-
-    main_conf="/etc/unbound/unbound.conf"
-    if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]]; then
-        if [[ -f "$main_conf" ]] && ! grep -q 'unbound\.conf\.d/\*\.conf' "$main_conf"; then
-            echo 'include: "/etc/unbound/unbound.conf.d/*.conf"' >> "$main_conf"
-        fi
-    else
-        if [[ -f "$main_conf" ]] && ! grep -q 'conf\.d/\*\.conf' "$main_conf"; then
-            echo 'include: "/etc/unbound/conf.d/*.conf"' >> "$main_conf"
-        fi
-    fi
-}
-
 get_thread_count() {
     local cores
     cores=$(nproc)
@@ -283,16 +234,13 @@ get_effective_mem_gb() {
 # ── 构建自有域名透传块 ───────────────────────────────────────
 _build_own_domain_zones() {
     local domains=()
-
-    # 从全局变量收集所有配置的域名（去重、去空）
     local d
     for d in \
-        "${XHTTP_DOMAIN:-}"  \
-        "${GRPC_DOMAIN:-}"   \
+        "${XHTTP_DOMAIN:-}"   \
+        "${GRPC_DOMAIN:-}"    \
         "${REALITY_DOMAIN:-}" \
         "${ANYTLS_DOMAIN:-}"; do
         [[ -z "$d" ]] && continue
-        # 检查是否已在列表里
         local already=0
         local existing
         for existing in "${domains[@]+"${domains[@]}"}"; do
@@ -312,91 +260,122 @@ _build_own_domain_zones() {
     done
 }
 
-generate_unbound_config() {
-    log_step "生成 Unbound 配置..."
+# ── 生成主配置 /etc/unbound/unbound.conf ────────────────────
+generate_main_config() {
+    log_step "生成主配置 /etc/unbound/unbound.conf..."
 
     local threads mem_gb msg_cache rrset_cache
     threads=$(get_thread_count)
     mem_gb=$(get_effective_mem_gb)
-    msg_cache="128m"
-    rrset_cache="256m"
+    msg_cache="256m"
+    rrset_cache="512m"
     [[ $mem_gb -ge 8 ]] && msg_cache="512m" && rrset_cache="1024m"
 
-    local conf_dir target_conf remote_conf module_config
-    UNBOUND_SERVICE_NAME=$(infer_unbound_service_name)
-    ensure_unbound_include_dir
-    conf_dir=$(get_unbound_conf_dir)
-    target_conf="${conf_dir}/${UNBOUND_SERVICE_NAME}.conf"
-    remote_conf="${conf_dir}/remote-control.conf"
-    module_config=$(_get_module_config)
+    local do_ip6="yes"
+    local iface_ipv6="    interface: ::"
+    [[ "$(get_stack_mode)" == "ipv4" ]] && do_ip6="no" && iface_ipv6="    # interface: ::  # IPv4-only"
 
-    rm -f "${conf_dir}"/root-*.conf
+    cat > /etc/unbound/unbound.conf << MAIN_EOF
+# ============================================================
+# /etc/unbound/unbound.conf
+# 由 xray-nginx-deploy 自动生成 - $(date '+%Y-%m-%d %H:%M:%S')
+# ============================================================
 
-    # IPv6 监听
-    local ipv6_line
-    if [[ "$(get_stack_mode)" == "dual" || "$(get_stack_mode)" == "ipv6" ]]; then
-        ipv6_line="    interface: ::1"
-    else
-        ipv6_line="    # interface: ::1  # IPv4-only mode"
-    fi
-
-    # trust-anchor-file 只在非 Fedora/RHEL 系写入
-    local trust_anchor_line=""
-    if ! _use_auto_trust_anchor; then
-        trust_anchor_line="    trust-anchor-file: \"/var/lib/unbound/root.key\""
-    fi
-
-    # 自有域名透传块
-    local own_domain_zones
-    own_domain_zones=$(_build_own_domain_zones)
-
-    cat > "$target_conf" << CONF_EOF
 server:
+    # === 基础设置 ===
     verbosity: 1
     port: 53
-    interface: 127.0.0.1
-${ipv6_line}
+    do-ip4: yes
+    do-ip6: ${do_ip6}
+    do-udp: yes
+    do-tcp: yes
+    interface: 0.0.0.0
+${iface_ipv6}
+
+    # === 访问控制（仅本地）===
     access-control: 127.0.0.0/8 allow
+    access-control: ::1 allow
     access-control: 0.0.0.0/0 refuse
+    access-control: ::/0 refuse
+
+    # === 性能优化 ===
     num-threads: ${threads}
     so-reuseport: yes
     msg-cache-size: ${msg_cache}
     rrset-cache-size: ${rrset_cache}
     cache-max-ttl: 86400
+    cache-min-ttl: 300
     prefetch: yes
     prefetch-key: yes
-    root-hints: "/var/lib/unbound/root.hints"
-    serve-expired: yes
-    serve-expired-ttl: 14400
+    outgoing-range: 8192
+    num-queries-per-thread: 4096
+    jostle-timeout: 200
+    so-rcvbuf: 8m
+    so-sndbuf: 8m
+
+    # === 安全加固 ===
+    prefer-ip6: no
+    deny-any: yes
     harden-glue: yes
-    harden-large-queries: yes
     harden-referral-path: yes
-    qname-minimisation: yes
-    aggressive-nsec: yes
+    harden-below-nxdomain: yes
     hide-identity: yes
     hide-version: yes
-    deny-any: yes
-    rrset-roundrobin: yes
-    minimal-responses: yes
-    unwanted-reply-threshold: 10000000
-    val-clean-additional: yes
-    val-permissive-mode: no
-    val-log-level: 1
-    trust-anchor-signaling: yes
-    root-key-sentinel: yes
-    prefer-ip6: no
+    hide-trustanchor: yes
+
+    # === DNSSEC ===
+    auto-trust-anchor-file: "/var/lib/unbound/root.key"
+    root-hints: "/etc/unbound/root.hints"
+
+    # === 过期缓存容错 ===
+    serve-expired: yes
+    serve-expired-ttl: 1800
+    serve-expired-client-timeout: 120
+
+    # === 系统参数 ===
     username: "unbound"
     directory: "/etc/unbound"
-    chroot: ""
     pidfile: "/run/unbound.pid"
-    module-config: "${module_config}"
-${trust_anchor_line}
+    use-systemd: yes
+    module-config: "validator iterator"
 
-    # === 性能统计 ===
-    statistics-interval: 0
-    statistics-cumulative: no
-    extended-statistics: yes
+    # === 加载扩展配置 ===
+    include: "/etc/unbound/conf.d/*.conf"
 
+# === 远程控制 ===
+remote-control:
+    control-enable: yes
+    control-interface: 127.0.0.1
+    control-interface: ::1
+    control-port: 8953
+    control-use-cert: no
+MAIN_EOF
+
+    chown root:unbound /etc/unbound/unbound.conf 2>/dev/null || true
+    chmod 640 /etc/unbound/unbound.conf
+    log_info "主配置生成完成"
+}
+
+# ── 生成 conf.d 自定义配置 ───────────────────────────────────
+generate_custom_config() {
+    log_step "生成自定义配置 /etc/unbound/conf.d/..."
+
+    UNBOUND_SERVICE_NAME=$(infer_unbound_service_name)
+    mkdir -p /etc/unbound/conf.d
+
+    # 清理旧的自定义配置（保留系统自带的 example.com.conf 等不动）
+    rm -f "/etc/unbound/conf.d/${UNBOUND_SERVICE_NAME}.conf"
+
+    local own_domain_zones
+    own_domain_zones=$(_build_own_domain_zones)
+
+    cat > "/etc/unbound/conf.d/${UNBOUND_SERVICE_NAME}.conf" << CUSTOM_EOF
+# ============================================================
+# /etc/unbound/conf.d/${UNBOUND_SERVICE_NAME}.conf
+# 由 xray-nginx-deploy 自动生成 - $(date '+%Y-%m-%d %H:%M:%S')
+# ============================================================
+
+server:
     # === 本地域名解析 ===
     local-zone: "localhost." static
     local-data: "localhost. 10800 IN A 127.0.0.1"
@@ -418,9 +397,9 @@ ${own_domain_zones}
 
     # === 局域与安全域 ===
     do-not-query-localhost: yes
-    private-address: 10.0.0.0/8
-    private-address: 172.16.0.0/12
     private-address: 192.168.0.0/16
+    private-address: 172.16.0.0/12
+    private-address: 10.0.0.0/8
     private-address: 169.254.0.0/16
     private-address: fd00::/8
     private-address: fe80::/10
@@ -430,19 +409,25 @@ ${own_domain_zones}
     local-zone: "authors.bind." refuse
     local-zone: "hostname.bind." refuse
     local-zone: "id.server." refuse
-CONF_EOF
 
-    cat > "$remote_conf" << 'EOF'
-remote-control:
-    control-enable: yes
-    control-interface: /run/unbound.ctl
-EOF
+    # === 性能统计 ===
+    statistics-interval: 0
+    statistics-cumulative: no
+    extended-statistics: yes
+CUSTOM_EOF
 
-    log_info "Unbound 配置生成完成: ${target_conf}"
+    chown root:unbound "/etc/unbound/conf.d/${UNBOUND_SERVICE_NAME}.conf" 2>/dev/null || true
+    chmod 640 "/etc/unbound/conf.d/${UNBOUND_SERVICE_NAME}.conf"
+    log_info "自定义配置生成完成: /etc/unbound/conf.d/${UNBOUND_SERVICE_NAME}.conf"
+}
+
+generate_unbound_config() {
+    generate_main_config
+    generate_custom_config
 }
 
 init_unbound_control() {
-    log_info "使用 UNIX socket remote-control"
+    log_info "remote-control 已写入主配置"
 }
 
 # ── root.hints 自动更新脚本 + 定时任务 ──────────────────────
@@ -455,7 +440,7 @@ install_root_update_job() {
 set -euo pipefail
 
 ROOT_HINTS_URL="https://www.internic.net/domain/named.root"
-DEST_FILE="/var/lib/unbound/root.hints"
+DEST_FILE="/etc/unbound/root.hints"
 ROOT_KEY_FILE="/var/lib/unbound/root.key"
 BACKUP_DIR="/var/lib/unbound/root-hints-backup"
 MAX_BACKUPS=5
@@ -473,15 +458,7 @@ echo "===== $(date '+%Y-%m-%d %H:%M:%S') 开始更新 ====="
 
 [[ $EUID -ne 0 ]] && { _error "请使用 root 用户运行"; exit 1; }
 
-mkdir -p /var/lib/unbound "$BACKUP_DIR"
-
-# ── 初始化 root.hints（文件不存在或过小时）──────────────────
-if [[ ! -f "$DEST_FILE" || $(stat -c%s "$DEST_FILE" 2>/dev/null || echo 0) -lt $MIN_ROOT_HINTS_SIZE ]]; then
-    _info "初始化 root.hints..."
-    curl -fsSL "$ROOT_HINTS_URL" -o "$DEST_FILE" || true
-    chown unbound:unbound "$DEST_FILE" 2>/dev/null || true
-    chmod 644 "$DEST_FILE"
-fi
+mkdir -p /etc/unbound /var/lib/unbound "$BACKUP_DIR"
 
 # ── 初始化 root.key（文件不存在或为空时）───────────────────
 if [[ ! -f "$ROOT_KEY_FILE" || ! -s "$ROOT_KEY_FILE" ]]; then
@@ -520,7 +497,6 @@ done
 
 if [[ $downloaded -eq 0 ]]; then
     _error "多次下载失败，保留旧版本"
-    # 恢复备份
     [[ -f "${BACKUP_DIR}/root.hints.${TS}" ]] && \
         cp "${BACKUP_DIR}/root.hints.${TS}" "$DEST_FILE"
     exit 1
@@ -549,9 +525,7 @@ fi
 UPDATE_EOF
 
     chmod +x /usr/local/bin/update-root-hints.sh
-    log_info "更新脚本已写入 /usr/local/bin/update-root-hints.sh"
 
-    # ── 安装 systemd timer（每月1日凌晨3点执行）────────────
     cat > /etc/systemd/system/unbound-root-update.service << 'SVC_EOF'
 [Unit]
 Description=Update Unbound root.hints
@@ -587,10 +561,9 @@ TIMER_EOF
 start_unbound() {
     log_step "启动 Unbound 服务..."
 
-    if _use_auto_trust_anchor; then
-        systemctl disable --now unbound-anchor.service 2>/dev/null || true
-        systemctl mask    unbound-anchor.service        2>/dev/null || true
-    fi
+    # 禁用系统自带的 unbound-anchor.service，避免与 auto-trust-anchor-file 竞争
+    systemctl disable --now unbound-anchor.service 2>/dev/null || true
+    systemctl mask    unbound-anchor.service        2>/dev/null || true
 
     if ! unbound-checkconf >/dev/null 2>&1; then
         log_error "配置验证失败"
@@ -673,7 +646,7 @@ run_unbound() {
                 collect_unbound_stack_mode
                 collect_unbound_service_name
                 disable_systemd_resolved
-                mkdir -p /var/lib/unbound
+                mkdir -p /etc/unbound /var/lib/unbound
                 chown unbound:unbound /var/lib/unbound 2>/dev/null || true
                 download_root_hints
                 init_trust_anchor
@@ -708,6 +681,6 @@ run_unbound() {
     fi
 
     log_info "========== Unbound 安装配置完成 =========="
-    log_info "本地递归 DNS  : 127.0.0.1:53"
+    log_info "本地递归 DNS   : 127.0.0.1:53"
     log_info "root.hints 更新: 每月自动执行（systemd timer）"
 }
