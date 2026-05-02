@@ -508,19 +508,34 @@ do_inst_system() {
     upgrade_kernel
     collect_hardware_info
     load_kernel_modules
-    tune_system_limits
     install_base_tools
+    optimize_hardware_interrupts
+    optimize_sysctl
+    tune_system_limits
     sync_time
+    print_optimization_summary
+
+    # HW_MEM_GB / HW_BANDWIDTH / HW_DUAL_STACK / HW_DISK_TYPE
+    # 在旧版 system.sh 里 collect_hardware_info 不一定填充，做兜底
+    local mem_mb
+    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    HW_MEM_GB=${HW_MEM_GB:-$(awk -v m="$mem_mb" 'BEGIN{printf "%.1f", m/1024}')}
+    HW_BANDWIDTH=${HW_BANDWIDTH:-unknown}
+    HW_DUAL_STACK=${HW_DUAL_STACK:-unknown}
+    HW_DISK_TYPE=${HW_DISK_TYPE:-unknown}
+
+    # BBR_VERSION：从实际内核参数读取
+    BBR_VERSION=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "bbr")
 
     save_state "OS_ID"        "$OS_ID"
     save_state "OS_NAME"      "$OS_NAME"
     save_state "PKG_MANAGER"  "$PKG_MANAGER"
-    save_state "BBR_VERSION"  "${BBR_VERSION:-bbr}"
-    save_state "HW_CPU_CORES" "$HW_CPU_CORES"
-    save_state "HW_MEM_GB"    "$HW_MEM_GB"
-    save_state "HW_BANDWIDTH" "$HW_BANDWIDTH"
-    save_state "HW_DUAL_STACK" "$HW_DUAL_STACK"
-    save_state "HW_DISK_TYPE" "$HW_DISK_TYPE"
+    save_state "BBR_VERSION"  "${BBR_VERSION}"
+    save_state "HW_CPU_CORES" "${HW_CPU_CORES:-$(nproc)}"
+    save_state "HW_MEM_GB"    "${HW_MEM_GB}"
+    save_state "HW_BANDWIDTH" "${HW_BANDWIDTH}"
+    save_state "HW_DUAL_STACK" "${HW_DUAL_STACK}"
+    save_state "HW_DISK_TYPE" "${HW_DISK_TYPE}"
     save_state "XRAY_PADDING" "${XRAY_PADDING:-128-2048}"
     save_state "INST_SYSTEM"  "1"
 
@@ -863,21 +878,32 @@ run_full_install_flow() {
     upgrade_kernel
     collect_hardware_info
     load_kernel_modules
-    tune_system_limits
     install_base_tools
+    optimize_hardware_interrupts
+    optimize_sysctl
+    tune_system_limits
     sync_time
+    print_optimization_summary
 
-    save_state "OS_ID"        "$OS_ID"
-    save_state "OS_NAME"      "$OS_NAME"
-    save_state "PKG_MANAGER"  "$PKG_MANAGER"
-    save_state "BBR_VERSION"  "${BBR_VERSION:-bbr}"
-    save_state "HW_CPU_CORES" "$HW_CPU_CORES"
-    save_state "HW_MEM_GB"    "$HW_MEM_GB"
-    save_state "HW_BANDWIDTH" "$HW_BANDWIDTH"
-    save_state "HW_DUAL_STACK" "$HW_DUAL_STACK"
-    save_state "HW_DISK_TYPE" "$HW_DISK_TYPE"
-    save_state "XRAY_PADDING" "${XRAY_PADDING:-128-2048}"
-    save_state "INST_SYSTEM"  "1"
+    local mem_mb
+    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
+    HW_MEM_GB=${HW_MEM_GB:-$(awk -v m="$mem_mb" 'BEGIN{printf "%.1f", m/1024}')}
+    HW_BANDWIDTH=${HW_BANDWIDTH:-unknown}
+    HW_DUAL_STACK=${HW_DUAL_STACK:-unknown}
+    HW_DISK_TYPE=${HW_DISK_TYPE:-unknown}
+    BBR_VERSION=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "bbr")
+
+    save_state "OS_ID"         "$OS_ID"
+    save_state "OS_NAME"       "$OS_NAME"
+    save_state "PKG_MANAGER"   "$PKG_MANAGER"
+    save_state "BBR_VERSION"   "${BBR_VERSION}"
+    save_state "HW_CPU_CORES"  "${HW_CPU_CORES:-$(nproc)}"
+    save_state "HW_MEM_GB"     "${HW_MEM_GB}"
+    save_state "HW_BANDWIDTH"  "${HW_BANDWIDTH}"
+    save_state "HW_DUAL_STACK" "${HW_DUAL_STACK}"
+    save_state "HW_DISK_TYPE"  "${HW_DISK_TYPE}"
+    save_state "XRAY_PADDING"  "${XRAY_PADDING:-128-2048}"
+    save_state "INST_SYSTEM"   "1"
 
     load_module unbound
     restore_domain_arrays
