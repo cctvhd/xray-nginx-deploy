@@ -10,6 +10,10 @@ BASE_URL="https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/main"
 MODULES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/modules"
 STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
+LOCAL_MODULES_DIR="${STATE_DIR}/modules"   # 服务器本地模块缓存目录
+
+# 所有模块名称列表（同步时使用）
+ALL_MODULES=(system unbound nginx cert xray singbox warp client uninstall)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -61,13 +65,75 @@ save_state() {
     chmod 600 "$STATE_FILE"
 
     escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
-    # 先删除所有该 key 的行（防止重复行），再追加一行
     sed -i "/^${key}=/d" "$STATE_FILE" 2>/dev/null || true
     echo "${key}='${escaped}'" >> "$STATE_FILE"
 }
 
 get_step() {
     get_state "$1" "0"
+}
+
+# ── 模块加载：本地缓存 → 脚本同级目录 → 远程下载并缓存 ─────
+load_module() {
+    local module="$1"
+    local cached_path="${LOCAL_MODULES_DIR}/${module}.sh"
+    local local_path="${MODULES_DIR}/${module}.sh"
+    local remote_url="${BASE_URL}/modules/${module}.sh"
+
+    if [[ -f "$cached_path" ]]; then
+        # 优先读本地缓存（/etc/xray-deploy/modules/）
+        # shellcheck source=/dev/null
+        source "$cached_path"
+    elif [[ -f "$local_path" ]]; then
+        # 次选脚本同级 modules/ 目录（开发调试用）
+        # shellcheck source=/dev/null
+        source "$local_path"
+    else
+        # 从远程下载并缓存到本地，避免下次重复下载
+        log_info "下载模块 ${module}.sh ..."
+        mkdir -p "$LOCAL_MODULES_DIR"
+        chmod 700 "$LOCAL_MODULES_DIR"
+        if curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
+            chmod 600 "$cached_path"
+            log_info "模块 ${module}.sh 已缓存至 ${cached_path}"
+            # shellcheck source=/dev/null
+            source "$cached_path"
+        else
+            log_warn "下载失败，尝试直接执行远程模块..."
+            # shellcheck source=/dev/null
+            source <(curl -fsSL "$remote_url")
+        fi
+    fi
+}
+
+# ── 同步/更新所有模块到本地缓存 ─────────────────────────────
+sync_modules() {
+    log_step "同步模块到本地缓存 (${LOCAL_MODULES_DIR})..."
+    mkdir -p "$LOCAL_MODULES_DIR"
+    chmod 700 "$LOCAL_MODULES_DIR"
+
+    local ok=0 fail=0
+    for module in "${ALL_MODULES[@]}"; do
+        local cached_path="${LOCAL_MODULES_DIR}/${module}.sh"
+        local remote_url="${BASE_URL}/modules/${module}.sh"
+        echo -n "  ${module}.sh ... "
+        if curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
+            chmod 600 "$cached_path"
+            echo -e "${GREEN}OK${NC}"
+            (( ok++ )) || true
+        else
+            echo -e "${RED}失败${NC}"
+            (( fail++ )) || true
+        fi
+    done
+
+    echo ""
+    log_info "同步完成：成功 ${ok} 个，失败 ${fail} 个"
+    if [[ $fail -gt 0 ]]; then
+        log_warn "失败的模块将在使用时实时从远程加载"
+    fi
+    log_info "本地缓存目录: ${LOCAL_MODULES_DIR}"
+    log_info "如需强制更新，再次选择 s 即可覆盖所有缓存"
 }
 
 # ── 根据实际服务状态自动补全 state ──────────────────────────
@@ -82,28 +148,24 @@ _sync_inst_state() {
     systemctl is-active --quiet sing-box 2>/dev/null && [[ "$(get_step CONF_SINGBOX)" != "1" ]] && save_state "CONF_SINGBOX" "1" || true
     [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]] && \
         [[ "$(get_step CONF_WARP)" != "1" ]] && save_state "CONF_WARP" "1" || true
-
-    # ── 自动同步 cert 状态 ──────────────────────────────────
-    # 检查 certbot (Let's Encrypt) 证书是否存在
     _sync_cert_state
 }
 
 # ── 从实际证书文件 + domain_map.conf 同步 cert 状态 ─────────
+# 注意：do_inst_cert 执行完后会直接调用 save_state "INST_CERT" "1"
+# 本函数只用于重新运行脚本时的自动恢复，不依赖此函数来即时更新状态
 _sync_cert_state() {
-    # 已经是 1 就不需要重复同步
     [[ "$(get_step INST_CERT)" == "1" ]] && return 0
 
     local CF_DOMAIN_MAP="/etc/cloudflare/domain_map.conf"
     [[ -f "$CF_DOMAIN_MAP" ]] || return 0
 
-    # 从 domain_map.conf 读取域名
     local xhttp grpc reality anytls
     xhttp=$(   grep "^XHTTP_DOMAIN="   "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
     grpc=$(    grep "^GRPC_DOMAIN="    "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
     reality=$( grep "^REALITY_DOMAIN=" "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
     anytls=$(  grep "^ANYTLS_DOMAIN="  "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
 
-    # 检查是否有至少一个域名的 Let's Encrypt 证书存在
     local cert_ok=false
     for d in "$xhttp" "$grpc" "$reality" "$anytls"; do
         [[ -z "$d" ]] && continue
@@ -117,13 +179,11 @@ _sync_cert_state() {
 
     $cert_ok || return 0
 
-    # 证书确实存在，同步域名变量到 config.env
     [[ -n "$xhttp"   ]] && save_state "XHTTP_DOMAIN"   "$xhttp"
     [[ -n "$grpc"    ]] && save_state "GRPC_DOMAIN"     "$grpc"
     [[ -n "$reality" ]] && save_state "REALITY_DOMAIN"  "$reality"
     [[ -n "$anytls"  ]] && save_state "ANYTLS_DOMAIN"   "$anytls"
 
-    # 重建 ALL/CDN/DIRECT_DOMAINS 字符串（仅当 config.env 里为空时）
     local cur_all
     cur_all=$(get_state "ALL_DOMAINS")
     if [[ -z "$cur_all" ]]; then
@@ -140,7 +200,6 @@ _sync_cert_state() {
     save_state "INST_CERT" "1"
     log_info "已自动同步证书状态（检测到有效的 Let's Encrypt 证书）"
 
-    # 同步到当前 shell 变量，让 show_status 域名栏立即生效
     [[ -n "$xhttp"   ]] && XHTTP_DOMAIN="$xhttp"
     [[ -n "$grpc"    ]] && GRPC_DOMAIN="$grpc"
     [[ -n "$reality" ]] && REALITY_DOMAIN="$reality"
@@ -230,7 +289,6 @@ ENV
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XRAY_PADDING=$(get_state "XRAY_PADDING")
 
-    # WARP / wgcf 凭证（供 xray.sh / singbox.sh 的 generate_*_config 直接使用）
     WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
     WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
     WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
@@ -238,22 +296,7 @@ ENV
     WGCF_ENDPOINT_HOST=$(get_state "WGCF_ENDPOINT_HOST")
     WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT")
 
-    # 根据实际服务状态自动补全 state（解决手动配置后状态栏不正常问题）
     _sync_inst_state
-}
-
-load_module() {
-    local module="$1"
-    local local_path="${MODULES_DIR}/${module}.sh"
-    local remote_url="${BASE_URL}/modules/${module}.sh"
-
-    if [[ -f "$local_path" ]]; then
-        # shellcheck source=/dev/null
-        source "$local_path"
-    else
-        # shellcheck source=/dev/null
-        source <(curl -fsSL "$remote_url")
-    fi
 }
 
 load_os_info() {
@@ -321,7 +364,6 @@ show_status() {
     local s_system s_unbound s_nginx s_cert s_xray s_singbox s_warp
     local c_nginx c_xray c_singbox c_warp
 
-    # 安装状态：state=1 OR 实际检测到，取其一即为 OK
     { [[ "$(get_step INST_SYSTEM)"  == "1" ]] || \
       sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q 'bbr'; } \
       && s_system="OK"  || s_system="--"
@@ -334,7 +376,7 @@ show_status() {
       command -v nginx &>/dev/null; } \
       && s_nginx="OK"   || s_nginx="--"
 
-    # ── Cert：检查 Let's Encrypt 实际证书目录 ────────────────
+    # ── Cert：state=1 OR 实际有证书文件，均视为 OK ───────────
     { [[ "$(get_step INST_CERT)" == "1" ]] || \
       find /etc/letsencrypt/live -name 'fullchain.pem' -quit 2>/dev/null | grep -q .; } \
       && s_cert="OK" || s_cert="--"
@@ -351,7 +393,6 @@ show_status() {
       command -v wgcf &>/dev/null; } \
       && s_warp="OK"    || s_warp="--"
 
-    # 配置状态：state=1 OR 服务正在运行，取其一即为 OK
     { [[ "$(get_step CONF_NGINX)"   == "1" ]] || \
       systemctl is-active --quiet nginx 2>/dev/null; } \
       && c_nginx="OK"   || c_nginx="--"
@@ -367,6 +408,13 @@ show_status() {
     { [[ "$(get_step CONF_WARP)"    == "1" ]] || \
       [[ -f /etc/wgcf/wgcf-profile.conf ]]; } \
       && c_warp="OK"    || c_warp="--"
+
+    # 本地模块缓存数量
+    local cached_count=0
+    for m in "${ALL_MODULES[@]}"; do
+        [[ -f "${LOCAL_MODULES_DIR}/${m}.sh" ]] && (( cached_count++ )) || true
+    done
+    local total_modules=${#ALL_MODULES[@]}
 
     echo ""
     echo -e "${BLUE}================ 当前状态 ================${NC}"
@@ -399,6 +447,9 @@ show_status() {
         echo "    CPU: ${HW_CPU_CORES} | MEM: ${HW_MEM_GB}GB | BW: ${HW_BANDWIDTH} | STACK: ${HW_DUAL_STACK} | DISK: ${HW_DISK_TYPE}"
     fi
 
+    echo ""
+    echo "  [模块缓存]  ${cached_count}/${total_modules} 个已缓存到本地（选 s 可同步更新）"
+
     echo -e "${BLUE}==========================================${NC}"
     echo ""
 }
@@ -429,6 +480,7 @@ main_menu() {
     echo "  === 其他 ==="
     echo "  a. 生成客户端链接"
     echo "  b. 查看当前状态"
+    echo "  s. 同步/更新模块到本地缓存"
     echo "  w. 配置 WARP WireGuard 凭证（步骤 8/9 的前置依赖）"
     echo "  u. 卸载 / 清理模块"
     echo "  r. 全部重装（先清理再执行 1-9）"
@@ -456,6 +508,7 @@ main_menu() {
             read -rp "按回车返回主菜单..." _
             main_menu
             ;;
+        s|S) do_sync_modules ;;
         w|W) do_warp ;;
         u|U) do_uninstall_menu ;;
         r|R) do_reinstall_all ;;
@@ -469,7 +522,21 @@ main_menu() {
     esac
 }
 
-# ── WGCF 凭证保障：若变量为空则先从 state 恢复，仍空则触发 run_warp ──────
+# ── 同步模块入口 ─────────────────────────────────────────────
+do_sync_modules() {
+    echo ""
+    log_warn "将从 GitHub 下载所有模块覆盖本地缓存，需要网络连接。"
+    read -rp "确认继续？[y/N]: " confirm
+    if [[ "${confirm,,}" != "y" ]]; then
+        main_menu
+        return
+    fi
+    echo ""
+    sync_modules
+    done_return
+}
+
+# ── WGCF 凭证保障 ────────────────────────────────────────────
 _ensure_wgcf() {
     [[ -z "${WGCF_PRIVATE_KEY:-}"   ]] && WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
     [[ -z "${WGCF_PEER_PUBKEY:-}"   ]] && WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
@@ -483,9 +550,6 @@ _ensure_wgcf() {
         load_os_info
         load_module warp
         run_warp
-        # ── BUG FIX：run_warp 执行后变量已在 shell 中，立即持久化到 config.env ──
-        # 原代码此处用 get_state 读取，但 warp.sh 注释说"不自行写 state_file"，
-        # 导致 config.env 里始终为空，下次调用仍触发 run_warp，形成死循环。
         save_state "WGCF_PRIVATE_KEY"   "${WGCF_PRIVATE_KEY:-}"
         save_state "WGCF_PEER_PUBKEY"   "${WGCF_PEER_PUBKEY:-}"
         save_state "WGCF_ADDRESS"       "${WGCF_ADDRESS:-}"
@@ -518,8 +582,6 @@ do_inst_system() {
     sync_time
     print_optimization_summary
 
-    # HW_MEM_GB / HW_BANDWIDTH / HW_DUAL_STACK / HW_DISK_TYPE
-    # 在旧版 system.sh 里 collect_hardware_info 不一定填充，做兜底
     local mem_mb
     mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
     HW_MEM_GB=${HW_MEM_GB:-$(awk -v m="$mem_mb" 'BEGIN{printf "%.1f", m/1024}')}
@@ -527,20 +589,19 @@ do_inst_system() {
     HW_DUAL_STACK=${HW_DUAL_STACK:-unknown}
     HW_DISK_TYPE=${HW_DISK_TYPE:-unknown}
 
-    # BBR_VERSION：从实际内核参数读取
     BBR_VERSION=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "bbr")
 
-    save_state "OS_ID"        "$OS_ID"
-    save_state "OS_NAME"      "$OS_NAME"
-    save_state "PKG_MANAGER"  "$PKG_MANAGER"
-    save_state "BBR_VERSION"  "${BBR_VERSION}"
-    save_state "HW_CPU_CORES" "${HW_CPU_CORES:-$(nproc)}"
-    save_state "HW_MEM_GB"    "${HW_MEM_GB}"
-    save_state "HW_BANDWIDTH" "${HW_BANDWIDTH}"
+    save_state "OS_ID"         "$OS_ID"
+    save_state "OS_NAME"       "$OS_NAME"
+    save_state "PKG_MANAGER"   "$PKG_MANAGER"
+    save_state "BBR_VERSION"   "${BBR_VERSION}"
+    save_state "HW_CPU_CORES"  "${HW_CPU_CORES:-$(nproc)}"
+    save_state "HW_MEM_GB"     "${HW_MEM_GB}"
+    save_state "HW_BANDWIDTH"  "${HW_BANDWIDTH}"
     save_state "HW_DUAL_STACK" "${HW_DUAL_STACK}"
-    save_state "HW_DISK_TYPE" "${HW_DISK_TYPE}"
-    save_state "XRAY_PADDING" "${XRAY_PADDING:-128-2048}"
-    save_state "INST_SYSTEM"  "1"
+    save_state "HW_DISK_TYPE"  "${HW_DISK_TYPE}"
+    save_state "XRAY_PADDING"  "${XRAY_PADDING:-128-2048}"
+    save_state "INST_SYSTEM"   "1"
 
     done_return
 }
@@ -591,6 +652,10 @@ do_inst_cert() {
     load_module cert
     run_cert
 
+    # ── BUG FIX：cert 申请完直接写入 state 并同步 shell 变量 ──
+    # 原逻辑依赖 _sync_cert_state 在下次启动时检测文件来更新状态，
+    # 导致当次运行返回主菜单后 Cert 仍显示 --，重启后才变 OK。
+    # 现在在 run_cert 执行完后立即写入所有状态，无需等下次启动。
     save_state "XHTTP_DOMAIN"   "${XHTTP_DOMAIN:-}"
     save_state "GRPC_DOMAIN"    "${GRPC_DOMAIN:-}"
     save_state "REALITY_DOMAIN" "${REALITY_DOMAIN:-}"
@@ -600,6 +665,14 @@ do_inst_cert() {
     save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
     save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
     save_state "INST_CERT"      "1"
+
+    # 同步到当前 shell 变量，让 show_status 域名栏立即生效
+    # （init_state 在 done_return 里会重新从 config.env 读，
+    #   但 show_status 在此之前会用当前 shell 变量，所以需要手动同步）
+    XHTTP_DOMAIN="${XHTTP_DOMAIN:-}"
+    GRPC_DOMAIN="${GRPC_DOMAIN:-}"
+    REALITY_DOMAIN="${REALITY_DOMAIN:-}"
+    ANYTLS_DOMAIN="${ANYTLS_DOMAIN:-}"
 
     if [[ "$(get_step INST_UNBOUND)" == "1" ]] || command -v unbound &>/dev/null; then
         refresh_unbound_after_cert
@@ -666,7 +739,6 @@ do_conf_nginx() {
         save_state "INST_NGINX" "1"
     fi
 
-    # ── Cert 检查：state=1 OR 实际有证书文件，均视为已完成 ──
     local cert_ready=false
     [[ "$(get_step INST_CERT)" == "1" ]] && cert_ready=true
     find /etc/letsencrypt/live -name 'fullchain.pem' -quit 2>/dev/null | grep -q . && cert_ready=true
