@@ -38,10 +38,11 @@ run_system() {
     log_info "========== 系统初始化完成 =========="
 }
 
-# ── 硬件信息收集 ─────────────────────────────────────────────
+# ── 硬件信息收集（自动检测 + 用户确认/覆盖）────────────────
 collect_hardware_info() {
     log_step "收集硬件信息..."
 
+    # ── 自动检测 CPU 核心数 ──────────────────────────────────
     if [[ -z "${HW_CPU_CORES:-}" ]]; then
         HW_CPU_CORES=$(nproc 2>/dev/null \
             || grep -c '^processor' /proc/cpuinfo 2>/dev/null \
@@ -49,8 +50,149 @@ collect_hardware_info() {
     fi
     [[ "$HW_CPU_CORES" -gt 0 ]] 2>/dev/null || HW_CPU_CORES=4
 
-    log_info "CPU 核心数: ${HW_CPU_CORES}"
-    log_info "物理内存: $(( $(grep -E '^MemTotal:' /proc/meminfo | awk '{print $2}') / 1024 ))MB"
+    # ── 自动检测内存 ─────────────────────────────────────────
+    local mem_kb mem_mb mem_gb_auto
+    mem_kb=$(grep -E '^MemTotal:' /proc/meminfo | awk '{print $2}')
+    mem_mb=$(( mem_kb / 1024 ))
+    mem_gb_auto=$(awk -v m="$mem_mb" 'BEGIN{printf "%.1f", m/1024}')
+    if [[ -z "${HW_MEM_GB:-}" ]]; then
+        HW_MEM_GB="$mem_gb_auto"
+    fi
+
+    # ── 自动检测磁盘类型 ─────────────────────────────────────
+    local disk_auto="unknown"
+    local root_dev
+    root_dev=$(lsblk -no PKNAME "$(findmnt -n -o SOURCE /)" 2>/dev/null | head -1)
+    if [[ -n "$root_dev" ]]; then
+        local rotational
+        rotational=$(cat "/sys/block/${root_dev}/queue/rotational" 2>/dev/null || echo "")
+        if [[ "$rotational" == "0" ]]; then
+            disk_auto="ssd"
+        elif [[ "$rotational" == "1" ]]; then
+            disk_auto="hdd"
+        fi
+    fi
+    if [[ -z "${HW_DISK_TYPE:-}" || "${HW_DISK_TYPE}" == "unknown" ]]; then
+        HW_DISK_TYPE="$disk_auto"
+    fi
+
+    # ── 自动检测双栈 ─────────────────────────────────────────
+    local dual_auto="ipv4-only"
+    if ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+        dual_auto="dual-stack"
+    fi
+    if [[ -z "${HW_DUAL_STACK:-}" || "${HW_DUAL_STACK}" == "unknown" ]]; then
+        HW_DUAL_STACK="$dual_auto"
+    fi
+
+    # ── 自动检测带宽（测速，可跳过）────────────────────────
+    if [[ -z "${HW_BANDWIDTH:-}" || "${HW_BANDWIDTH}" == "unknown" ]]; then
+        HW_BANDWIDTH="unknown"
+    fi
+
+    # ── 打印自动检测结果 ─────────────────────────────────────
+    echo ""
+    log_info "═══ 硬件自动检测结果 ═══════════════════"
+    log_info "  CPU 核心数 : ${HW_CPU_CORES}"
+    log_info "  物理内存   : ${mem_mb}MB (${HW_MEM_GB}GB)"
+    log_info "  磁盘类型   : ${HW_DISK_TYPE}"
+    log_info "  网络栈     : ${HW_DUAL_STACK}"
+    log_info "  带宽       : ${HW_BANDWIDTH}"
+    log_info "════════════════════════════════════════"
+    echo ""
+
+    # ── 询问是否自定义 ───────────────────────────────────────
+    local customize
+    read -rp "是否自定义硬件参数？[y/N（直接回车使用自动检测值）]: " customize
+    if [[ "${customize,,}" != "y" ]]; then
+        log_info "使用自动检测值，继续..."
+        return 0
+    fi
+
+    # ── 自定义 CPU 核心数 ────────────────────────────────────
+    echo ""
+    local input_cores
+    read -rp "CPU 核心数 [当前: ${HW_CPU_CORES}，直接回车保持]: " input_cores
+    if [[ -n "$input_cores" && "$input_cores" =~ ^[0-9]+$ && "$input_cores" -gt 0 ]]; then
+        HW_CPU_CORES="$input_cores"
+        log_info "CPU 核心数已设为: ${HW_CPU_CORES}"
+    fi
+
+    # ── 自定义内存 ───────────────────────────────────────────
+    local input_mem
+    read -rp "物理内存 GB（小数点格式，如 3.8）[当前: ${HW_MEM_GB}，直接回车保持]: " input_mem
+    if [[ -n "$input_mem" && "$input_mem" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        HW_MEM_GB="$input_mem"
+        log_info "物理内存已设为: ${HW_MEM_GB}GB"
+    fi
+
+    # ── 自定义带宽 ───────────────────────────────────────────
+    echo ""
+    echo "带宽选项："
+    echo "  1. 100Mbps"
+    echo "  2. 500Mbps"
+    echo "  3. 1Gbps"
+    echo "  4. 10Gbps"
+    echo "  5. 自定义"
+    echo "  6. 保持当前 (${HW_BANDWIDTH})"
+    local bw_choice
+    read -rp "请选择 [1-6，默认6]: " bw_choice
+    case "${bw_choice:-6}" in
+        1) HW_BANDWIDTH="100Mbps" ;;
+        2) HW_BANDWIDTH="500Mbps" ;;
+        3) HW_BANDWIDTH="1Gbps" ;;
+        4) HW_BANDWIDTH="10Gbps" ;;
+        5)
+            local input_bw
+            read -rp "输入带宽（如 200Mbps、2Gbps）: " input_bw
+            [[ -n "$input_bw" ]] && HW_BANDWIDTH="$input_bw"
+            ;;
+        6) : ;;
+    esac
+    log_info "带宽已设为: ${HW_BANDWIDTH}"
+
+    # ── 自定义网络栈 ─────────────────────────────────────────
+    echo ""
+    echo "网络栈选项："
+    echo "  1. ipv4-only"
+    echo "  2. dual-stack（IPv4 + IPv6）"
+    echo "  3. 保持当前 (${HW_DUAL_STACK})"
+    local stack_choice
+    read -rp "请选择 [1-3，默认3]: " stack_choice
+    case "${stack_choice:-3}" in
+        1) HW_DUAL_STACK="ipv4-only" ;;
+        2) HW_DUAL_STACK="dual-stack" ;;
+        3) : ;;
+    esac
+    log_info "网络栈已设为: ${HW_DUAL_STACK}"
+
+    # ── 自定义磁盘类型 ───────────────────────────────────────
+    echo ""
+    echo "磁盘类型选项："
+    echo "  1. ssd"
+    echo "  2. hdd"
+    echo "  3. nvme"
+    echo "  4. 保持当前 (${HW_DISK_TYPE})"
+    local disk_choice
+    read -rp "请选择 [1-4，默认4]: " disk_choice
+    case "${disk_choice:-4}" in
+        1) HW_DISK_TYPE="ssd" ;;
+        2) HW_DISK_TYPE="hdd" ;;
+        3) HW_DISK_TYPE="nvme" ;;
+        4) : ;;
+    esac
+    log_info "磁盘类型已设为: ${HW_DISK_TYPE}"
+
+    # ── 确认最终值 ───────────────────────────────────────────
+    echo ""
+    log_info "═══ 最终硬件参数 ════════════════════════"
+    log_info "  CPU 核心数 : ${HW_CPU_CORES}"
+    log_info "  物理内存   : ${HW_MEM_GB}GB"
+    log_info "  磁盘类型   : ${HW_DISK_TYPE}"
+    log_info "  网络栈     : ${HW_DUAL_STACK}"
+    log_info "  带宽       : ${HW_BANDWIDTH}"
+    log_info "════════════════════════════════════════"
+    echo ""
 }
 
 # ── 检测虚拟化环境（仅用于日志） ─────────────────────────────
@@ -351,7 +493,10 @@ print_optimization_summary() {
     log_info "========== 系统优化完成摘要 =========="
     log_info "运行环境   : ${VIRT_TYPE:-unknown}"
     log_info "CPU 核心数 : ${HW_CPU_CORES}"
-    log_info "物理内存   : $(( total_mem_kb / 1024 ))MB"
+    log_info "物理内存   : $(( total_mem_kb / 1024 ))MB (配置值: ${HW_MEM_GB}GB)"
+    log_info "磁盘类型   : ${HW_DISK_TYPE:-unknown}"
+    log_info "网络栈     : ${HW_DUAL_STACK:-unknown}"
+    log_info "带宽       : ${HW_BANDWIDTH:-unknown}"
     log_info "主网卡     : ${main_iface:-未检测}"
     log_info "队列策略   : $( \
         [[ "${NET_CHANNELS:-1}" -gt 1 ]] \
