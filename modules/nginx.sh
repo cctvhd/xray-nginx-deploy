@@ -80,6 +80,7 @@ create_nginx_dirs() {
         /var/log/nginx
         /var/www/html
         /var/cache/nginx
+        /etc/nginx/certs
     )
 
     for dir in "${dirs[@]}"; do
@@ -96,6 +97,31 @@ create_nginx_dirs() {
     chown -R www-data:www-data /var/log/nginx /var/cache/nginx 2>/dev/null || true
 
     log_info "目录结构创建完成"
+}
+
+# ── 生成 20880 陷阱端口自签证书（P3修复：让TLS握手能完成）──
+generate_trap_cert() {
+    log_step "生成 SNI 陷阱端口自签证书..."
+
+    local cert_dir="/etc/nginx/certs"
+    local key="${cert_dir}/trap.key"
+    local crt="${cert_dir}/trap.crt"
+
+    if [[ -f "$key" && -f "$crt" ]]; then
+        log_info "陷阱证书已存在，跳过生成"
+        return
+    fi
+
+    openssl req -x509 -newkey rsa:2048 -nodes \
+        -keyout "$key" \
+        -out    "$crt" \
+        -days   3650 \
+        -subj   "/CN=localhost" \
+        -quiet 2>/dev/null
+
+    chmod 600 "$key"
+    chmod 644 "$crt"
+    log_info "陷阱自签证书已生成: ${cert_dir}/trap.{key,crt}"
 }
 
 # ── 生成伪装站页面 ───────────────────────────────────────────
@@ -206,10 +232,6 @@ geo \$remote_addr \$from_cf {
 }
 
 # ── 健壮型真实 IP 映射 ────────────────────────────────────────────────
-# 三路逻辑：
-#   CF 节点 + 有 CF-Connecting-IP Header → 访客真实 IP
-#   CF 节点 + 无 CF-Connecting-IP Header → CF 物理 IP（异常情况兜底）
-#   非 CF 节点（直连）                   → 物理连接 IP
 map "\$from_cf:\$http_cf_connecting_ip" \$final_real_ip {
     "1:"       \$remote_addr;
     "~^1:.+"   \$http_cf_connecting_ip;
@@ -279,22 +301,16 @@ cat > "$TMP_CF_CONF" << HEREDOC
 # 自动生成，请勿手动编辑 | 更新时间: $(date '+%Y-%m-%d %H:%M:%S')
 # ======================================================================
 
-# ── 信任本地环回（stream → nginx 的本地转发必须信任）────────────────
 set_real_ip_from 127.0.0.1;
 set_real_ip_from ::1;
 
-# ── 信任 Cloudflare 官方节点（IPv4）──────────────────────────────────
 $(echo "$CF_IPV4" | sed 's/^/set_real_ip_from /;s/$/;/')
 
-# ── 信任 Cloudflare 官方节点（IPv6）──────────────────────────────────
 $(echo "$CF_IPV6" | sed 's/^/set_real_ip_from /;s/$/;/')
 
-# ── 核心：从 Stream 层传来的 PROXY Protocol 中提取物理连接 IP ─────────
-# 注意：不能用 CF-Connecting-IP，该 Header 可被任意伪造
 real_ip_header    proxy_protocol;
 real_ip_recursive on;
 
-# ── 判断物理 IP 是否属于 CF 官方节点 ─────────────────────────────────
 geo \$remote_addr \$from_cf {
     default 0;
     127.0.0.1 0;
@@ -303,7 +319,6 @@ $(echo "$CF_IPV4" | sed 's/^/    /;s/$/ 1;/')
 $(echo "$CF_IPV6" | sed 's/^/    /;s/$/ 1;/')
 }
 
-# ── 健壮型真实 IP 映射 ────────────────────────────────────────────────
 map "\$from_cf:\$http_cf_connecting_ip" \$final_real_ip {
     "1:"       \$remote_addr;
     "~^1:.+"   \$http_cf_connecting_ip;
@@ -336,7 +351,7 @@ else
         log "${RED}无可用备份，请手动检查 $CF_CONF${NC}"
     fi
     rm -f "$TMP_CF_CONF"
-    error_exit "新配置 nginx -t 未通过，已回滚，现有配置保持不变"
+    error_exit "新配置 nginx -t 未通过，已回滚"
 fi
 
 find "$BACKUP_DIR" -name "real_ip.conf.*" -type f | sort -r | tail -n +11 | xargs -r rm -f || true
@@ -344,7 +359,7 @@ log "${GREEN}Cloudflare IP 更新完成${NC}"
 SCRIPT_EOF
 
     chmod +x /usr/local/bin/update_cf_ip.sh
-    log_info "Cloudflare IP 更新脚本已安装: /usr/local/bin/update_cf_ip.sh"
+    log_info "Cloudflare IP 更新脚本已安装"
 }
 
 # ── 配置 Cloudflare IP 自动更新任务 ─────────────────────────
@@ -383,49 +398,28 @@ generate_ssl_conf() {
 # /etc/nginx/ssl/common.conf
 # ===================================================
 
-# ========= TLS 版本 =========
 ssl_protocols TLSv1.3 TLSv1.2;
-
-# ========= TLS 1.3 密码套件 =========
 ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256;
-
-# ========= TLS 1.2 密码套件 =========
 ssl_ciphers HIGH:!aNULL:!MD5:!3DES:!RC4:!DES:!EXPORT:!LOW:!PSK;
-
-# ECDH 曲线
 ssl_ecdh_curve X25519:prime256v1;
-
-# 会话缓存
 ssl_session_cache shared:SSL:50m;
 ssl_session_timeout 1d;
 ssl_session_tickets off;
-
-# 禁止 0-RTT
 ssl_early_data off;
-
-# TLS 缓冲优化
 ssl_buffer_size 4k;
-
-# ========= 取消 OCSP（LE 已停服务）=========
 ssl_stapling off;
 ssl_stapling_verify off;
 
-# DNS 解析器
 resolver 127.0.0.1:53 valid=300s ipv6=on;
 resolver_timeout 5s;
 
-# ========= 安全响应头 =========
 add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
 add_header X-Content-Type-Options nosniff always;
 add_header X-Frame-Options DENY always;
 add_header X-XSS-Protection "1; mode=block" always;
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
-
-# CSP - 静态页面收紧版
 add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
-
-# 跨域（XHTTP CDN 需要）
 add_header Access-Control-Allow-Origin "*" always;
 add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
 add_header Access-Control-Allow-Headers "*" always;
@@ -439,13 +433,11 @@ select_nginx_profile() {
     local cpu_cores="$1"
     local mem_mb="$2"
 
-    # 小鸡：1C 或 < 2GB，优先保守稳定
-    # 中配：2C/2-8GB，兼顾连接容量和资源占用
-    # 大机：> 2C 且 >= 8GB，适当拉高长连接与文件缓存
     if [[ $cpu_cores -le 1 || $mem_mb -lt 2048 ]]; then
         NGINX_PROFILE="small"
         NGINX_WORKER_CONNECTIONS=4096
-        NGINX_KEEPALIVE_TIMEOUT=1800
+        # P5修复：全局 keepalive 改小，在 location 内单独覆盖长连接
+        NGINX_KEEPALIVE_TIMEOUT=65
         NGINX_KEEPALIVE_REQUESTS=5000
         NGINX_OPEN_FILE_CACHE_MAX=20000
         NGINX_OPEN_FILE_CACHE_INACTIVE=120
@@ -454,7 +446,7 @@ select_nginx_profile() {
     elif [[ $cpu_cores -le 2 || $mem_mb -lt 8192 ]]; then
         NGINX_PROFILE="medium"
         NGINX_WORKER_CONNECTIONS=8192
-        NGINX_KEEPALIVE_TIMEOUT=3600
+        NGINX_KEEPALIVE_TIMEOUT=65
         NGINX_KEEPALIVE_REQUESTS=8000
         NGINX_OPEN_FILE_CACHE_MAX=100000
         NGINX_OPEN_FILE_CACHE_INACTIVE=240
@@ -463,7 +455,7 @@ select_nginx_profile() {
     else
         NGINX_PROFILE="large"
         NGINX_WORKER_CONNECTIONS=16384
-        NGINX_KEEPALIVE_TIMEOUT=7200
+        NGINX_KEEPALIVE_TIMEOUT=65
         NGINX_KEEPALIVE_REQUESTS=10000
         NGINX_OPEN_FILE_CACHE_MAX=200000
         NGINX_OPEN_FILE_CACHE_INACTIVE=300
@@ -472,7 +464,7 @@ select_nginx_profile() {
     fi
 }
 
-# ── 获取用于动态分档的有效内存 ───────────────────────────────
+# ── 获取有效内存 ─────────────────────────────────────────────
 get_effective_memory_mb() {
     local mem_mb
 
@@ -483,8 +475,6 @@ get_effective_memory_mb() {
 
     mem_mb=$(awk '/MemTotal/{print int($2/1024 + 0.5)}' /proc/meminfo)
 
-    # 云主机常见情况：标称 2G / 4G / 8G，系统可用值通常会略小。
-    # 这里按“接近标准档位则向上归档”的方式处理，避免 1.8G 被当成 1G 档。
     if (( mem_mb >= 1792 && mem_mb < 2048 )); then
         echo 2048
     elif (( mem_mb >= 3584 && mem_mb < 4096 )); then
@@ -506,8 +496,7 @@ generate_nginx_conf() {
     local worker_processes="auto"
     [[ $cpu_cores -eq 1 ]] && worker_processes="1"
 
-    local mem_mb
-    local mem_gb_display
+    local mem_mb mem_gb_display
     if [[ -n "${HW_MEM_GB:-}" ]] && [[ "${HW_MEM_GB}" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
         mem_mb=$(awk -v v="${HW_MEM_GB}" 'BEGIN { print int(v * 1024 + 0.5) }')
         mem_gb_display="${HW_MEM_GB}"
@@ -517,6 +506,10 @@ generate_nginx_conf() {
     fi
 
     select_nginx_profile "$cpu_cores" "$mem_mb"
+
+    # P6修复：worker_rlimit_nofile 按实际需求计算
+    # 峰值 FD ≈ worker_connections × 2 + 系统开销，32768 足够
+    local worker_rlimit_nofile=32768
 
     [[ -f /etc/nginx/nginx.conf ]] && \
         cp /etc/nginx/nginx.conf \
@@ -531,7 +524,8 @@ generate_nginx_conf() {
 # ============================================================
 user nginx;
 worker_processes ${worker_processes};
-worker_rlimit_nofile 200000;
+# P6修复：原 200000 严重虚高，按峰值FD实际需求设置
+worker_rlimit_nofile ${worker_rlimit_nofile};
 worker_cpu_affinity auto;
 error_log /var/log/nginx/error.log warn;
 pid /run/nginx.pid;
@@ -553,7 +547,9 @@ http {
                     '\$status \$body_bytes_sent "\$http_referer" '
                     '"\$http_user_agent" rt=\$request_time ut="\$upstream_response_time"';
 
+    # P8修复：403 安全事件单独保留，其余 4xx 继续过滤
     map \$status \$loggable {
+        403     1;
         ~^4     0;
         default 1;
     }
@@ -578,15 +574,17 @@ http {
     tcp_nopush  on;
     tcp_nodelay on;
 
+    # P5修复：全局 keepalive 改为 65s，xhttp/grpc 在 location 内单独覆盖
     keepalive_timeout  ${NGINX_KEEPALIVE_TIMEOUT}s;
     keepalive_requests ${NGINX_KEEPALIVE_REQUESTS};
 
     client_max_body_size        0;
     client_body_timeout         7200s;
     client_header_timeout       300s;
-    client_body_buffer_size     1m;
-    client_header_buffer_size   8k;
-    large_client_header_buffers 8 32k;
+    # P7修复：缓冲区按实际需求收缩，避免峰值内存超物理内存
+    client_body_buffer_size     128k;
+    client_header_buffer_size   4k;
+    large_client_header_buffers 4 16k;
     send_timeout                7200s;
 
     server_tokens             off;
@@ -675,42 +673,50 @@ CONF
 }
 
 # ── 生成 SNI 路由映射 ────────────────────────────────────────
+# P4修复：Reality serverNames 里的所有域名都加进 stream map 指向 9443
 generate_sni_map() {
     local had_output=0
     local sn
-    local -A seen_reality_sni=()
+    local -A seen_sni=()
 
+    # Reality 自有域名
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames）------------"
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames 全部路由到 9443）--"
         echo "        ${REALITY_DOMAIN}     127.0.0.1:9443;"
-        seen_reality_sni["${REALITY_DOMAIN}"]=1
+        seen_sni["${REALITY_DOMAIN}"]=1
         had_output=1
     fi
+
+    # Reality 所有 serverNames（包括公共域名）全部指向 9443
+    # 确保客户端用任意 serverName 连接时都能命中正确后端
     if [[ -n "${REALITY_SERVER_NAMES:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames）------------"
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality serverNames 全部路由到 9443 ---------------"
         for sn in "${REALITY_SERVER_NAMES[@]}"; do
             [[ -n "$sn" ]] || continue
-            [[ -n "${seen_reality_sni[$sn]:-}" ]] && continue
+            [[ -n "${seen_sni[$sn]:-}" ]] && continue
             echo "        ${sn}     127.0.0.1:9443;"
-            seen_reality_sni["$sn"]=1
+            seen_sni["$sn"]=1
         done
         had_output=1
     fi
+
     if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- xhttp CDN 回源 -----------------------------------"
         echo "        ${XHTTP_DOMAIN}        127.0.0.1:20443;"
         had_output=1
     fi
+
     if [[ -n "${GRPC_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- gRPC CDN 回源 ------------------------------------"
         echo "        ${GRPC_DOMAIN}         127.0.0.1:20445;"
         had_output=1
     fi
+
     if [[ -n "${ANYTLS_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
-        echo "        # -- AnyTLS -> nginx 中间层 -> sing-box --------------"
+        echo "        # -- AnyTLS -> nginx 中间层 -> sing-box ---------------"
         echo "        ${ANYTLS_DOMAIN}       127.0.0.1:18443;"
     fi
 }
@@ -742,6 +748,8 @@ CONF
 }
 
 # ── 生成 fallback.conf ───────────────────────────────────────
+# P1修复：xhttp location 路径使用 ${XHTTP_PATH} 变量（与 xray 保持一致）
+# P2修复：listen 加 proxy_protocol，从 PROXY header 获取真实 IP
 generate_fallback_conf() {
     log_step "生成 fallback 配置..."
 
@@ -749,9 +757,13 @@ generate_fallback_conf() {
 # ============================================================
 # /etc/nginx/conf.d/fallback.conf
 # Reality Fallback 入口
+# P1修复：xhttp path 与 xray 保持一致（均使用 XHTTP_PATH 变量）
+# P2修复：加 proxy_protocol 接收 xver=2 发送的 PROXY header，
+#         从而正确获取真实 IP 而非 127.0.0.1
 # ============================================================
 server {
-    listen 127.0.0.1:10080;
+    # P2修复：加 proxy_protocol，配合 xray fallback xver=2
+    listen 127.0.0.1:10080 proxy_protocol;
     server_name   _;
     access_log    off;
     server_tokens off;
@@ -763,13 +775,16 @@ server {
                   text/xml application/xml application/xml+rss text/javascript
                   image/svg+xml;
 
+    # P1修复：路径与 xray xhttpSettings.path 保持一致
     location ${XHTTP_PATH} {
         gzip off;
         proxy_pass              http://vless_xhttp_backend;
         proxy_http_version      1.1;
         proxy_set_header        Connection "";
         proxy_set_header        Host \$host;
-        proxy_set_header        X-Forwarded-For \$final_real_ip;
+        # P2修复：proxy_protocol 启用后 \$remote_addr 即为真实 IP
+        proxy_set_header        X-Real-IP \$remote_addr;
+        proxy_set_header        X-Forwarded-For \$remote_addr;
         proxy_buffering         off;
         proxy_request_buffering off;
         proxy_cache             off;
@@ -780,6 +795,8 @@ server {
         proxy_connect_timeout   15s;
         proxy_send_timeout      7200s;
         proxy_read_timeout      7200s;
+        # P5修复：fallback 长连接单独覆盖
+        keepalive_timeout       7200s;
     }
 
     location /grpc.Service {
@@ -805,14 +822,11 @@ CONF
 }
 
 # ── 生成 servers.conf ────────────────────────────────────────
-# ── 生成 servers.conf ────────────────────────────────────────
 generate_servers_conf() {
     log_step "生成 servers.conf..."
 
-    # 每次重新生成，先清空
     > /etc/nginx/conf.d/servers.conf
 
-    # 提取根域名函数
     get_root_domain() {
         echo "$1" | awk -F. '{print $(NF-1)"."$NF}'
     }
@@ -827,6 +841,7 @@ generate_servers_conf() {
 
 # ===================================================================
 # CDN ${XHTTP_DOMAIN} — xhttp
+# P1修复：location 路径与 xray xhttpSettings.path 保持一致
 # ===================================================================
 server {
     listen 127.0.0.1:20443 ssl proxy_protocol;
@@ -854,6 +869,7 @@ server {
         rewrite ^ /_fake last;
     }
 
+    # P1修复：路径与 xray xhttpSettings.path 保持一致
     location ${XHTTP_PATH} {
         gzip       off;
         access_log off;
@@ -889,6 +905,7 @@ server {
         client_max_body_size        0;
         client_body_timeout         7200s;
         send_timeout                7200s;
+        # P5修复：长连接在 location 内单独覆盖
         keepalive_timeout           7200s;
         keepalive_requests          5000;
     }
@@ -1017,7 +1034,7 @@ server {
 CONF
     fi
 
-    # 兜底 + SNI陷阱
+    # 兜底 server 块
     cat >> /etc/nginx/conf.d/servers.conf << 'CONF'
 
 # ===================================================================
@@ -1032,24 +1049,33 @@ server {
     listen 127.0.0.1:20445 ssl default_server proxy_protocol;
     ssl_reject_handshake on;
 }
+CONF
+
+    # P3修复：20880 加自签证书完成 TLS 握手，返回伪装页而非 RST
+    cat >> /etc/nginx/conf.d/servers.conf << 'CONF'
 
 # ===================================================================
-# SNI 陷阱兜底伪装站
+# SNI 陷阱伪装站（20880）
+# P3修复：加自签证书让扫描器能完成 TLS 握手，返回正常伪装页
+#         而非直接 RST（更难被识别为代理节点）
 # ===================================================================
 server {
-    listen 127.0.0.1:20880 proxy_protocol;
-    server_name   _;
-    server_tokens off;
-    access_log    off;
-    gzip          on;
-    gzip_vary     on;
-    gzip_comp_level 2;
-    gzip_min_length 1000;
-    gzip_types    text/plain text/css application/json application/javascript
-                  text/xml application/xml application/xml+rss text/javascript
-                  image/svg+xml;
-    root          /var/www/html;
-    index         index.html;
+    listen 127.0.0.1:20880 ssl proxy_protocol;
+    ssl_certificate     /etc/nginx/certs/trap.crt;
+    ssl_certificate_key /etc/nginx/certs/trap.key;
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    server_name         _;
+    server_tokens       off;
+    access_log          off;
+    gzip                on;
+    gzip_vary           on;
+    gzip_comp_level     2;
+    gzip_min_length     1000;
+    gzip_types          text/plain text/css application/json application/javascript
+                        text/xml application/xml application/xml+rss text/javascript
+                        image/svg+xml;
+    root                /var/www/html;
+    index               index.html;
 
     location / {
         try_files $uri $uri/ /index.html;
@@ -1059,7 +1085,7 @@ server {
 }
 CONF
 
-    # HTTP 重定向（域名列表动态生成）
+    # HTTP 重定向
     local all_domain_names=""
     for domain in "${ALL_DOMAINS[@]}"; do
         all_domain_names+=" ${domain}"
@@ -1115,6 +1141,7 @@ run_nginx() {
     generate_upstreams_conf
     generate_fallback_conf
     generate_servers_conf
+    generate_trap_cert          # P3：生成陷阱端口自签证书
     generate_nginx_conf
     reload_nginx
     install_cf_ip_updater

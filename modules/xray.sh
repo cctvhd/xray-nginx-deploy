@@ -64,6 +64,13 @@ generate_xray_params() {
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     else
         XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        # ── BUG FIX：生成新路径后立即写入 config.env ──────────
+        # 原代码只赋值给 shell 变量，install.sh 在步骤8结束后才
+        # save_state，如果步骤7（nginx）在步骤8之前执行，nginx
+        # 读不到这个路径，导致两边 XHTTP_PATH 不一致。
+        # 立即保存后，无论步骤7/8的执行顺序如何，双方都能读到
+        # 同一个路径。
+        save_state "XHTTP_PATH" "${XHTTP_PATH}"
         log_info "生成新 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
@@ -212,16 +219,13 @@ collect_reality_params() {
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
 }
 
-# ── 构建 wireguard 出站 JSON（供 generate_xray_config 调用）──
+# ── 构建 wireguard 出站 JSON ──────────────────────────────────
 _build_warp_outbound_json() {
-    # 必须由 warp.sh 的 run_warp() 预先填充这些变量
     if [[ -z "${WGCF_PRIVATE_KEY:-}" ]]; then
         log_error "WGCF_* 凭证未设置，请确认 run_warp() 已在 run_xray() 前执行"
         exit 1
     fi
 
-    # 将逗号分隔的 Address 转换为 JSON 数组
-    # 例: "172.16.0.2/32,fd01:5ca1:ab1e::1/128"
     local addr_json=""
     IFS=',' read -ra addr_arr <<< "${WGCF_ADDRESS}"
     for addr in "${addr_arr[@]}"; do
@@ -415,7 +419,10 @@ generate_xray_config() {
                 ],
                 "decryption": "none",
                 "fallbacks":  [
-                    {"dest": "127.0.0.1:10080", "xver": 0}
+                    {
+                        "dest": "127.0.0.1:10080",
+                        "xver": 2
+                    }
                 ]
             },
             "streamSettings": {
