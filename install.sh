@@ -10,9 +10,8 @@ BASE_URL="https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/main"
 MODULES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/modules"
 STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
-LOCAL_MODULES_DIR="${STATE_DIR}/modules"   # 服务器本地模块缓存目录
+LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-# 所有模块名称列表（同步时使用）
 ALL_MODULES=(system unbound nginx cert xray singbox warp client uninstall)
 
 RED='\033[0;31m'
@@ -81,15 +80,12 @@ load_module() {
     local remote_url="${BASE_URL}/modules/${module}.sh"
 
     if [[ -f "$cached_path" ]]; then
-        # 优先读本地缓存（/etc/xray-deploy/modules/）
         # shellcheck source=/dev/null
         source "$cached_path"
     elif [[ -f "$local_path" ]]; then
-        # 次选脚本同级 modules/ 目录（开发调试用）
         # shellcheck source=/dev/null
         source "$local_path"
     else
-        # 从远程下载并缓存到本地，避免下次重复下载
         log_info "下载模块 ${module}.sh ..."
         mkdir -p "$LOCAL_MODULES_DIR"
         chmod 700 "$LOCAL_MODULES_DIR"
@@ -151,9 +147,6 @@ _sync_inst_state() {
     _sync_cert_state
 }
 
-# ── 从实际证书文件 + domain_map.conf 同步 cert 状态 ─────────
-# 注意：do_inst_cert 执行完后会直接调用 save_state "INST_CERT" "1"
-# 本函数只用于重新运行脚本时的自动恢复，不依赖此函数来即时更新状态
 _sync_cert_state() {
     [[ "$(get_step INST_CERT)" == "1" ]] && return 0
 
@@ -241,6 +234,7 @@ XRAY_PUBLIC_KEY=''
 XRAY_PRIVATE_KEY=''
 REALITY_DEST=''
 REALITY_SNI=''
+REALITY_SERVER_NAMES=''
 REALITY_SHORT_ID=''
 REALITY_SPIDER_X=''
 
@@ -288,6 +282,14 @@ ENV
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XRAY_PADDING=$(get_state "XRAY_PADDING")
+
+    # ── BUG FIX：恢复 REALITY_SERVER_NAMES 数组 ──────────────
+    # 原代码只保存了 REALITY_SNI（第一个元素），导致 do_conf_nginx
+    # 调用 generate_sni_map 时数组为空，stream map 缺失公共域名路由。
+    local _reality_sn_str
+    _reality_sn_str=$(get_state "REALITY_SERVER_NAMES")
+    REALITY_SERVER_NAMES=()
+    [[ -n "$_reality_sn_str" ]] && read -ra REALITY_SERVER_NAMES <<< "$_reality_sn_str"
 
     WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
     WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
@@ -337,6 +339,12 @@ restore_domain_arrays() {
     REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
     XHTTP_PATH=$(get_state "XHTTP_PATH")
+
+    # ── 同步恢复 REALITY_SERVER_NAMES ────────────────────────
+    local _sn_str
+    _sn_str=$(get_state "REALITY_SERVER_NAMES")
+    REALITY_SERVER_NAMES=()
+    [[ -n "$_sn_str" ]] && read -ra REALITY_SERVER_NAMES <<< "$_sn_str"
 }
 
 refresh_unbound_after_cert() {
@@ -376,7 +384,6 @@ show_status() {
       command -v nginx &>/dev/null; } \
       && s_nginx="OK"   || s_nginx="--"
 
-    # ── Cert：state=1 OR 实际有证书文件，均视为 OK ───────────
     { [[ "$(get_step INST_CERT)" == "1" ]] || \
       find /etc/letsencrypt/live -name 'fullchain.pem' -quit 2>/dev/null | grep -q .; } \
       && s_cert="OK" || s_cert="--"
@@ -409,7 +416,6 @@ show_status() {
       [[ -f /etc/wgcf/wgcf-profile.conf ]]; } \
       && c_warp="OK"    || c_warp="--"
 
-    # 本地模块缓存数量
     local cached_count=0
     for m in "${ALL_MODULES[@]}"; do
         [[ -f "${LOCAL_MODULES_DIR}/${m}.sh" ]] && (( cached_count++ )) || true
@@ -522,7 +528,6 @@ main_menu() {
     esac
 }
 
-# ── 同步模块入口 ─────────────────────────────────────────────
 do_sync_modules() {
     echo ""
     log_warn "将从 GitHub 下载所有模块覆盖本地缓存，需要网络连接。"
@@ -536,7 +541,6 @@ do_sync_modules() {
     done_return
 }
 
-# ── WGCF 凭证保障 ────────────────────────────────────────────
 _ensure_wgcf() {
     [[ -z "${WGCF_PRIVATE_KEY:-}"   ]] && WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
     [[ -z "${WGCF_PEER_PUBKEY:-}"   ]] && WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
@@ -652,10 +656,6 @@ do_inst_cert() {
     load_module cert
     run_cert
 
-    # ── BUG FIX：cert 申请完直接写入 state 并同步 shell 变量 ──
-    # 原逻辑依赖 _sync_cert_state 在下次启动时检测文件来更新状态，
-    # 导致当次运行返回主菜单后 Cert 仍显示 --，重启后才变 OK。
-    # 现在在 run_cert 执行完后立即写入所有状态，无需等下次启动。
     save_state "XHTTP_DOMAIN"   "${XHTTP_DOMAIN:-}"
     save_state "GRPC_DOMAIN"    "${GRPC_DOMAIN:-}"
     save_state "REALITY_DOMAIN" "${REALITY_DOMAIN:-}"
@@ -666,9 +666,6 @@ do_inst_cert() {
     save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
     save_state "INST_CERT"      "1"
 
-    # 同步到当前 shell 变量，让 show_status 域名栏立即生效
-    # （init_state 在 done_return 里会重新从 config.env 读，
-    #   但 show_status 在此之前会用当前 shell 变量，所以需要手动同步）
     XHTTP_DOMAIN="${XHTTP_DOMAIN:-}"
     GRPC_DOMAIN="${GRPC_DOMAIN:-}"
     REALITY_DOMAIN="${REALITY_DOMAIN:-}"
@@ -750,7 +747,7 @@ do_conf_nginx() {
     fi
 
     load_os_info
-    restore_domain_arrays
+    restore_domain_arrays   # 内含 REALITY_SERVER_NAMES 恢复
 
     XHTTP_PATH=$(get_state "XHTTP_PATH")
     if [[ -z "${XHTTP_PATH}" ]]; then
@@ -817,15 +814,17 @@ do_conf_xray() {
     generate_xray_config
     start_xray
 
-    save_state "XRAY_UUID"        "${XRAY_UUID:-}"
-    save_state "XRAY_PUBLIC_KEY"  "${XRAY_PUBLIC_KEY:-}"
-    save_state "XRAY_PRIVATE_KEY" "${XRAY_PRIVATE_KEY:-}"
-    save_state "XHTTP_PATH"       "${XHTTP_PATH:-}"
-    save_state "REALITY_DEST"     "${REALITY_DEST:-}"
-    save_state "REALITY_SNI"      "${REALITY_SERVER_NAMES[0]:-}"
-    save_state "REALITY_SHORT_ID" "${REALITY_SHORT_IDS[1]:-}"
-    save_state "REALITY_SPIDER_X" "${REALITY_SPIDER_X:-}"
-    save_state "CONF_XRAY"        "1"
+    save_state "XRAY_UUID"             "${XRAY_UUID:-}"
+    save_state "XRAY_PUBLIC_KEY"       "${XRAY_PUBLIC_KEY:-}"
+    save_state "XRAY_PRIVATE_KEY"      "${XRAY_PRIVATE_KEY:-}"
+    save_state "XHTTP_PATH"            "${XHTTP_PATH:-}"
+    save_state "REALITY_DEST"          "${REALITY_DEST:-}"
+    save_state "REALITY_SNI"           "${REALITY_SERVER_NAMES[0]:-}"
+    # ── BUG FIX：保存完整 serverNames 数组供 nginx 生成 SNI map 使用 ──
+    save_state "REALITY_SERVER_NAMES"  "${REALITY_SERVER_NAMES[*]:-}"
+    save_state "REALITY_SHORT_ID"      "${REALITY_SHORT_IDS[1]:-}"
+    save_state "REALITY_SPIDER_X"      "${REALITY_SPIDER_X:-}"
+    save_state "CONF_XRAY"             "1"
 
     done_return
 }
@@ -1024,24 +1023,6 @@ run_full_install_flow() {
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
-    load_module nginx
-    create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
-    fi
-    generate_cf_realip_conf
-    generate_ssl_conf
-    generate_upstreams_conf
-    generate_fallback_conf
-    generate_servers_conf
-    generate_nginx_conf
-    reload_nginx
-    install_cf_ip_updater
-    setup_cf_ip_updater
-    run_cf_ip_updater
-    save_state "CONF_NGINX" "1"
-
     load_module warp
     run_warp
     save_state "WGCF_PRIVATE_KEY"   "${WGCF_PRIVATE_KEY:-}"
@@ -1066,15 +1047,35 @@ run_full_install_flow() {
     collect_reality_params
     generate_xray_config
     start_xray
-    save_state "XRAY_UUID"        "${XRAY_UUID:-}"
-    save_state "XRAY_PUBLIC_KEY"  "${XRAY_PUBLIC_KEY:-}"
-    save_state "XRAY_PRIVATE_KEY" "${XRAY_PRIVATE_KEY:-}"
-    save_state "XHTTP_PATH"       "${XHTTP_PATH:-}"
-    save_state "REALITY_DEST"     "${REALITY_DEST:-}"
-    save_state "REALITY_SNI"      "${REALITY_SERVER_NAMES[0]:-}"
-    save_state "REALITY_SHORT_ID" "${REALITY_SHORT_IDS[1]:-}"
-    save_state "REALITY_SPIDER_X" "${REALITY_SPIDER_X:-}"
-    save_state "CONF_XRAY"        "1"
+    save_state "XRAY_UUID"            "${XRAY_UUID:-}"
+    save_state "XRAY_PUBLIC_KEY"      "${XRAY_PUBLIC_KEY:-}"
+    save_state "XRAY_PRIVATE_KEY"     "${XRAY_PRIVATE_KEY:-}"
+    save_state "XHTTP_PATH"           "${XHTTP_PATH:-}"
+    save_state "REALITY_DEST"         "${REALITY_DEST:-}"
+    save_state "REALITY_SNI"          "${REALITY_SERVER_NAMES[0]:-}"
+    save_state "REALITY_SERVER_NAMES" "${REALITY_SERVER_NAMES[*]:-}"
+    save_state "REALITY_SHORT_ID"     "${REALITY_SHORT_IDS[1]:-}"
+    save_state "REALITY_SPIDER_X"     "${REALITY_SPIDER_X:-}"
+    save_state "CONF_XRAY"            "1"
+
+    # nginx 在 xray 之后生成，确保 REALITY_SERVER_NAMES 已保存
+    load_module nginx
+    create_nginx_dirs
+    generate_fake_site "/var/www/html" "Welcome"
+    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
+        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
+    fi
+    generate_cf_realip_conf
+    generate_ssl_conf
+    generate_upstreams_conf
+    generate_fallback_conf
+    generate_servers_conf
+    generate_nginx_conf
+    reload_nginx
+    install_cf_ip_updater
+    setup_cf_ip_updater
+    run_cf_ip_updater
+    save_state "CONF_NGINX" "1"
 
     load_module singbox
     install_singbox
