@@ -26,6 +26,7 @@ load_existing_params() {
     REALITY_SPIDER_X=$(read_state_value "REALITY_SPIDER_X")
     ANYTLS_DOMAIN=$(read_state_value "ANYTLS_DOMAIN")
     SINGBOX_PASSWORD=$(read_state_value "SINGBOX_PASSWORD")
+    XHTTP_PADDING=$(read_state_value "XHTTP_PADDING")
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then

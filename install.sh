@@ -12,7 +12,7 @@ STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-ALL_MODULES=(system unbound nginx cert xray singbox warp client uninstall)
+ALL_MODULES=(system unbound nginx cert xray singbox warp client sync uninstall)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -323,38 +323,8 @@ load_os_info() {
 }
 
 restore_domain_arrays() {
-    local all_str cdn_str direct_str
-    all_str=$(get_state "ALL_DOMAINS")
-    cdn_str=$(get_state "CDN_DOMAINS")
-    direct_str=$(get_state "DIRECT_DOMAINS")
-
-    ALL_DOMAINS=()
-    CDN_DOMAINS=()
-    DIRECT_DOMAINS=()
-
-    if [[ -n "$all_str" ]]; then
-        read -ra ALL_DOMAINS <<< "$all_str"
-    fi
-    if [[ -n "$cdn_str" ]]; then
-        read -ra CDN_DOMAINS <<< "$cdn_str"
-    fi
-    if [[ -n "$direct_str" ]]; then
-        read -ra DIRECT_DOMAINS <<< "$direct_str"
-    fi
-
-    XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
-    GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
-    REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
-    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
-    XHTTP_PATH=$(get_state "XHTTP_PATH")
-
-    # ── 同步恢复 REALITY_SERVER_NAMES ────────────────────────
-    local _sn_str
-    _sn_str=$(get_state "REALITY_SERVER_NAMES")
-    REALITY_SERVER_NAMES=()
-    if [[ -n "$_sn_str" ]]; then
-        read -ra REALITY_SERVER_NAMES <<< "$_sn_str"
-    fi
+    load_module sync
+    sync_restore_domain_arrays
 }
 
 refresh_unbound_after_cert() {
@@ -790,30 +760,8 @@ do_conf_nginx() {
 }
 
 refresh_nginx_after_xray() {
-    if [[ "$(get_step CONF_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
-        log_warn "Nginx 未配置，跳过 Xray 后置同步"
-        return 0
-    fi
-
-    log_step "同步 Nginx 与 Xray 路由参数..."
-    restore_domain_arrays
-    load_module nginx
-    create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
-    fi
-    generate_cf_realip_conf
-    generate_ssl_conf
-    generate_upstreams_conf
-    generate_fallback_conf
-    generate_servers_conf
-    generate_nginx_conf
-    reload_nginx
-    install_cf_ip_updater
-    setup_cf_ip_updater
-    run_cf_ip_updater
-    save_state "CONF_NGINX" "1"
+    load_module sync
+    sync_refresh_nginx_routes "Xray"
 }
 
 do_conf_xray() {
@@ -890,6 +838,8 @@ do_conf_singbox() {
     fi
 
     load_os_info
+    load_module sync
+    sync_restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
 
     _ensure_wgcf
@@ -901,12 +851,17 @@ do_conf_singbox() {
     start_singbox
 
     save_state "SINGBOX_PASSWORD" "${SINGBOX_PASSWORD:-}"
+    save_state "ANYTLS_DOMAIN"     "${ANYTLS_DOMAIN:-}"
     save_state "CONF_SINGBOX"     "1"
+
+    sync_refresh_nginx_routes "Sing-Box"
 
     done_return
 }
 
 do_client() {
+    load_module sync
+    sync_before_client_links
     load_module client
     run_client
     done_return
