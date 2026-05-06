@@ -391,7 +391,15 @@ generate_xray_config() {
                     "extra": {
                         "enc":           "packet",
                         "xPaddingBytes": "${x_padding}",
-                        "headers":       {"User-Agent": "chrome"}
+                        "headers":       {"User-Agent": "chrome"},
+                        "xmux": {
+                            "maxConcurrency":   "4-8",
+                            "maxConnections":   0,
+                            "cMaxReuseTimes":   150,
+                            "hMaxRequestTimes": "150-300",
+                            "hMaxReusableSecs": "1800-3600",
+                            "hKeepAlivePeriod": 60
+                        }
                     }
                 },
                 "sockopt": {
@@ -464,7 +472,10 @@ generate_xray_config() {
                     "spiderX":     "${REALITY_SPIDER_X}"
                 },
                 "sockopt": {
-                    "acceptProxyProtocol": true
+                    "acceptProxyProtocol": true,
+                    "tcpUserTimeout":       ${user_timeout},
+                    "tcpKeepAliveIdle":     300,
+                    "tcpKeepAliveInterval": 30
                 }
             },
             "sniffing": {
