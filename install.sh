@@ -789,6 +789,33 @@ do_conf_nginx() {
     done_return
 }
 
+refresh_nginx_after_xray() {
+    if [[ "$(get_step CONF_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
+        log_warn "Nginx 未配置，跳过 Xray 后置同步"
+        return 0
+    fi
+
+    log_step "同步 Nginx 与 Xray 路由参数..."
+    restore_domain_arrays
+    load_module nginx
+    create_nginx_dirs
+    generate_fake_site "/var/www/html" "Welcome"
+    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
+        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
+    fi
+    generate_cf_realip_conf
+    generate_ssl_conf
+    generate_upstreams_conf
+    generate_fallback_conf
+    generate_servers_conf
+    generate_nginx_conf
+    reload_nginx
+    install_cf_ip_updater
+    setup_cf_ip_updater
+    run_cf_ip_updater
+    save_state "CONF_NGINX" "1"
+}
+
 do_conf_xray() {
     if [[ "$(get_step INST_XRAY)" != "1" ]] && ! command -v xray &>/dev/null; then
         log_warn "请先完成步骤 5（安装 Xray）"
@@ -835,6 +862,8 @@ do_conf_xray() {
     save_state "REALITY_SHORT_ID"      "${REALITY_SHORT_IDS[1]:-}"
     save_state "REALITY_SPIDER_X"      "${REALITY_SPIDER_X:-}"
     save_state "CONF_XRAY"             "1"
+
+    refresh_nginx_after_xray
 
     done_return
 }
