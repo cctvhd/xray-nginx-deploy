@@ -67,6 +67,16 @@ REPO
     local nginx_ver
     nginx_ver=$(nginx -v 2>&1 | grep -oP '[\d.]+' | head -1)
     log_info "Nginx 安装成功: v${nginx_ver}"
+
+    local nginx_nofile="${GLOBAL_NOFILE_LIMIT:-1048576}"
+    mkdir -p /etc/systemd/system/nginx.service.d
+    cat > /etc/systemd/system/nginx.service.d/99-xray-limits.conf << LIMITS
+[Service]
+LimitNOFILE=${nginx_nofile}
+LIMITS
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    log_info "Nginx systemd nofile 限制: ${nginx_nofile}"
+
     systemctl enable --now nginx
 }
 
@@ -507,9 +517,8 @@ generate_nginx_conf() {
 
     select_nginx_profile "$cpu_cores" "$mem_mb"
 
-    # P6修复：worker_rlimit_nofile 按实际需求计算
-    # 峰值 FD ≈ worker_connections × 2 + 系统开销，32768 足够
-    local worker_rlimit_nofile=32768
+    # 代理转发会同时占用客户端和上游连接，按 worker_connections 动态留余量。
+    local worker_rlimit_nofile=$(( NGINX_WORKER_CONNECTIONS * 2 + 8192 ))
 
     [[ -f /etc/nginx/nginx.conf ]] && \
         cp /etc/nginx/nginx.conf \
@@ -524,7 +533,7 @@ generate_nginx_conf() {
 # ============================================================
 user nginx;
 worker_processes ${worker_processes};
-# P6修复：原 200000 严重虚高，按峰值FD实际需求设置
+# 按代理连接峰值动态设置，和 systemd LimitNOFILE/内核 fd 上限保持匹配
 worker_rlimit_nofile ${worker_rlimit_nofile};
 worker_cpu_affinity auto;
 error_log /var/log/nginx/error.log warn;
@@ -1123,12 +1132,12 @@ CONF
     log_info "servers.conf 生成完成"
 }
 
-# ── 验证并重载 Nginx ─────────────────────────────────────────
+# ── 验证并重启 Nginx ─────────────────────────────────────────
 reload_nginx() {
     log_step "验证 Nginx 配置..."
     if nginx -t 2>&1; then
-        systemctl reload nginx
-        log_info "Nginx 配置验证通过并已重载"
+        systemctl restart nginx
+        log_info "Nginx 配置验证通过并已重启，资源限制已生效"
     else
         log_error "Nginx 配置验证失败，请检查配置文件"
         nginx -t
