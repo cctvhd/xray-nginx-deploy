@@ -154,10 +154,10 @@ _sync_cert_state() {
     [[ -f "$CF_DOMAIN_MAP" ]] || return 0
 
     local xhttp grpc reality anytls
-    xhttp=$(   grep "^XHTTP_DOMAIN="   "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
-    grpc=$(    grep "^GRPC_DOMAIN="    "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
-    reality=$( grep "^REALITY_DOMAIN=" "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
-    anytls=$(  grep "^ANYTLS_DOMAIN="  "$CF_DOMAIN_MAP" | head -1 | cut -d= -f2- | tr -d "'\""  )
+    xhttp=$(   grep "^XHTTP_DOMAIN="   "$CF_DOMAIN_MAP" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'\"" || true )
+    grpc=$(    grep "^GRPC_DOMAIN="    "$CF_DOMAIN_MAP" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'\"" || true )
+    reality=$( grep "^REALITY_DOMAIN=" "$CF_DOMAIN_MAP" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'\"" || true )
+    anytls=$(  grep "^ANYTLS_DOMAIN="  "$CF_DOMAIN_MAP" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'\"" || true )
 
     local cert_ok=false
     for d in "$xhttp" "$grpc" "$reality" "$anytls"; do
@@ -289,7 +289,9 @@ ENV
     local _reality_sn_str
     _reality_sn_str=$(get_state "REALITY_SERVER_NAMES")
     REALITY_SERVER_NAMES=()
-    [[ -n "$_reality_sn_str" ]] && read -ra REALITY_SERVER_NAMES <<< "$_reality_sn_str"
+    if [[ -n "$_reality_sn_str" ]]; then
+        read -ra REALITY_SERVER_NAMES <<< "$_reality_sn_str"
+    fi
 
     WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
     WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
@@ -330,9 +332,15 @@ restore_domain_arrays() {
     CDN_DOMAINS=()
     DIRECT_DOMAINS=()
 
-    [[ -n "$all_str"    ]] && read -ra ALL_DOMAINS    <<< "$all_str"
-    [[ -n "$cdn_str"    ]] && read -ra CDN_DOMAINS    <<< "$cdn_str"
-    [[ -n "$direct_str" ]] && read -ra DIRECT_DOMAINS <<< "$direct_str"
+    if [[ -n "$all_str" ]]; then
+        read -ra ALL_DOMAINS <<< "$all_str"
+    fi
+    if [[ -n "$cdn_str" ]]; then
+        read -ra CDN_DOMAINS <<< "$cdn_str"
+    fi
+    if [[ -n "$direct_str" ]]; then
+        read -ra DIRECT_DOMAINS <<< "$direct_str"
+    fi
 
     XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
@@ -344,7 +352,9 @@ restore_domain_arrays() {
     local _sn_str
     _sn_str=$(get_state "REALITY_SERVER_NAMES")
     REALITY_SERVER_NAMES=()
-    [[ -n "$_sn_str" ]] && read -ra REALITY_SERVER_NAMES <<< "$_sn_str"
+    if [[ -n "$_sn_str" ]]; then
+        read -ra REALITY_SERVER_NAMES <<< "$_sn_str"
+    fi
 }
 
 refresh_unbound_after_cert() {
