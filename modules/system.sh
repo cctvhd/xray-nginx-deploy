@@ -2,12 +2,12 @@
 # ============================================================
 # modules/system.sh
 # 系统初始化模块 - 2026 最终独立版
-# 策略：激进上限 + 内核自适应，让软件按需使用内存
+# 策略：代理节点稳健上限 + 内核自适应，让软件按需使用内存
 # ============================================================
 
 # ── 全局资源常量 ─────────────────────────────────────────────
-GLOBAL_NR_OPEN=4194304
-GLOBAL_FILE_MAX=4194304
+GLOBAL_NR_OPEN=2097152
+GLOBAL_FILE_MAX=2097152
 GLOBAL_NOFILE_LIMIT=1048576
 GLOBAL_NPROC_LIMIT=65536
 
@@ -291,7 +291,7 @@ determine_ecn_value() {
 
 # ── 3. sysctl 内核参数优化 ───────────────────────────────────
 optimize_sysctl() {
-    log_step "计算并应用 sysctl 内核优化参数 (激进上限 + 自适应)..."
+    log_step "计算并应用 sysctl 内核优化参数 (代理节点稳健上限 + 自适应)..."
 
     determine_ecn_value
 
@@ -318,7 +318,7 @@ optimize_sysctl() {
 # CPU 核心 : ${HW_CPU_CORES:-unknown}
 # 物理内存 : $(( total_mem_kb / 1024 ))MB
 # 运行环境 : ${VIRT_TYPE:-unknown}
-# 优化策略 : 激进上限 + 内核自适应
+# 优化策略 : 代理节点稳健上限 + 内核自适应
 # ============================================================
 
 # --- 文件描述符 ---
@@ -331,7 +331,7 @@ net.ipv4.tcp_congestion_control = bbr
 net.ipv4.tcp_moderate_rcvbuf    = 1
 net.ipv4.tcp_ecn                = ${SYSCTL_ECN}
 
-# --- Socket 缓冲区（激进上限，内核按需分配）---
+# --- Socket 缓冲区（稳健上限，内核按需分配）---
 net.core.rmem_max     = ${rmem_max}
 net.core.wmem_max     = ${wmem_max}
 net.core.rmem_default = 262144
@@ -354,9 +354,9 @@ net.ipv4.tcp_keepalive_time        = 300
 net.ipv4.tcp_keepalive_intvl       = 30
 net.ipv4.tcp_keepalive_probes      = 3
 net.ipv4.tcp_fin_timeout           = 30
-net.ipv4.tcp_tw_reuse              = 1
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing           = 1
+net.ipv4.tcp_notsent_lowat         = 16384
 
 # --- 虚拟内存 ---
 vm.swappiness             = ${VM_SWAPPINESS}

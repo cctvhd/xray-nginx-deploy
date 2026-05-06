@@ -24,6 +24,20 @@ install_xray() {
     chmod 755 /var/log/xray
 }
 
+# ── 配置 Xray systemd 资源限制 ──────────────────────────────
+configure_xray_service_limits() {
+    local xray_nofile="${GLOBAL_NOFILE_LIMIT:-1048576}"
+
+    mkdir -p /etc/systemd/system/xray.service.d
+    cat > /etc/systemd/system/xray.service.d/99-xray-limits.conf << LIMITS
+[Service]
+LimitNOFILE=${xray_nofile}
+LIMITS
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    log_info "Xray systemd nofile 限制: ${xray_nofile}"
+}
+
 # ── 生成随机参数 ─────────────────────────────────────────────
 generate_xray_params() {
     log_step "生成 Xray 随机参数..."
@@ -497,6 +511,7 @@ start_xray() {
         exit 1
     fi
 
+    configure_xray_service_limits
     systemctl enable --now xray
 
     sleep 2
