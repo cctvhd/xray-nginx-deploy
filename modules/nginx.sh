@@ -740,7 +740,9 @@ upstream vless_grpc_backend {
     server 127.0.0.1:8002 max_fails=3 fail_timeout=30s;
     keepalive          32;
     keepalive_requests 1000;
-    keepalive_timeout  40s;
+    # 修复3：与 xray grpc idle_timeout(80s) 形成梯度
+    # nginx(90s) > xray(80s) > 客户端(60s)，避免连接被提前回收
+    keepalive_timeout  90s;
 }
 CONF
 
@@ -807,6 +809,8 @@ server {
         grpc_connect_timeout 15s;
         grpc_send_timeout    7200s;
         grpc_read_timeout    7200s;
+        # 修复4：与 servers.conf gRPC location 保持一致
+        grpc_buffer_size     4k;
     }
 
     location / {
@@ -997,6 +1001,8 @@ server {
         grpc_read_timeout     7200s;
         grpc_socket_keepalive on;
         grpc_next_upstream    off;
+        # 修复4：与 fallback.conf gRPC location 保持一致
+        grpc_buffer_size      4k;
 
         client_max_body_size  0;
         client_body_timeout   7200s;
