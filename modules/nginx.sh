@@ -122,7 +122,7 @@ generate_trap_cert() {
         return
     fi
 
-    openssl req -x509 -newkey rsa:2048 -nodes \
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
         -keyout "$key" \
         -out    "$crt" \
         -days   3650 \
@@ -409,10 +409,11 @@ generate_ssl_conf() {
 # ===================================================
 
 ssl_protocols TLSv1.3 TLSv1.2;
-ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_AES_128_GCM_SHA256:TLS_CHACHA20_POLY1305_SHA256;
-ssl_ciphers HIGH:!aNULL:!MD5:!3DES:!RC4:!DES:!EXPORT:!LOW:!PSK;
-ssl_ecdh_curve X25519:prime256v1;
-ssl_session_cache shared:SSL:50m;
+ssl_conf_command Ciphersuites TLS_AES_256_GCM_SHA384:TLS_CHACHA20_POLY1305_SHA256:TLS_AES_128_GCM_SHA256;
+ssl_ciphers ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+ssl_prefer_server_ciphers on;
+ssl_conf_command Curves X25519:P-256:P-384;
+ssl_session_cache shared:SSL:10m;
 ssl_session_timeout 1d;
 ssl_session_tickets off;
 ssl_early_data off;
@@ -426,13 +427,10 @@ resolver_timeout 5s;
 add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
 add_header X-Content-Type-Options nosniff always;
 add_header X-Frame-Options DENY always;
-add_header X-XSS-Protection "1; mode=block" always;
 add_header Referrer-Policy "strict-origin-when-cross-origin" always;
 add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
-add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
-add_header Access-Control-Allow-Origin "*" always;
-add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
-add_header Access-Control-Allow-Headers "*" always;
+# CSP 和 CORS 已从全局移除：CSP 仅在伪装页 location 内添加，CORS 仅在 xhttp location 内添加
+# 代理 location 不需要 CSP（干扰流式传输），CORS 全局设置会污染伪装页响应
 CONF
 
     log_info "SSL 通用配置生成完成"
@@ -449,7 +447,7 @@ select_nginx_profile() {
         # P5修复：全局 keepalive 改小，在 location 内单独覆盖长连接
         NGINX_KEEPALIVE_TIMEOUT=65
         NGINX_KEEPALIVE_REQUESTS=5000
-        NGINX_OPEN_FILE_CACHE_MAX=20000
+        NGINX_OPEN_FILE_CACHE_MAX=2000
         NGINX_OPEN_FILE_CACHE_INACTIVE=120
         NGINX_OPEN_FILE_CACHE_VALID=60
         NGINX_OPEN_FILE_CACHE_MIN_USES=2
@@ -588,13 +586,13 @@ http {
     keepalive_requests ${NGINX_KEEPALIVE_REQUESTS};
 
     client_max_body_size        0;
-    client_body_timeout         7200s;
+client_body_timeout 60s;  # 修复: 7200→60s 防慢速攻击；代理 location 内显式覆盖 7200s
     client_header_timeout       300s;
     # P7修复：缓冲区按实际需求收缩，避免峰值内存超物理内存
     client_body_buffer_size     128k;
     client_header_buffer_size   4k;
     large_client_header_buffers 4 16k;
-    send_timeout                7200s;
+send_timeout 60s;  # 修复: 7200→60s 非代理 location 不需要长超时
 
     server_tokens             off;
     reset_timedout_connection on;
@@ -628,8 +626,7 @@ http {
 
     gzip off;
 
-    limit_req_zone  \$final_real_ip zone=websocket:20m rate=2000r/s;
-    limit_req_zone  \$final_real_ip zone=api:20m      rate=3000r/s;
+    limit_req_zone  \$final_real_ip zone=websocket:20m rate=200r/s;
     limit_req_zone  \$final_real_ip zone=health:1m    rate=10r/s;
     limit_conn_zone \$final_real_ip zone=conn_limit:20m;
 
@@ -739,14 +736,16 @@ generate_upstreams_conf() {
 # /etc/nginx/conf.d/00-upstreams.conf
 # ============================================================
 upstream vless_xhttp_backend {
-    server 127.0.0.1:8001 max_fails=3 fail_timeout=30s;
+    server 127.0.0.1:8001 max_fails=0 fail_timeout=30s;
     keepalive          256;
     keepalive_requests 10000;
-    keepalive_timeout  7200s;
+# 与 Xray xhttp hMaxReusableSecs(1800-3600s) 形成梯度
+# nginx(300s) < Xray 上限(3600s)，确保 nginx 先回收，避免持有对 Xray 已关闭的连接
+keepalive_timeout 300s;
 }
 
 upstream vless_grpc_backend {
-    server 127.0.0.1:8002 max_fails=3 fail_timeout=30s;
+    server 127.0.0.1:8002 max_fails=0 fail_timeout=30s;
     keepalive          32;
     keepalive_requests 1000;
     # 修复3：与 xray grpc idle_timeout(80s) 形成梯度
@@ -760,7 +759,6 @@ CONF
 
 # ── 生成 fallback.conf ───────────────────────────────────────
 # P1修复：xhttp location 路径使用 ${XHTTP_PATH} 变量（与 xray 保持一致）
-# P2修复：listen 加 proxy_protocol，从 PROXY header 获取真实 IP
 generate_fallback_conf() {
     log_step "生成 fallback 配置..."
 
@@ -769,12 +767,11 @@ generate_fallback_conf() {
 # /etc/nginx/conf.d/fallback.conf
 # Reality Fallback 入口
 # P1修复：xhttp path 与 xray 保持一致（均使用 XHTTP_PATH 变量）
-# P2修复：加 proxy_protocol 接收 xver=2 发送的 PROXY header，
-#         从而正确获取真实 IP 而非 127.0.0.1
+# 注意：Xray Reality fallback xver=0，不发送 PROXY header，
+# 因此 listen 不加 proxy_protocol
 # ============================================================
 server {
-    # P2修复：加 proxy_protocol，配合 xray fallback xver=2
-    listen 127.0.0.1:10080 proxy_protocol;
+listen 127.0.0.1:10080;
     server_name   _;
     access_log    off;
     server_tokens off;
@@ -793,9 +790,9 @@ server {
         proxy_http_version      1.1;
         proxy_set_header        Connection "";
         proxy_set_header        Host \$host;
-        # P2修复：proxy_protocol 启用后 \$remote_addr 即为真实 IP
-        proxy_set_header        X-Real-IP \$remote_addr;
-        proxy_set_header        X-Forwarded-For \$remote_addr;
+ # fallback 经 xver=0 转发，无 proxy_protocol，使用 $final_real_ip 获取真实 IP
+        proxy_set_header        X-Real-IP \$final_real_ip;
+        proxy_set_header        X-Forwarded-For \$final_real_ip;
         proxy_buffering         off;
         proxy_request_buffering off;
         proxy_cache             off;
@@ -816,17 +813,32 @@ server {
         grpc_set_header      Host \$host;
         grpc_next_upstream   off;
         grpc_connect_timeout 15s;
-        grpc_send_timeout    7200s;
-        grpc_read_timeout    7200s;
+        grpc_send_timeout    300s;
+        grpc_read_timeout    300s;
         # 修复4：与 servers.conf gRPC location 保持一致
-        grpc_buffer_size     4k;
+        grpc_buffer_size     64k;
+        grpc_socket_keepalive on;
+        client_max_body_size 0;
+        client_body_timeout 7200s;
+        send_timeout 7200s;
     }
 
     location / {
         root      /var/www/html;
         index     index.html;
         try_files \$uri \$uri/ /index.html;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
         add_header Cache-Control "public, max-age=3600" always;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
+ add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
     }
 }
 CONF
@@ -896,9 +908,17 @@ server {
         proxy_set_header        X-Real-IP \$final_real_ip;
         proxy_set_header        X-Forwarded-For \$final_real_ip;
         proxy_set_header        X-Forwarded-Proto \$scheme;
-        proxy_set_header        Cache-Control "no-cache, no-store, private";
+        add_header Cache-Control "no-store, no-cache, must-revalidate" always;
 
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
         add_header X-Accel-Buffering "no" always;
+ add_header Access-Control-Allow-Origin "*" always;
+ add_header Access-Control-Allow-Methods "GET, POST, OPTIONS" always;
+ add_header Access-Control-Allow-Headers "*" always;
         proxy_hide_header Via;
         proxy_hide_header X-Cache;
         proxy_hide_header X-Cache-Status;
@@ -926,6 +946,11 @@ server {
     location = /health {
         limit_req  zone=health burst=5 nodelay;
         access_log off;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
         add_header Content-Type  "text/plain" always;
         add_header Cache-Control "no-cache, no-store, must-revalidate" always;
         return 200 "healthy\n";
@@ -936,15 +961,32 @@ server {
         root      /var/www/html;
         index     index.html;
         try_files /index.html =200;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
         add_header Cache-Control "public, max-age=3600" always;
+ add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
         access_log off;
     }
 
     location / {
         root  /var/www/html;
         index index.html;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
+ add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
         location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
             expires    30d;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
             add_header Cache-Control "public, no-transform";
             access_log off;
         }
@@ -1006,12 +1048,12 @@ server {
         grpc_set_header       Content-Type "application/grpc";
 
         grpc_connect_timeout  15s;
-        grpc_send_timeout     7200s;
-        grpc_read_timeout     7200s;
+        grpc_send_timeout     300s;
+        grpc_read_timeout     300s;
         grpc_socket_keepalive on;
         grpc_next_upstream    off;
         # 修复4：与 fallback.conf gRPC location 保持一致
-        grpc_buffer_size      4k;
+        grpc_buffer_size      64k;
 
         client_max_body_size  0;
         client_body_timeout   7200s;
@@ -1021,6 +1063,11 @@ server {
     location = /health {
         limit_req  zone=health burst=5 nodelay;
         access_log off;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
         add_header Content-Type  "text/plain" always;
         add_header Cache-Control "no-cache, no-store, must-revalidate" always;
         return 200 "healthy\n";
@@ -1031,15 +1078,32 @@ server {
         root      /var/www/${GRPC_DOMAIN};
         index     index.html;
         try_files /index.html =200;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
         add_header Cache-Control "public, max-age=3600" always;
+ add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
         access_log off;
     }
 
     location / {
         root  /var/www/${GRPC_DOMAIN};
         index index.html;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
+ add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
         location ~* \.(css|js|png|jpg|jpeg|gif|ico|svg|woff|woff2|ttf|eot)$ {
             expires    30d;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
             add_header Cache-Control "public, no-transform";
             access_log off;
         }
@@ -1081,6 +1145,9 @@ server {
     ssl_protocols       TLSv1.2 TLSv1.3;
     server_name         _;
     server_tokens       off;
+        client_header_timeout 10s;
+        send_timeout 10s;
+        keepalive_timeout 10s;
     access_log          off;
     gzip                on;
     gzip_vary           on;
@@ -1095,7 +1162,12 @@ server {
     location / {
         try_files $uri $uri/ /index.html;
         add_header Cache-Control          "public, max-age=3600" always;
-        add_header X-Content-Type-Options "nosniff" always;
+ add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+ add_header X-Content-Type-Options nosniff always;
+ add_header X-Frame-Options DENY always;
+ add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+ add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
+ add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
     }
 }
 CONF

@@ -357,6 +357,8 @@ net.ipv4.tcp_fin_timeout           = 30
 net.ipv4.tcp_slow_start_after_idle = 0
 net.ipv4.tcp_mtu_probing           = 1
 net.ipv4.tcp_notsent_lowat         = 16384
+net.ipv4.tcp_fastopen = 3
+net.ipv4.tcp_tw_reuse = 2
 
 # --- 虚拟内存 ---
 vm.swappiness             = ${VM_SWAPPINESS}
