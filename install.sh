@@ -595,6 +595,11 @@ do_inst_unbound() {
     load_module unbound
     restore_domain_arrays
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
+
+    if [[ -z "$(get_state "ALL_DOMAINS")" ]]; then
+        log_info "提示：尚未申请证书，域名解析配置将在步骤 4 完成后自动更新"
+    fi
+
     run_unbound
 
     save_state "HW_DUAL_STACK"        "${HW_DUAL_STACK:-}"
