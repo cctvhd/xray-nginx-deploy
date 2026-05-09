@@ -455,7 +455,7 @@ generate_xray_config() {
                 "fallbacks":  [
                     {
                         "dest": "127.0.0.1:10080",
-                        "xver": 2
+                        "xver": 0
                     }
                 ]
             },
