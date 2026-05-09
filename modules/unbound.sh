@@ -229,33 +229,66 @@ get_effective_mem_gb() {
     else awk -v m="$mem_mb" 'BEGIN { print int(m/1024) }'; fi
 }
 
-# ── 构建自有域名透传块 ───────────────────────────────────────
-_build_own_domain_zones() {
-    local domains=()
-    local d
-    for d in \
-        "${XHTTP_DOMAIN:-}"   \
-        "${GRPC_DOMAIN:-}"    \
-        "${REALITY_DOMAIN:-}" \
-        "${ANYTLS_DOMAIN:-}"; do
-        [[ -z "$d" ]] && continue
-        local already=0
-        local existing
-        for existing in "${domains[@]+"${domains[@]}"}"; do
-            [[ "$existing" == "$d" ]] && already=1 && break
-        done
-        [[ $already -eq 0 ]] && domains+=("$d")
-    done
+# ── 获取服务器 IP ───────────────────────────────────────────
+_get_server_ipv4() {
+    ip -o -4 addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1
+}
 
-    if [[ ${#domains[@]} -eq 0 ]]; then
-        echo "    # 暂无自有域名透传配置"
-        return
+_get_server_ipv6() {
+    ip -o -6 addr show scope global 2>/dev/null | grep -v ' fe80:' | awk '{print $4}' | cut -d/ -f1 | head -1
+}
+
+# ── 构建自有域名内部解析 ──────────────────────────────────────
+_build_own_domain_zones() {
+    local reality_domain anytls_domain cdn_str
+    reality_domain=$(get_state "REALITY_DOMAIN" "")
+    anytls_domain=$(get_state "ANYTLS_DOMAIN" "")
+    cdn_str=$(get_state "CDN_DOMAINS" "")
+
+    local server_ipv4 server_ipv6
+    server_ipv4=$(_get_server_ipv4)
+    server_ipv6=$(_get_server_ipv6)
+
+    echo "    # === 自有域名内部解析 ==="
+
+    # Reality 域名：static zone + A/AAAA 记录
+    if [[ -n "$reality_domain" ]]; then
+        echo "    local-zone: \"${reality_domain}.\" static"
+        if [[ -n "$server_ipv4" ]]; then
+            echo "    local-data: \"${reality_domain}. 300 IN A ${server_ipv4}\""
+        fi
+        if [[ -n "$server_ipv6" ]]; then
+            echo "    local-data: \"${reality_domain}. 300 IN AAAA ${server_ipv6}\""
+        fi
     fi
 
-    echo "    # === 自有域名透传（直连/不拦截）==="
-    for d in "${domains[@]}"; do
-        echo "    local-zone: \"${d}.\" transparent"
-    done
+    # AnyTLS 域名：static zone + A/AAAA 记录
+    if [[ -n "$anytls_domain" ]]; then
+        echo "    local-zone: \"${anytls_domain}.\" static"
+        if [[ -n "$server_ipv4" ]]; then
+            echo "    local-data: \"${anytls_domain}. 300 IN A ${server_ipv4}\""
+        fi
+        if [[ -n "$server_ipv6" ]]; then
+            echo "    local-data: \"${anytls_domain}. 300 IN AAAA ${server_ipv6}\""
+        fi
+    fi
+
+    # CDN 域名：只标注注释，不做本地解析
+    if [[ -n "$cdn_str" ]]; then
+        local cdn_domains=()
+        read -ra cdn_domains <<< "$cdn_str"
+        echo ""
+        echo "    # === CDN 域名（不做本地解析，走上游 CDN）==="
+        local cdn_d
+        for cdn_d in "${cdn_domains[@]}"; do
+            [[ -z "$cdn_d" ]] && continue
+            echo "    # CDN 域名: ${cdn_d}"
+        done
+    fi
+
+    if [[ -z "$reality_domain" && -z "$anytls_domain" && -z "$cdn_str" ]]; then
+        echo "    # 暂无自有域名配置"
+    fi
 }
 
 # ── 生成主配置 /etc/unbound/unbound.conf ────────────────────
@@ -382,15 +415,6 @@ server:
     local-zone: "127.in-addr.arpa." static
     local-zone: "0.0.0.0/8." static
     local-zone: "ip6.arpa." transparent
-
-    # === CDN 透传优化 ===
-    local-zone: "cdnjs.cloudflare.com." transparent
-    local-zone: "ajax.cloudflare.com." transparent
-    local-zone: "ajax.googleapis.com." transparent
-    local-zone: "fonts.googleapis.com." transparent
-    local-zone: "fonts.gstatic.com." transparent
-    local-zone: "googleapis.com." transparent
-    local-zone: "gstatic.com." transparent
 
 ${own_domain_zones}
 
