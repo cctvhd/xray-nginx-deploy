@@ -1,0 +1,199 @@
+{
+    "log": {
+        "loglevel": "warn",
+        "access":   "none",
+        "error":    "/var/log/xray/error.log"
+    },
+
+    "dns": {
+        "servers": [
+            {
+                "tag":      "local-dns",
+                "address":  "localhost",
+                "port":     53,
+                "domains":  [
+                    "geosite:geolocation-!cn",
+                    "geosite:google",
+                    "geosite:github",
+                    "geosite:cloudflare",
+                    "geosite:netflix",
+                    "geosite:openai"
+                ],
+                "expectIPs":    ["geoip:!cn"],
+                "skipFallback": true
+            },
+            {
+                "tag":      "warp-dns",
+                "address":  "1.1.1.1",
+                "domains":  [
+                    "geosite:cn",
+                    "geosite:tld-cn"
+                ],
+                "expectIPs": ["geoip:cn"],
+                "proxyTag":  "warp"
+            }
+        ],
+        "disableCache":    false,
+        "disableFallback": true,
+        "queryStrategy":   "UseIPv6v4"
+    },
+
+    "routing": {
+        "domainStrategy": "IPIfNonMatch",
+        "rules": [
+            {
+                "type":        "field",
+                "ip":          ["geoip:private"],
+                "outboundTag": "block"
+            },
+            {
+                "type":        "field",
+                "domain":      ["geosite:cn", "geosite:tld-cn"],
+                "outboundTag": "warp"
+            },
+            {
+                "type":        "field",
+                "ip":          ["geoip:cn"],
+                "outboundTag": "warp"
+            }
+        ]
+    },
+
+    "inbounds": [
+        {
+            "tag":      "vless-xhttp-cdn",
+            "listen":   "127.0.0.1",
+            "port":     8001,
+            "protocol": "vless",
+            "settings": {
+                "clients":     [{"id": "66d3c50e-41cc-4a85-85e3-0e7151f6e106"}],
+                "decryption":  "none"
+            },
+            "streamSettings": {
+                "network":  "xhttp",
+                "security": "none",
+                "xhttpSettings": {
+                    "path": "/98eb0d08b5574ea7b4a3f8e302064540",
+                    "host": "ca.ccpv.tk",
+                    "extra": {
+                        "enc":           "packet",
+                        "xPaddingBytes": "100-1000",
+                        "headers":       {"User-Agent": "chrome"}
+                    }
+                },
+                "sockopt": {
+                    "trustedXForwardedFor": ["127.0.0.1", "::1"]
+                }
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": false
+            }
+        },
+
+        {
+            "tag":      "vless-grpc-cdn",
+            "listen":   "127.0.0.1",
+            "port":     8002,
+            "protocol": "vless",
+            "settings": {
+                "clients":    [{"id": "66d3c50e-41cc-4a85-85e3-0e7151f6e106"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network":  "grpc",
+                "security": "none",
+                "grpcSettings": {
+                    "serviceName":          "grpc.Service",
+                    "multiMode":            true,
+                    "idle_timeout":         60,
+                    "health_check_timeout": 20
+                }
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": false
+            }
+        },
+
+        {
+            "tag":      "reality-direct",
+            "listen":   "127.0.0.1",
+            "port":     9443,
+            "protocol": "vless",
+            "settings": {
+                "clients": [
+                    {
+                        "id":   "66d3c50e-41cc-4a85-85e3-0e7151f6e106",
+                        "flow": "xtls-rprx-vision"
+                    }
+                ],
+                "decryption": "none",
+                "fallbacks":  [
+                    {"dest": "127.0.0.1:10080", "xver": 0}
+                ]
+            },
+            "streamSettings": {
+                "network":  "tcp",
+                "security": "reality",
+                "realitySettings": {
+                    "show":        false,
+                    "dest":        "solanolibrary.com:443",
+                    "xver":        0,
+                    "serverNames": ["lax.shoes-bv.tk","solanolibrary.com","openclaw.ai","www.lapl.org","www.siliconvalley.com","www.oxy.edu","business.ca.gov","film.ca.gov"],
+                    "privateKey":  "qPvNiBLnFFGkIoUZ6LAaIJXHqHWT4zTEHE3uroUbz1A",
+                    "shortIds":    ["","2553efad","c58936c1","5bcd590b","b785d3cffaed","bbf028ba700fb8f8"],
+                    "spiderX":     "/api/health"
+                },
+                "sockopt": {
+                    "acceptProxyProtocol": true
+                }
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": false
+            }
+        }
+    ],
+
+    "outbounds": [
+        {
+            "tag":      "direct",
+            "protocol": "freedom",
+            "settings": {
+                "domainStrategy": "UseIPv6v4"
+            },
+            "streamSettings": {
+                "sockopt": {
+                    "tcpUserTimeout":       30000,
+                    "tcpKeepAliveIdle":     300,
+                    "tcpKeepAliveInterval": 30
+                }
+            }
+        },
+        {
+            "tag":      "block",
+            "protocol": "blackhole"
+        },
+        {
+            "tag":      "warp",
+            "protocol": "wireguard",
+            "settings": {
+                "secretKey": "kJATOBFMkz4OgkUOpOFVJkhzDo4/IkeZ4NCCz+1dWVA=",
+                "address":   ["172.16.0.2/32", "2606:4700:110:8529:1a10:13d1:aa2f:5ad5/128"],
+                "peers": [
+                    {
+                        "publicKey":  "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
+                        "endpoint":   "engage.cloudflareclient.com:2408",
+                        "allowedIPs": ["0.0.0.0/0"]
+                    }
+                ],
+                "mtu":            1280,
+                "domainStrategy": "ForceIPv4"
+            }
+        }
+    ]
+}
