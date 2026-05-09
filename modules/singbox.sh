@@ -161,7 +161,7 @@ _build_warp_endpoint_json_sb() {
           "port":        ${WGCF_ENDPOINT_PORT},
           "public_key":  "${WGCF_PEER_PUBKEY}",
           "reserved":    [0, 0, 0],
-          "allowed_ips": ["0.0.0.0/0", "::/0"]
+          "allowed_ips": ["::/0", "0.0.0.0/0"]
         }
       ],
       "mtu": 1280

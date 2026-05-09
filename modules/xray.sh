@@ -259,7 +259,7 @@ _build_warp_outbound_json() {
                     {
                         "publicKey":  "${WGCF_PEER_PUBKEY}",
                         "endpoint":   "${WGCF_ENDPOINT}",
-                        "allowedIPs": ["0.0.0.0/0", "::/0"]
+                        "allowedIPs": ["::/0", "0.0.0.0/0"]
                     }
                 ],
                 "mtu":            1280,
