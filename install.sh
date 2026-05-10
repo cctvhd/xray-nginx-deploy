@@ -1080,13 +1080,18 @@ run_full_install_flow() {
     install_singbox
     save_state "INST_SINGBOX" "1"
 
+    load_module sync
+    sync_restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
     generate_singbox_params
     collect_singbox_params
     generate_singbox_config
     start_singbox
     save_state "SINGBOX_PASSWORD" "${SINGBOX_PASSWORD:-}"
+    save_state "ANYTLS_DOMAIN"     "${ANYTLS_DOMAIN:-}"
     save_state "CONF_SINGBOX"     "1"
+
+    sync_refresh_nginx_routes "Sing-Box"
 
     log_info "全流程安装完成"
 }
