@@ -106,7 +106,9 @@ create_nginx_dirs() {
     chown -R nginx:nginx /var/log/nginx /var/cache/nginx 2>/dev/null || \
     chown -R www-data:www-data /var/log/nginx /var/cache/nginx 2>/dev/null || true
 
-    log_info "目录结构创建完成"
+	# 删除 nginx 官方包自带的默认 server 块，避免与自定义配置冲突
+	rm -f /etc/nginx/conf.d/default.conf
+log_info "目录结构创建完成"
 }
 
 # ── 生成 20880 陷阱端口自签证书（P3修复：让TLS握手能完成）──
