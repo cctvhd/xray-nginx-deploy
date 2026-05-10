@@ -105,6 +105,9 @@ purge_unbound() {
     rm -f  /etc/systemd/system/unbound-root-update.service
     rm -f  /etc/systemd/system/unbound-root-update.timer
     systemctl daemon-reload 2>/dev/null || true
+	# 临时恢复公网 DNS，防止卸载后 resolv.conf 仍指向 127.0.0.1 导致 DNS 中断
+	chattr -i /etc/resolv.conf 2>/dev/null || true
+	echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf
     log_info "Unbound 清理完成"
 }
 
@@ -654,7 +657,8 @@ run_unbound() {
             3)
                 collect_unbound_stack_mode
                 collect_unbound_service_name
-                purge_unbound
+                	trap 'echo -e "nameserver 1.1.1.1\nnameserver 8.8.8.8" > /etc/resolv.conf' EXIT
+	purge_unbound
                 install_unbound
                 disable_systemd_resolved
                 download_root_hints
@@ -662,6 +666,7 @@ run_unbound() {
                 generate_unbound_config
                 init_unbound_control
                 start_unbound
+	trap - EXIT
                 install_root_update_job
                 ;;
             2)
