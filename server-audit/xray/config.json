@@ -35,7 +35,7 @@
         ],
         "disableCache":    false,
         "disableFallback": true,
-        "queryStrategy":   "UseIPv6v4"
+        "queryStrategy":   "UseIPv4v6"
     },
 
     "routing": {
@@ -66,19 +66,27 @@
             "port":     8001,
             "protocol": "vless",
             "settings": {
-                "clients":     [{"id": "66d3c50e-41cc-4a85-85e3-0e7151f6e106"}],
+                "clients":     [{"id": "94832c11-9f9b-4197-a796-ecac49a77fac"}],
                 "decryption":  "none"
             },
             "streamSettings": {
                 "network":  "xhttp",
                 "security": "none",
                 "xhttpSettings": {
-                    "path": "/98eb0d08b5574ea7b4a3f8e302064540",
-                    "host": "ca.ccpv.tk",
+                    "path": "/c028cb9083544ea3ae6d62fc505c5251",
+                    "host": "dn.zhongning.tk",
                     "extra": {
                         "enc":           "packet",
                         "xPaddingBytes": "100-1000",
-                        "headers":       {"User-Agent": "chrome"}
+                        "headers":       {"User-Agent": "chrome"},
+                        "xmux": {
+                            "maxConcurrency":   "4-8",
+                            "maxConnections":   0,
+                            "cMaxReuseTimes":   150,
+                            "hMaxRequestTimes": "150-300",
+                            "hMaxReusableSecs": "1800-3600",
+                            "hKeepAlivePeriod": 60
+                        }
                     }
                 },
                 "sockopt": {
@@ -98,7 +106,7 @@
             "port":     8002,
             "protocol": "vless",
             "settings": {
-                "clients":    [{"id": "66d3c50e-41cc-4a85-85e3-0e7151f6e106"}],
+                "clients":    [{"id": "94832c11-9f9b-4197-a796-ecac49a77fac"}],
                 "decryption": "none"
             },
             "streamSettings": {
@@ -107,7 +115,7 @@
                 "grpcSettings": {
                     "serviceName":          "grpc.Service",
                     "multiMode":            true,
-                    "idle_timeout":         60,
+                    "idle_timeout":         80,
                     "health_check_timeout": 20
                 }
             },
@@ -126,13 +134,16 @@
             "settings": {
                 "clients": [
                     {
-                        "id":   "66d3c50e-41cc-4a85-85e3-0e7151f6e106",
+                        "id":   "94832c11-9f9b-4197-a796-ecac49a77fac",
                         "flow": "xtls-rprx-vision"
                     }
                 ],
                 "decryption": "none",
                 "fallbacks":  [
-                    {"dest": "127.0.0.1:10080", "xver": 0}
+                    {
+                        "dest": "127.0.0.1:10080",
+                        "xver": 0
+                    }
                 ]
             },
             "streamSettings": {
@@ -140,15 +151,18 @@
                 "security": "reality",
                 "realitySettings": {
                     "show":        false,
-                    "dest":        "solanolibrary.com:443",
+                    "dest":        "www.siliconvalley.com:443",
                     "xver":        0,
-                    "serverNames": ["lax.shoes-bv.tk","solanolibrary.com","openclaw.ai","www.lapl.org","www.siliconvalley.com","www.oxy.edu","business.ca.gov","film.ca.gov"],
-                    "privateKey":  "qPvNiBLnFFGkIoUZ6LAaIJXHqHWT4zTEHE3uroUbz1A",
-                    "shortIds":    ["","2553efad","c58936c1","5bcd590b","b785d3cffaed","bbf028ba700fb8f8"],
+                    "serverNames": ["la.zhongning.tk","www.siliconvalley.com","solanolibrary.com","www.oxy.edu","business.ca.gov"],
+                    "privateKey":  "oLfAnST4louxVq1-pG5ZCNryZPGIfzQGC_g8LpGUbFI",
+                    "shortIds":    ["7a5a0d2e","e9d281e6","dd16d0a3","24f191da4556","ec316b793239a7e4"],
                     "spiderX":     "/api/health"
                 },
                 "sockopt": {
-                    "acceptProxyProtocol": true
+                    "acceptProxyProtocol": true,
+                    "tcpUserTimeout":       30000,
+                    "tcpKeepAliveIdle":     300,
+                    "tcpKeepAliveInterval": 30
                 }
             },
             "sniffing": {
@@ -164,7 +178,7 @@
             "tag":      "direct",
             "protocol": "freedom",
             "settings": {
-                "domainStrategy": "UseIPv6v4"
+                "domainStrategy": "ForceIPv4v6"
             },
             "streamSettings": {
                 "sockopt": {
@@ -178,21 +192,21 @@
             "tag":      "block",
             "protocol": "blackhole"
         },
-        {
+                {
             "tag":      "warp",
             "protocol": "wireguard",
             "settings": {
-                "secretKey": "kJATOBFMkz4OgkUOpOFVJkhzDo4/IkeZ4NCCz+1dWVA=",
-                "address":   ["172.16.0.2/32", "2606:4700:110:8529:1a10:13d1:aa2f:5ad5/128"],
+                "secretKey": "2I7qMPoX0SJq53Gq0Dvbgoa/F6UAUjmmcjisUnu4j0c=",
+                "address":   ["172.16.0.2/32","2606:4700:110:8de9:94de:37ee:b0aa:31a8/128"],
                 "peers": [
                     {
                         "publicKey":  "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
                         "endpoint":   "engage.cloudflareclient.com:2408",
-                        "allowedIPs": ["0.0.0.0/0"]
+                        "allowedIPs": ["::/0", "0.0.0.0/0"]
                     }
                 ],
                 "mtu":            1280,
-                "domainStrategy": "ForceIPv4"
+                "domainStrategy": "ForceIPv4v6"
             }
         }
     ]

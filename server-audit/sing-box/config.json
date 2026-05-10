@@ -35,7 +35,7 @@
       "listen_port": 8443,
       "users": [
         {
-          "password": "6rAS03lKxhYnJRwd1Hcb-2e21be83"
+          "password": "JjRYrjfqGJweOu7gNP9U#ce5eb26f"
         }
       ],
       "padding_scheme": [
@@ -51,9 +51,9 @@
       ],
       "tls": {
         "enabled":          true,
-        "server_name":      "la.ccpv.tk",
-        "certificate_path": "/etc/letsencrypt/live/ccpv.tk/fullchain.pem",
-        "key_path":         "/etc/letsencrypt/live/ccpv.tk/privkey.pem",
+        "server_name":      "cia.zhongning.cf",
+        "certificate_path": "/etc/letsencrypt/live/zhongning.cf/fullchain.pem",
+        "key_path":         "/etc/letsencrypt/live/zhongning.cf/privkey.pem",
         "alpn":             ["h2", "http/1.1"],
         "min_version":      "1.3",
         "max_version":      "1.3"
@@ -64,15 +64,15 @@
         {
       "type":        "wireguard",
       "tag":         "warp",
-      "address":     ["172.16.0.2/32","2606:4700:110:8529:1a10:13d1:aa2f:5ad5/128"],
-      "private_key": "kJATOBFMkz4OgkUOpOFVJkhzDo4/IkeZ4NCCz+1dWVA=",
+      "address":     ["172.16.0.2/32","2606:4700:110:8de9:94de:37ee:b0aa:31a8/128"],
+      "private_key": "2I7qMPoX0SJq53Gq0Dvbgoa/F6UAUjmmcjisUnu4j0c=",
       "peers": [
         {
           "address":     "engage.cloudflareclient.com",
           "port":        2408,
           "public_key":  "bmXOC+F1FxEMF9dyiK2H5/1SUtzH0JuVo51h2wPfgyo=",
           "reserved":    [0, 0, 0],
-          "allowed_ips": ["0.0.0.0/0", "::/0"]
+          "allowed_ips": ["::/0", "0.0.0.0/0"]
         }
       ],
       "mtu": 1280
