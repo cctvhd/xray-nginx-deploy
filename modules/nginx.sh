@@ -790,7 +790,7 @@ listen 127.0.0.1:10080;
         proxy_http_version      1.1;
         proxy_set_header        Connection "";
         proxy_set_header        Host \$host;
- # fallback 经 xver=0 转发，无 proxy_protocol，使用 $final_real_ip 获取真实 IP
+ # fallback 经 xver=0 转发，无 proxy_protocol，使用 \$final_real_ip 获取真实 IP
         proxy_set_header        X-Real-IP \$final_real_ip;
         proxy_set_header        X-Forwarded-For \$final_real_ip;
         proxy_buffering         off;
