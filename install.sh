@@ -139,9 +139,9 @@ _sync_inst_state() {
     command -v sing-box &>/dev/null && [[ "$(get_step INST_SINGBOX)" != "1" ]] && save_state "INST_SINGBOX" "1" || true
     command -v wgcf     &>/dev/null && [[ "$(get_step INST_WARP)"    != "1" ]] && save_state "INST_WARP"    "1" || true
     command -v unbound  &>/dev/null && [[ "$(get_step INST_UNBOUND)" != "1" ]] && save_state "INST_UNBOUND" "1" || true
-    systemctl is-active --quiet nginx    2>/dev/null && [[ "$(get_step CONF_NGINX)"   != "1" ]] && save_state "CONF_NGINX"   "1" || true
-    systemctl is-active --quiet xray     2>/dev/null && [[ "$(get_step CONF_XRAY)"    != "1" ]] && save_state "CONF_XRAY"    "1" || true
-    systemctl is-active --quiet sing-box 2>/dev/null && [[ "$(get_step CONF_SINGBOX)" != "1" ]] && save_state "CONF_SINGBOX" "1" || true
+    systemctl is-active --quiet nginx    2>/dev/null && [[ -f /etc/nginx/conf.d/servers.conf ]] && [[ "$(get_step CONF_NGINX)"   != "1" ]] && save_state "CONF_NGINX"   "1" || true
+    systemctl is-active --quiet xray     2>/dev/null && [[ -f /usr/local/etc/xray/config.json ]]    && [[ "$(get_step CONF_XRAY)"    != "1" ]] && save_state "CONF_XRAY"    "1" || true
+    systemctl is-active --quiet sing-box 2>/dev/null && [[ -f /etc/sing-box/config.json ]]          && [[ "$(get_step CONF_SINGBOX)" != "1" ]] && save_state "CONF_SINGBOX" "1" || true
     [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]] && \
         [[ "$(get_step CONF_WARP)" != "1" ]] && save_state "CONF_WARP" "1" || true
     _sync_cert_state
@@ -381,15 +381,15 @@ show_status() {
       && s_warp="OK"    || s_warp="--"
 
     { [[ "$(get_step CONF_NGINX)"   == "1" ]] || \
-      systemctl is-active --quiet nginx 2>/dev/null; } \
+      ( systemctl is-active --quiet nginx 2>/dev/null && [[ -f /etc/nginx/conf.d/servers.conf ]] ); } \
       && c_nginx="OK"   || c_nginx="--"
 
     { [[ "$(get_step CONF_XRAY)"    == "1" ]] || \
-      systemctl is-active --quiet xray 2>/dev/null; } \
+      ( systemctl is-active --quiet xray 2>/dev/null && [[ -f /usr/local/etc/xray/config.json ]] ); } \
       && c_xray="OK"    || c_xray="--"
 
     { [[ "$(get_step CONF_SINGBOX)" == "1" ]] || \
-      systemctl is-active --quiet sing-box 2>/dev/null; } \
+      ( systemctl is-active --quiet sing-box 2>/dev/null && [[ -f /etc/sing-box/config.json ]] ); } \
       && c_singbox="OK" || c_singbox="--"
 
     { [[ "$(get_step CONF_WARP)"    == "1" ]] || \
@@ -758,6 +758,7 @@ do_conf_nginx() {
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
+    generate_trap_cert
     generate_fallback_conf
     generate_servers_conf
     generate_nginx_conf
@@ -850,8 +851,7 @@ do_conf_singbox() {
     fi
 
     load_os_info
-    load_module sync
-    sync_restore_domain_arrays
+    restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
 
     _ensure_wgcf
@@ -1075,6 +1075,7 @@ run_full_install_flow() {
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
+    generate_trap_cert
     generate_fallback_conf
     generate_servers_conf
     generate_nginx_conf
@@ -1088,8 +1089,7 @@ run_full_install_flow() {
     install_singbox
     save_state "INST_SINGBOX" "1"
 
-    load_module sync
-    sync_restore_domain_arrays
+    restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
     generate_singbox_params
     collect_singbox_params
