@@ -401,6 +401,12 @@ generate_custom_config() {
 
     rm -f "/etc/unbound/conf.d/${UNBOUND_SERVICE_NAME}.conf"
 
+	# 清理 unbound 包自带或残留的配置文件，避免与脚本主配置冲突
+	rm -f /etc/unbound/conf.d/remote-control.conf
+	rm -f /etc/unbound/conf.d/example.com.conf
+	rm -f /etc/unbound/conf.d/unbound-local-root.conf
+	rm -f /etc/unbound/unbound-local-root.conf
+
     local own_domain_zones
     own_domain_zones=$(_build_own_domain_zones)
 
