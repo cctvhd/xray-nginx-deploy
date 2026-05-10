@@ -527,6 +527,7 @@ CONF
 start_xray() {
     log_step "启动 Xray 服务..."
 
+mkdir -p /var/log/xray
     if ! xray run -test -config /usr/local/etc/xray/config.json; then
         log_error "Xray 配置验证失败"
         exit 1

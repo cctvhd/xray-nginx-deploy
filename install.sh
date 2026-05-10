@@ -1117,24 +1117,12 @@ do_reconf_nginx() {
 	load_module uninstall
 
 	log_step "清理 Nginx 配置文件..."
-	local domain
-	restore_domain_arrays
-
-	rm -f /usr/local/bin/update_cf_ip.sh
-	rm -f /etc/cron.weekly/update_cf_ip
-	rm -rf /var/backups/nginx
-	remove_crontab_entry "update_cf_ip.sh"
-
 	rm -f /etc/nginx/cloudflare_real_ip.conf
 	rm -rf /etc/nginx/ssl
 	rm -f /etc/nginx/conf.d/00-upstreams.conf
 	rm -f /etc/nginx/conf.d/fallback.conf
 	rm -f /etc/nginx/conf.d/servers.conf
 	rm -f /etc/nginx/nginx.conf
-	rm -rf /var/www/html
-	for domain in "${ALL_DOMAINS[@]:-}"; do
-		rm -rf "/var/www/${domain}"
-	done
 
 	save_state "INST_NGINX" "0"
 	save_state "CONF_NGINX" "0"
@@ -1150,8 +1138,7 @@ do_reconf_xray() {
 	load_module uninstall
 
 	log_step "清理 Xray 配置文件..."
-	rm -rf /usr/local/etc/xray
-	rm -rf /var/log/xray
+	rm -f /usr/local/etc/xray/config.json
 
 	save_state "INST_XRAY" "0"
 	save_state "CONF_XRAY" "0"
@@ -1167,8 +1154,7 @@ do_reconf_singbox() {
 	load_module uninstall
 
 	log_step "清理 Sing-Box 配置文件..."
-	rm -rf /etc/sing-box
-	rm -rf /var/lib/sing-box
+	rm -f /etc/sing-box/config.json
 
 	save_state "INST_SINGBOX" "0"
 	save_state "CONF_SINGBOX" "0"
