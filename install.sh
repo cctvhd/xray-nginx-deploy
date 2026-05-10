@@ -1124,7 +1124,6 @@ do_reconf_nginx() {
 	rm -f /etc/nginx/conf.d/servers.conf
 	rm -f /etc/nginx/nginx.conf
 
-	save_state "INST_NGINX" "0"
 	save_state "CONF_NGINX" "0"
 	log_info "Nginx 配置清理完成，开始重新生成..."
 
@@ -1140,7 +1139,6 @@ do_reconf_xray() {
 	log_step "清理 Xray 配置文件..."
 	rm -f /usr/local/etc/xray/config.json
 
-	save_state "INST_XRAY" "0"
 	save_state "CONF_XRAY" "0"
 	log_info "Xray 配置清理完成，开始重新生成..."
 
@@ -1156,7 +1154,6 @@ do_reconf_singbox() {
 	log_step "清理 Sing-Box 配置文件..."
 	rm -f /etc/sing-box/config.json
 
-	save_state "INST_SINGBOX" "0"
 	save_state "CONF_SINGBOX" "0"
 	log_info "Sing-Box 配置清理完成，开始重新生成..."
 
