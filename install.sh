@@ -462,6 +462,9 @@ main_menu() {
     echo "  7. 配置 Nginx"
     echo "  8. 配置 Xray"
     echo "  9. 配置 Sing-Box"
+	echo " n. 重新配置 Nginx（先清理再生成）"
+	echo " x. 重新配置 Xray（先清理再生成）"
+	echo " g. 重新配置 Sing-Box（先清理再生成）"
     echo ""
     echo "  === 其他 ==="
     echo "  a. 生成客户端链接"
@@ -488,6 +491,9 @@ main_menu() {
         7) do_conf_nginx ;;
         8) do_conf_xray ;;
         9) do_conf_singbox ;;
+      n|N) do_reconf_nginx ;;
+      x|X) do_reconf_xray ;;
+      g|G) do_reconf_singbox ;;
         a|A) do_client ;;
         b|B)
             show_status
@@ -1101,6 +1107,74 @@ run_full_install_flow() {
 do_full_install() {
     run_full_install_flow
     done_return
+}
+
+# ── 重新配置（先清理配置再重新生成）─────────────────────
+do_reconf_nginx() {
+	read -rp "将清理 Nginx 配置并重新生成，确认继续吗？[y/N]: " c
+	[[ "${c,,}" != "y" ]] && main_menu && return
+
+	load_module uninstall
+
+	log_step "清理 Nginx 配置文件..."
+	local domain
+	restore_domain_arrays
+
+	rm -f /usr/local/bin/update_cf_ip.sh
+	rm -f /etc/cron.weekly/update_cf_ip
+	rm -rf /var/backups/nginx
+	remove_crontab_entry "update_cf_ip.sh"
+
+	rm -f /etc/nginx/cloudflare_real_ip.conf
+	rm -rf /etc/nginx/ssl
+	rm -f /etc/nginx/conf.d/00-upstreams.conf
+	rm -f /etc/nginx/conf.d/fallback.conf
+	rm -f /etc/nginx/conf.d/servers.conf
+	rm -f /etc/nginx/nginx.conf
+	rm -rf /var/www/html
+	for domain in "${ALL_DOMAINS[@]:-}"; do
+		rm -rf "/var/www/${domain}"
+	done
+
+	save_state "INST_NGINX" "0"
+	save_state "CONF_NGINX" "0"
+	log_info "Nginx 配置清理完成，开始重新生成..."
+
+	do_conf_nginx
+}
+
+do_reconf_xray() {
+	read -rp "将清理 Xray 配置并重新生成，确认继续吗？[y/N]: " c
+	[[ "${c,,}" != "y" ]] && main_menu && return
+
+	load_module uninstall
+
+	log_step "清理 Xray 配置文件..."
+	rm -rf /usr/local/etc/xray
+	rm -rf /var/log/xray
+
+	save_state "INST_XRAY" "0"
+	save_state "CONF_XRAY" "0"
+	log_info "Xray 配置清理完成，开始重新生成..."
+
+	do_conf_xray
+}
+
+do_reconf_singbox() {
+	read -rp "将清理 Sing-Box 配置并重新生成，确认继续吗？[y/N]: " c
+	[[ "${c,,}" != "y" ]] && main_menu && return
+
+	load_module uninstall
+
+	log_step "清理 Sing-Box 配置文件..."
+	rm -rf /etc/sing-box
+	rm -rf /var/lib/sing-box
+
+	save_state "INST_SINGBOX" "0"
+	save_state "CONF_SINGBOX" "0"
+	log_info "Sing-Box 配置清理完成，开始重新生成..."
+
+	do_conf_singbox
 }
 
 do_reinstall_all() {
