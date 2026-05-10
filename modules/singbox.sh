@@ -79,10 +79,8 @@ https://deb.sagernet.org/ * *" \
 generate_singbox_params() {
     log_step "生成 Sing-Box 参数..."
 
-    local state_file="/etc/xray-deploy/config.env"
     local saved_password
-    saved_password=$(grep "^SINGBOX_PASSWORD=" "${state_file}" 2>/dev/null | \
-        cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//")
+    saved_password=$(get_state "SINGBOX_PASSWORD" "")
 
     if [[ -n "${saved_password}" ]]; then
         SINGBOX_PASSWORD="${saved_password}"

@@ -813,6 +813,7 @@ do_conf_xray() {
     # ── BUG FIX：保存完整 serverNames 数组供 nginx 生成 SNI map 使用 ──
     save_state "REALITY_SERVER_NAMES"  "${REALITY_SERVER_NAMES[*]:-}"
     save_state "REALITY_SHORT_ID"      "${REALITY_SHORT_IDS[1]:-}"
+    save_state "REALITY_SHORT_IDS" "${REALITY_SHORT_IDS[*]:-}"
     save_state "REALITY_SPIDER_X"      "${REALITY_SPIDER_X:-}"
     save_state "CONF_XRAY"             "1"
 
@@ -1053,6 +1054,7 @@ run_full_install_flow() {
     save_state "REALITY_DEST"         "${REALITY_DEST:-}"
     save_state "REALITY_SNI"          "${REALITY_SERVER_NAMES[0]:-}"
     save_state "REALITY_SERVER_NAMES" "${REALITY_SERVER_NAMES[*]:-}"
+    save_state "REALITY_SHORT_IDS" "${REALITY_SHORT_IDS[*]:-}"
     save_state "REALITY_SHORT_ID"     "${REALITY_SHORT_IDS[1]:-}"
     save_state "REALITY_SPIDER_X"     "${REALITY_SPIDER_X:-}"
     save_state "CONF_XRAY"            "1"
