@@ -682,42 +682,71 @@ request_certificates() {
         log_info "申请证书: *.${root_domain}"
         log_info "使用凭证: $ini_file"
 
-        local certbot_output certbot_rc
-        if certbot_output=$(certbot certonly \
-            --dns-cloudflare \
-            --dns-cloudflare-credentials "$ini_file" \
-            --dns-cloudflare-propagation-seconds 30 \
-            -d "${root_domain}" \
-            -d "*.${root_domain}" \
-            --email "admin@${root_domain}" \
-            --agree-tos \
-            --non-interactive \
-            --expand 2>&1); then
-            certbot_rc=0
-        else
-            certbot_rc=$?
-        fi
+        local attempt=0 max_attempts=3 certbot_output certbot_rc
+        while (( attempt < max_attempts )); do
+            ((attempt++))
+            log_info "证书申请尝试 ${attempt}/${max_attempts}: *.${root_domain}"
 
-        while IFS= read -r line; do
-            echo "  $line"
-        done <<< "$certbot_output"
+            if certbot_output=$(certbot certonly \
+                --dns-cloudflare \
+                --dns-cloudflare-credentials "$ini_file" \
+                --dns-cloudflare-propagation-seconds 30 \
+                -d "${root_domain}" \
+                -d "*.${root_domain}" \
+                --email "admin@${root_domain}" \
+                --agree-tos \
+                --non-interactive \
+                --expand 2>&1); then
+                certbot_rc=0
+            else
+                certbot_rc=$?
+            fi
 
-        if [[ $certbot_rc -eq 0 && -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
-            log_info "证书申请成功: *.${root_domain}"
-            CERT_SUCCESS_ROOTS+=("$root_domain")
-            ROOT_DOMAIN_DONE["$root_domain"]="success"
-        else
-            log_error "证书申请失败: ${root_domain}"
-            log_warn "certbot 退出码: ${certbot_rc}"
-            CERT_FAILED_ROOTS+=("$root_domain")
-            FAILED_CF_ACCOUNTS+=("$root_domain")   # 存根域名，汇总时直接定位到对应 ini
-            ROOT_DOMAIN_DONE["$root_domain"]="failed"  # ← 防止同根域名重试
-            log_warn "请检查："
-            echo "  1. 域名是否在该CF账号下: ${ini_file}"
-            echo "  2. API Token 是否有 Zone:DNS:Edit 权限"
-            echo "  3. 域名是否已添加到CF"
-            echo "  4. 上面 certbot 输出中的具体报错"
-        fi
+            while IFS= read -r line; do
+                echo "  $line"
+            done <<< "$certbot_output"
+
+            if [[ $certbot_rc -eq 0 && -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
+                log_info "证书申请成功: *.${root_domain} (第 ${attempt} 次尝试)"
+                CERT_SUCCESS_ROOTS+=("$root_domain")
+                ROOT_DOMAIN_DONE["$root_domain"]="success"
+                break
+            fi
+
+            # ── 检测 LE 限流 ─────────────────────────────────
+            local rate_limit_hint=""
+            if echo "$certbot_output" | grep -qi "too many certificates already issued\|rate limit"; then
+                rate_limit_hint="Let's Encrypt 限流：该域名本周已申请超过 5 张重复证书，请等待 7 天后重试。"
+            elif echo "$certbot_output" | grep -qi "too many failed authorizations\|too many invalid"; then
+                rate_limit_hint="Let's Encrypt 限流：一小时内有过多失败验证，已被暂停。请等待 1 小时后重试。"
+            elif echo "$certbot_output" | grep -qi "too many registrations\|too many accounts\|too many new orders"; then
+                rate_limit_hint="Let's Encrypt 限流：请求频率过高。请等待一段时间后重试。"
+            elif echo "$certbot_output" | grep -qi "429"; then
+                rate_limit_hint="HTTP 429 检测到限流响应，可能是 Let's Encrypt 或 Cloudflare 触发了频率限制。"
+            fi
+
+            if (( attempt >= max_attempts )); then
+                log_error "证书申请失败: ${root_domain}（已重试 ${max_attempts} 次）"
+                log_warn "certbot 退出码: ${certbot_rc}"
+                CERT_FAILED_ROOTS+=("$root_domain")
+                FAILED_CF_ACCOUNTS+=("$root_domain")
+                ROOT_DOMAIN_DONE["$root_domain"]="failed"
+                if [[ -n "$rate_limit_hint" ]]; then
+                    log_error "${rate_limit_hint}"
+                fi
+                log_warn "请检查："
+                echo "  1. 域名是否在该CF账号下: ${ini_file}"
+                echo "  2. API Token 是否有 Zone:DNS:Edit 权限"
+                echo "  3. 域名是否已添加到CF"
+                echo "  4. 上面 certbot 输出中的具体报错"
+            else
+                if [[ -n "$rate_limit_hint" ]]; then
+                    log_warn "检测到限流，${rate_limit_hint}"
+                fi
+                log_warn "证书申请失败（退出码: ${certbot_rc}），60秒后重试..."
+                sleep 60
+            fi
+        done
     done
 
     save_cert_request_status

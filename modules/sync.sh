@@ -135,6 +135,7 @@ sync_refresh_nginx_routes() {
     if [[ -n "${GRPC_DOMAIN:-}" ]]; then
         generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
     fi
+    generate_trap_cert
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf

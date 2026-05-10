@@ -41,11 +41,8 @@ LIMITS
 # ── 生成随机参数 ─────────────────────────────────────────────
 generate_xray_params() {
     log_step "生成 Xray 随机参数..."
-    local state_file="/etc/xray-deploy/config.env"
-
     local saved_uuid
-    saved_uuid=$(grep "^XRAY_UUID=" "${state_file}" 2>/dev/null | \
-        cut -d= -f2 | tr -d "'\"")
+    saved_uuid=$(get_state "XRAY_UUID" "")
     if [[ -n "${saved_uuid}" ]]; then
         XRAY_UUID="${saved_uuid}"
         log_info "复用已有 UUID: ${XRAY_UUID}"
@@ -54,13 +51,19 @@ generate_xray_params() {
         log_info "生成新 UUID: ${XRAY_UUID}"
     fi
 
-    local saved_privkey
-    saved_privkey=$(grep "^XRAY_PRIVATE_KEY=" "${state_file}" 2>/dev/null | \
-        cut -d= -f2 | tr -d "'\"")
+    local saved_privkey saved_pubkey
+    saved_privkey=$(get_state "XRAY_PRIVATE_KEY" "")
+    saved_pubkey=$(get_state "XRAY_PUBLIC_KEY" "")
     if [[ -n "${saved_privkey}" ]]; then
         XRAY_PRIVATE_KEY="${saved_privkey}"
-        XRAY_PUBLIC_KEY=$(grep "^XRAY_PUBLIC_KEY=" "${state_file}" 2>/dev/null | \
-            cut -d= -f2 | tr -d "'\"")
+        if [[ -n "${saved_pubkey}" ]]; then
+            XRAY_PUBLIC_KEY="${saved_pubkey}"
+        else
+            local keypair
+            keypair=$(xray x25519 -i "$XRAY_PRIVATE_KEY" 2>/dev/null)
+            XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
+            log_warn "从私钥重新推导公钥"
+        fi
         log_info "复用已有密钥对"
     else
         local keypair
@@ -71,8 +74,7 @@ generate_xray_params() {
     fi
 
     local saved_path
-    saved_path=$(grep "^XHTTP_PATH=" "${state_file}" 2>/dev/null | \
-        cut -d= -f2 | tr -d "'\"")
+    saved_path=$(get_state "XHTTP_PATH" "")
     if [[ -n "${saved_path}" ]]; then
         XHTTP_PATH="${saved_path}"
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
@@ -88,14 +90,22 @@ generate_xray_params() {
         log_info "生成新 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
-    REALITY_SHORT_IDS=(
-        ""
-        "$(openssl rand -hex 4)"
-        "$(openssl rand -hex 4)"
-        "$(openssl rand -hex 4)"
-        "$(openssl rand -hex 6)"
-        "$(openssl rand -hex 8)"
-    )
+    local saved_short_ids
+    saved_short_ids=$(get_state "REALITY_SHORT_IDS" "")
+    if [[ -n "${saved_short_ids}" ]]; then
+        read -ra REALITY_SHORT_IDS <<< "$saved_short_ids"
+        log_info "复用已有 Short IDs (${#REALITY_SHORT_IDS[@]} 个)"
+    else
+        REALITY_SHORT_IDS=(
+            ""
+            "$(openssl rand -hex 4)"
+            "$(openssl rand -hex 4)"
+            "$(openssl rand -hex 4)"
+            "$(openssl rand -hex 6)"
+            "$(openssl rand -hex 8)"
+        )
+        log_info "生成新 Short IDs"
+    fi
 
     REALITY_SPIDER_X="/api/health"
 

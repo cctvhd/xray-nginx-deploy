@@ -82,12 +82,6 @@ for inb in c['inbounds']:
                 keypair=$(xray x25519 -i "$reality_privkey" 2>/dev/null)
                 XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
             fi
-        elif [[ "${XRAY_PUBLIC_KEY}" != "$(grep -oP '"privateKey":\s*"\K[^"]+' "$xray_config" | head -1)" ]]; then
-            :
-        else
-            local keypair
-            keypair=$(xray x25519 -i "$XRAY_PUBLIC_KEY" 2>/dev/null)
-            XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
         fi
 
         # gRPC 域名从 nginx 配置读取
