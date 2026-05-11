@@ -334,11 +334,6 @@ refresh_unbound_after_cert() {
 
     load_module unbound
 
-    if ! check_unbound_installed; then
-        log_warn "Unbound 已安装但当前未运行，跳过自动刷新，请先执行步骤 2 修复 Unbound"
-        return 0
-    fi
-
     restore_domain_arrays
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
     if refresh_unbound_generated_config; then
