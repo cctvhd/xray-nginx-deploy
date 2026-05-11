@@ -467,6 +467,7 @@ main_menu() {
     echo "  s. 同步/更新模块到本地缓存"
     echo "  w. 配置 WARP WireGuard 凭证（步骤 8/9 的前置依赖）"
     echo "  u. 卸载 / 清理模块"
+    echo "  p. SELinux 管理"
     echo "  r. 全部重装（先清理再执行 1-9）"
     echo "  0. 全流程一键安装（步骤 1-9）"
     echo "  q. 退出"
@@ -498,6 +499,7 @@ main_menu() {
         s|S) do_sync_modules ;;
         w|W) do_warp ;;
         u|U) do_uninstall_menu ;;
+        p|P) do_selinux_mgmt ;;
         r|R) do_reinstall_all ;;
         0) do_full_install ;;
         q|Q) exit 0 ;;
@@ -565,6 +567,7 @@ do_inst_system() {
     optimize_sysctl
     tune_system_limits
     sync_time
+    setup_selinux_policy
     print_optimization_summary
 
     local mem_mb
@@ -958,6 +961,7 @@ run_full_install_flow() {
     optimize_sysctl
     tune_system_limits
     sync_time
+    setup_selinux_policy
     print_optimization_summary
 
     local mem_mb
@@ -1162,6 +1166,119 @@ do_reconf_singbox() {
 	log_info "Sing-Box 配置清理完成，开始重新生成..."
 
 	do_conf_singbox
+}
+
+do_selinux_mgmt() {
+    clear
+    echo ""
+    echo -e "${BLUE}================ SELinux 管理 ================${NC}"
+    echo ""
+
+    if ! command -v getenforce >/dev/null 2>&1; then
+        log_info "当前系统未安装 SELinux，无需管理"
+        echo ""
+        read -rp "按回车返回主菜单..." _
+        main_menu
+        return
+    fi
+
+    local status
+    status=$(getenforce 2>/dev/null || echo "Unknown")
+    echo "  当前 SELinux 状态: ${status}"
+
+    local ports_ok=true
+    if command -v semanage >/dev/null 2>&1; then
+        local existing
+        existing=$(semanage port -l 2>/dev/null | grep '^http_port_t' || true)
+        local ports=(20443 20445 20880 18443 9443 8443)
+        for port in "${ports[@]}"; do
+            if ! echo "$existing" | grep -qw "\\b${port}\\b"; then
+                echo "  ! 端口 ${port}/tcp 缺少 http_port_t 标签"
+                ports_ok=false
+            fi
+        done
+        $ports_ok && echo "  端口标签: 已全部配置"
+    else
+        echo "  ! semanage 不可用，无法检查端口标签"
+        ports_ok=false
+    fi
+
+    local bool_ok=true
+    if command -v getsebool >/dev/null 2>&1; then
+        local hcc
+        hcc=$(getsebool httpd_can_network_connect 2>/dev/null | awk '{print $NF}')
+        if [[ "$hcc" != "on" ]]; then
+            echo "  ! httpd_can_network_connect = ${hcc:-unknown}"
+            bool_ok=false
+        else
+            echo "  httpd_can_network_connect: on"
+        fi
+    fi
+
+    echo ""
+
+    case "$status" in
+        Enforcing)
+            echo "  1. 切换到 Permissive 模式"
+            echo "  q. 返回主菜单"
+            echo ""
+            read -rp "  请选择 [1/q]: " mgmt_choice
+            case "${mgmt_choice:-}" in
+                1)
+                    setenforce 0 2>/dev/null && \
+                        log_info "已切换到 Permissive 模式" || \
+                        log_error "切换失败"
+                    ;;
+            esac
+            ;;
+        Permissive)
+            if $ports_ok && $bool_ok; then
+                echo "  1. 切换到 Enforcing 模式（策略已就绪）"
+                echo "  q. 返回主菜单"
+                echo ""
+                read -rp "  请选择 [1/q]: " mgmt_choice
+                case "${mgmt_choice:-}" in
+                    1)
+                        setenforce 1 2>/dev/null && \
+                            log_info "已切换到 Enforcing 模式" || \
+                            log_error "切换失败"
+                        ;;
+                esac
+            else
+                echo "  1. 切换到 Enforcing 模式（策略不完整，不建议）"
+                echo "  2. 先修复缺失的 SELinux 策略再切换"
+                echo "  q. 返回主菜单"
+                echo ""
+                read -rp "  请选择: " mgmt_choice
+                case "${mgmt_choice:-}" in
+                    1)
+                        log_warn "端口标签或布尔值不完整，强制切换 Enforcing 可能导致服务异常"
+                        read -rp "确认切换？[y/N]: " c
+                        if [[ "${c,,}" == "y" ]]; then
+                            setenforce 1 2>/dev/null && \
+                                log_info "已切换到 Enforcing 模式" || \
+                                log_error "切换失败"
+                        fi
+                        ;;
+                    2)
+                        load_module system
+                        setup_selinux_policy
+                        log_info "策略修复完成，请重新选择切换"
+                        sleep 1
+                        do_selinux_mgmt
+                        return
+                        ;;
+                esac
+            fi
+            ;;
+        Disabled)
+            log_info "SELinux 已完全禁用，无需管理"
+            ;;
+    esac
+
+    echo ""
+    read -rp "按回车返回主菜单..." _
+    main_menu
 }
 
 do_reinstall_all() {

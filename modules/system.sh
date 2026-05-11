@@ -33,6 +33,7 @@ run_system() {
     optimize_sysctl
     optimize_limits
     sync_time
+    setup_selinux_policy
     print_optimization_summary
 
     log_info "========== 系统初始化完成 =========="
@@ -465,7 +466,63 @@ sync_time() {
     fi
 }
 
-# ── 7. 验证工具可用性检查 ────────────────────────────────────
+# ── 7. SELinux 策略自动适配 ────────────────────────────────────
+setup_selinux_policy() {
+    command -v getenforce >/dev/null 2>&1 || return 0
+
+    local selinux_status
+    selinux_status=$(getenforce 2>/dev/null || echo "Disabled")
+
+    case "$selinux_status" in
+        Disabled)   log_info "SELinux 已关闭，跳过策略适配"; return 0 ;;
+        Permissive) log_info "SELinux Permissive 模式，执行端口标签修复（仅记录不阻断）" ;;
+        Enforcing)  ;;
+        *)          return 0 ;;
+    esac
+
+    if [[ "$selinux_status" == "Enforcing" ]]; then
+        setenforce 0 2>/dev/null || true
+        log_warn "SELinux 已临时切换为 Permissive 模式，服务可正常运行"
+        log_warn "如需重新开启 Enforcing，请在所有服务配置完成后选择菜单选项 p"
+    fi
+
+    if ! command -v semanage >/dev/null 2>&1; then
+        log_info "安装 policycoreutils-python-utils（提供 semanage）..."
+        if command -v dnf >/dev/null 2>&1; then
+            dnf install -y policycoreutils-python-utils >/dev/null 2>&1
+        elif command -v yum >/dev/null 2>&1; then
+            yum install -y policycoreutils-python-utils >/dev/null 2>&1
+        fi
+        if ! command -v semanage >/dev/null 2>&1; then
+            log_warn "semanage 安装失败，跳过 SELinux 端口标签"
+            return 0
+        fi
+    fi
+
+    local ports=(20443 20445 20880 18443 9443 8443)
+    local existing_http_ports
+    existing_http_ports=$(semanage port -l 2>/dev/null | grep '^http_port_t' || true)
+
+    for port in "${ports[@]}"; do
+        if echo "$existing_http_ports" | grep -qw "\\b${port}\\b"; then
+            log_info "端口 ${port}/tcp 已有 http_port_t 标签，跳过"
+        else
+            semanage port -a -t http_port_t -p tcp "$port" 2>/dev/null && \
+                log_info "已添加 http_port_t 标签: ${port}/tcp" || \
+                log_warn "添加端口标签失败: ${port}/tcp（可能已存在）"
+        fi
+    done
+
+    setsebool -P httpd_can_network_connect 1 2>/dev/null && \
+        log_info "已开启 httpd_can_network_connect" || \
+        log_warn "setsebool httpd_can_network_connect 失败"
+
+    restorecon -Rv /etc/nginx/certs/ 2>/dev/null || true
+
+    log_info "SELinux 策略适配完成"
+}
+
+# ── 8. 验证工具可用性检查 ────────────────────────────────────
 check_tools() {
     local missing=()
     for cmd in mpstat sar ss ethtool tc ip; do
@@ -484,7 +541,7 @@ check_tools() {
     fi
 }
 
-# ── 8. 优化完成摘要与验证建议 ────────────────────────────────
+# ── 9. 优化完成摘要与验证建议 ────────────────────────────────
 print_optimization_summary() {
     local total_mem_kb
     total_mem_kb=$(grep -E '^MemTotal:' /proc/meminfo | awk '{print $2}')
