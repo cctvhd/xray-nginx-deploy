@@ -727,9 +727,9 @@ do_conf_nginx() {
     find /etc/letsencrypt/live -name 'fullchain.pem' -quit 2>/dev/null | grep -q . && cert_ready=true
 
     if ! $cert_ready; then
-        log_warn "请先完成步骤 4（申请 SSL 证书）"
-        read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        log_warn "未检测到有效 SSL 证书，请先完成步骤 4（申请 SSL 证书）"
+        done_return
+        return
     fi
 
     load_os_info
