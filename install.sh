@@ -1113,7 +1113,6 @@ do_reconf_nginx() {
 
 	log_step "清理 Nginx 配置文件..."
 	rm -f /etc/nginx/cloudflare_real_ip.conf
-	rm -rf /etc/nginx/ssl
 	rm -f /etc/nginx/conf.d/00-upstreams.conf
 	rm -f /etc/nginx/conf.d/fallback.conf
 	rm -f /etc/nginx/conf.d/servers.conf
