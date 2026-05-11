@@ -1139,6 +1139,15 @@ do_reconf_xray() {
 	log_step "清理 Xray 配置文件..."
 	rm -f /usr/local/etc/xray/config.json
 
+	save_state "XRAY_UUID"            ""
+	save_state "XRAY_PUBLIC_KEY"      ""
+	save_state "XRAY_PRIVATE_KEY"     ""
+	save_state "REALITY_DEST"         ""
+	save_state "REALITY_SNI"          ""
+	save_state "REALITY_SERVER_NAMES" ""
+	save_state "REALITY_SHORT_ID"     ""
+	save_state "REALITY_SHORT_IDS"    ""
+	save_state "REALITY_SPIDER_X"     ""
 	save_state "CONF_XRAY" "0"
 	log_info "Xray 配置清理完成，开始重新生成..."
 
@@ -1153,6 +1162,7 @@ do_reconf_singbox() {
 
 	log_step "清理 Sing-Box 配置文件..."
 	rm -f /etc/sing-box/config.json
+	save_state "SINGBOX_PASSWORD" ""
 
 	save_state "CONF_SINGBOX" "0"
 	log_info "Sing-Box 配置清理完成，开始重新生成..."
