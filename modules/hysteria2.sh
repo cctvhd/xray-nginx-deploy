@@ -5,11 +5,6 @@
 # 官方脚本: https://get.hy2.sh/
 # ============================================================
 
-log_step() { echo -e "\e[36m[STEP]\e[0m $*"; }
-log_info()  { echo -e "\e[32m[INFO]\e[0m $*"; }
-log_warn()  { echo -e "\e[33m[WARN]\e[0m $*"; }
-log_error() { echo -e "\e[31m[ERROR]\e[0m $*"; }
-
 install_hysteria2() {
     log_step "安装 Hysteria2（官方脚本）..."
 
