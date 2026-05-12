@@ -970,8 +970,10 @@ do_uninstall_menu() {
     echo "  4. 清理证书 / Cloudflare 配置"
     echo "  5. 清理 Xray"
     echo "  6. 清理 Sing-Box"
-    echo "  7. 清理 Cloudflare WARP"
-    echo "  8. 清理全部"
+    echo "  7. 清理 Hysteria2"
+    echo "  8. 清理 NaïveProxy"
+    echo "  9. 清理 Cloudflare WARP"
+    echo "  10. 清理全部"
     echo "  q. 返回主菜单"
     echo ""
     read -rp "  请选择: " cleanup_choice
@@ -986,8 +988,10 @@ do_uninstall_menu() {
         4) cleanup_cert_module ;;
         5) cleanup_xray_module ;;
         6) cleanup_singbox_module ;;
-        7) cleanup_warp_module ;;
-        8)
+        7) cleanup_hysteria2_module ;;
+        8) cleanup_naive_module ;;
+        9) cleanup_warp_module ;;
+       10)
             read -rp "这会删除本脚本生成的大部分服务、配置和证书，确认继续吗？[y/N]: " confirm_cleanup
             if [[ "${confirm_cleanup,,}" != "y" ]]; then
                 main_menu
