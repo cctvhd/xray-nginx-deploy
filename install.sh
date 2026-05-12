@@ -6,7 +6,7 @@ set -euo pipefail
 # GitHub: https://github.com/cctvhd/xray-nginx-deploy
 # ============================================================
 
-BASE_URL="https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/codex/proxy-kernel-service-tuning"
+BASE_URL="https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/feature/hysteria2-naive"
 MODULES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/modules"
 STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
