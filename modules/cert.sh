@@ -826,13 +826,19 @@ _scan_cf_account_files() {
 # ── 从 ini 文件提取账号显示标签 ──────────────────────────────
 _cf_account_label() {
     local ini_file="$1"
-    local email token
+    local email token token_display
     email=$(grep 'dns_cloudflare_email' "$ini_file" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-    if [[ -n "$email" ]]; then
-        echo "$email"
+    token=$(grep 'dns_cloudflare_api_token' "$ini_file" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+    local token_len=${#token}
+    if [[ "$token_len" -ge 16 ]]; then
+        token_display="${token:0:12}...${token: -4}"
     else
-        token=$(grep 'dns_cloudflare_api_token' "$ini_file" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-        echo "token: ${token:0:8}..."
+        token_display="${token:0:8}..."
+    fi
+    if [[ -n "$email" ]]; then
+        echo "邮箱: ${email}  |  token: ${token_display}"
+    else
+        echo "token: ${token_display}"
     fi
 }
 
@@ -847,12 +853,12 @@ add_cf_account() {
     local existing
     existing=$(_scan_cf_account_files)
     if [[ -n "$existing" ]]; then
-        log_info "已有 CF 账号："
+        log_info "已有 CF 账号（如需新增请退出后选择选项2）："
         for f in $existing; do
             local label base
             base=$(basename "$f" .ini)
             label=$(_cf_account_label "$f")
-            echo "  [${base}] (${label})"
+            echo "  [${base}] cf_account_${base}.ini  |  ${label}"
         done
         echo ""
     fi
@@ -964,7 +970,7 @@ add_domain_and_cert() {
 
     # 显示 CF 账号列表
     echo ""
-    log_info "当前 CF 账号："
+    log_info "当前 CF 账号（如需新增请退出后选择选项2）："
     local cf_files
     cf_files=$(_scan_cf_account_files)
     if [[ -z "$cf_files" ]]; then
@@ -975,7 +981,7 @@ add_domain_and_cert() {
         local label base
         base=$(basename "$f" .ini | sed 's/^cf_account_//')
         label=$(_cf_account_label "$f")
-        echo "  [${base}] (${label})"
+        echo "  [${base}] cf_account_${base}.ini  |  ${label}"
     done
 
     # 收集新域名信息
@@ -1041,7 +1047,7 @@ add_domain_and_cert() {
             local label base
             base=$(basename "$f" .ini | sed 's/^cf_account_//')
             label=$(_cf_account_label "$f")
-            echo "  [${base}] (${label})"
+            echo "  [${base}] cf_account_${base}.ini  |  ${label}"
         done
         local selected_base
         read -rp "使用哪个 CF 账号（输入方括号内的标识）: " selected_base
