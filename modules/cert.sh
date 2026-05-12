@@ -296,6 +296,8 @@ save_domain_config() {
         echo "GRPC_DOMAIN='${GRPC_DOMAIN:-}'"
         echo "REALITY_DOMAIN='${REALITY_DOMAIN:-}'"
         echo "ANYTLS_DOMAIN='${ANYTLS_DOMAIN:-}'"
+        echo "NAIVE_DOMAIN='${NAIVE_DOMAIN:-}'"
+        echo "HYSTERIA2_DOMAIN='${HYSTERIA2_DOMAIN:-}'"
         declare -p ALL_DOMAINS    2>/dev/null || echo "declare -a ALL_DOMAINS=()"
         declare -p CDN_DOMAINS    2>/dev/null || echo "declare -a CDN_DOMAINS=()"
         declare -p DIRECT_DOMAINS 2>/dev/null || echo "declare -a DIRECT_DOMAINS=()"
@@ -779,9 +781,262 @@ HOOK
     fi
 }
 
+# ── 新增 Cloudflare 账号 ─────────────────────────────────────
+add_cf_account() {
+    log_step "新增 Cloudflare 账号"
+
+    mkdir -p "$CF_CONFIG_DIR"
+    chmod 700 "$CF_CONFIG_DIR"
+
+    # 自动计算下一个编号
+    local next_idx=1
+    local existing
+    existing=$(ls "${CF_CONFIG_DIR}"/cf_account_*.ini 2>/dev/null || true)
+    if [[ -n "$existing" ]]; then
+        local max_idx=0
+        for f in $existing; do
+            local n
+            n=$(basename "$f" | sed 's/cf_account_//;s/\.ini//')
+            [[ "$n" -gt "$max_idx" ]] && max_idx="$n"
+        done
+        next_idx=$(( max_idx + 1 ))
+    fi
+
+    local cf_email cf_token
+    read -rp "请输入新 CF 账号的 Email: " cf_email
+    read -rp "请输入新 CF 账号的 API Token（或 Global API Key）: " cf_token
+
+    local ini_file="${CF_CONFIG_DIR}/cf_account_${next_idx}.ini"
+    cat > "$ini_file" << INI
+# Cloudflare API Token - 账号 ${next_idx}
+# Email: ${cf_email}
+dns_cloudflare_api_token = ${cf_token}
+INI
+    chmod 600 "$ini_file"
+
+    # 更新 CF_ACCOUNT_COUNT
+    CF_ACCOUNT_COUNT="$next_idx"
+    save_domain_config
+
+    rebuild_cf_ini_files
+    log_info "新账号已保存为 cf_account_${next_idx}.ini"
+}
+
+# ── 新增域名并申请证书 ───────────────────────────────────────
+add_domain_and_cert() {
+    log_step "新增域名并申请证书"
+
+    # 加载现有配置
+    load_domain_config >/dev/null 2>&1 || true
+
+    # 显示当前域名
+    echo ""
+    log_info "当前已有域名："
+    [[ -n "${XHTTP_DOMAIN:-}"   ]] && echo "  xhttp:    ${XHTTP_DOMAIN}"
+    [[ -n "${GRPC_DOMAIN:-}"    ]] && echo "  grpc:     ${GRPC_DOMAIN}"
+    [[ -n "${REALITY_DOMAIN:-}" ]] && echo "  reality:  ${REALITY_DOMAIN}"
+    [[ -n "${ANYTLS_DOMAIN:-}"  ]] && echo "  anytls:   ${ANYTLS_DOMAIN}"
+    [[ -n "${NAIVE_DOMAIN:-}"   ]] && echo "  naive:    ${NAIVE_DOMAIN}"
+    [[ -n "${HYSTERIA2_DOMAIN:-}" ]] && echo "  hysteria2: ${HYSTERIA2_DOMAIN}"
+    if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
+        echo "  （暂无）"
+    fi
+
+    # 显示 CF 账号列表
+    echo ""
+    log_info "当前 CF 账号："
+    local cf_files
+    cf_files=$(ls "${CF_CONFIG_DIR}"/cf_account_*.ini 2>/dev/null || true)
+    if [[ -z "$cf_files" ]]; then
+        log_error "未找到任何 CF 账号，请先执行选项 2 添加账号"
+        return 1
+    fi
+    for f in $cf_files; do
+        local idx
+        idx=$(basename "$f" | sed 's/cf_account_//;s/\.ini//')
+        local email
+        email=$(grep 'Email:' "$f" 2>/dev/null | head -1 | cut -d: -f2- | xargs || echo "?")
+        echo "  [${idx}] $(basename $f) (${email})"
+    done
+
+    # 收集新域名信息
+    echo ""
+    local new_domain new_usage new_cf_idx
+    read -rp "请输入新域名（如 np.zhongning.cf）: " new_domain
+    new_domain="${new_domain,,}"
+    [[ -z "$new_domain" ]] && { log_error "域名不能为空"; return 1; }
+
+    echo ""
+    echo "域名用途: xhttp / grpc / reality / anytls / naive / hysteria2"
+    read -rp "该域名用途: " new_usage
+    case "$new_usage" in
+        xhttp|grpc|reality|anytls|naive|hysteria2) ;;
+        *) log_error "无效用途: ${new_usage}"; return 1 ;;
+    esac
+
+    read -rp "使用第几个 CF 账号（输入编号）: " new_cf_idx
+    [[ -f "${CF_CONFIG_DIR}/cf_account_${new_cf_idx}.ini" ]] || {
+        log_error "CF 账号 ${new_cf_idx} 不存在"
+        return 1
+    }
+
+    # 直连域名（reality/anytls/hysteria2）提示关闭 CF 代理
+    if [[ "$new_usage" =~ ^(reality|anytls|hysteria2)$ ]]; then
+        local cf_proxy_off
+        read -rp "是否已在 Cloudflare 关闭代理（直连域名需关闭）[y/N]: " cf_proxy_off
+        if [[ "${cf_proxy_off,,}" != "y" ]]; then
+            log_warn "直连域名请先在 Cloudflare 面板关闭代理（DNS only），否则证书验证会失败"
+            log_warn "继续申请..."
+        fi
+    else
+        log_info "CDN 域名（${new_usage}），Cloudflare 代理应保持开启"
+    fi
+
+    # 更新对应 state 变量
+    local root_domain
+    root_domain=$(echo "$new_domain" | awk -F. '{print $(NF-1)"."$NF}')
+
+    case "$new_usage" in
+        xhttp)
+            XHTTP_DOMAIN="$new_domain"
+            [[ " ${CDN_DOMAINS[*]} " != *" $new_domain "* ]] && CDN_DOMAINS+=("$new_domain")
+            ;;
+        grpc)
+            GRPC_DOMAIN="$new_domain"
+            [[ " ${CDN_DOMAINS[*]} " != *" $new_domain "* ]] && CDN_DOMAINS+=("$new_domain")
+            ;;
+        reality)
+            REALITY_DOMAIN="$new_domain"
+            [[ " ${DIRECT_DOMAINS[*]} " != *" $new_domain "* ]] && DIRECT_DOMAINS+=("$new_domain")
+            ;;
+        anytls)
+            ANYTLS_DOMAIN="$new_domain"
+            [[ " ${DIRECT_DOMAINS[*]} " != *" $new_domain "* ]] && DIRECT_DOMAINS+=("$new_domain")
+            ;;
+        naive)
+            NAIVE_DOMAIN="$new_domain"
+            [[ " ${DIRECT_DOMAINS[*]} " != *" $new_domain "* ]] && DIRECT_DOMAINS+=("$new_domain")
+            ;;
+        hysteria2)
+            HYSTERIA2_DOMAIN="$new_domain"
+            [[ " ${DIRECT_DOMAINS[*]} " != *" $new_domain "* ]] && DIRECT_DOMAINS+=("$new_domain")
+            ;;
+    esac
+
+    [[ " ${ALL_DOMAINS[*]} " != *" $new_domain "* ]] && ALL_DOMAINS+=("$new_domain")
+
+    # 写入 domain→CF 账号映射
+    link_domain_to_cf_account "$root_domain" "$new_cf_idx"
+
+    # 持久化 domain_map.conf
+    save_domain_config
+    save_state "NAIVE_DOMAIN"      "${NAIVE_DOMAIN:-}"
+    save_state "HYSTERIA2_DOMAIN"  "${HYSTERIA2_DOMAIN:-}"
+    save_state "XHTTP_DOMAIN"      "${XHTTP_DOMAIN:-}"
+    save_state "GRPC_DOMAIN"       "${GRPC_DOMAIN:-}"
+    save_state "REALITY_DOMAIN"    "${REALITY_DOMAIN:-}"
+    save_state "ANYTLS_DOMAIN"     "${ANYTLS_DOMAIN:-}"
+    save_state "ALL_DOMAINS"       "${ALL_DOMAINS[*]:-}"
+    save_state "CDN_DOMAINS"       "${CDN_DOMAINS[*]:-}"
+    save_state "DIRECT_DOMAINS"    "${DIRECT_DOMAINS[*]:-}"
+    save_state "INST_CERT"         "1"
+
+    # 申请该根域证书
+    log_info "申请证书: *.${root_domain}"
+
+    local ini_file="${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+    local certbot_output certbot_rc
+
+    if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
+        log_info "证书已存在，跳过申请: *.${root_domain}"
+    else
+        if certbot_output=$(certbot certonly \
+            --dns-cloudflare \
+            --dns-cloudflare-credentials "$ini_file" \
+            --dns-cloudflare-propagation-seconds 30 \
+            -d "${root_domain}" \
+            -d "*.${root_domain}" \
+            --email "admin@${root_domain}" \
+            --agree-tos \
+            --non-interactive \
+            --expand 2>&1); then
+            certbot_rc=0
+        else
+            certbot_rc=$?
+        fi
+
+        if [[ $certbot_rc -eq 0 && -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
+            log_info "证书申请成功: *.${root_domain}"
+        else
+            log_error "证书申请失败（退出码: ${certbot_rc}）"
+            while IFS= read -r line; do echo "  $line"; done <<< "$certbot_output"
+            log_warn "请检查域名 DNS 解析和 CF API Token 权限"
+            return 1
+        fi
+    fi
+
+    # 自动配置续期（如果还没配）
+    setup_auto_renew
+
+    # 询问是否重新生成 Nginx 配置
+    echo ""
+    local redo_nginx
+    read -rp "是否立即重新生成 Nginx 配置？[y/N]: " redo_nginx
+    if [[ "${redo_nginx,,}" == "y" ]]; then
+        log_info "重新生成 Nginx 配置..."
+        do_conf_nginx 2>/dev/null || {
+            log_warn "Nginx 配置生成失败，请手动执行步骤 9"
+        }
+    fi
+
+    log_info "域名 ${new_domain} 添加完成"
+}
+
 # ── 模块入口 ─────────────────────────────────────────────────
 run_cert() {
     log_step "========== SSL 证书申请 =========="
+
+    # 子菜单
+    echo ""
+    echo "  请选择操作："
+    echo "  1. 首次完整配置（CF账号 + 域名 + 申请证书）"
+    echo "  2. 新增 Cloudflare 账号"
+    echo "  3. 新增域名并申请证书（复用已有CF账号）"
+    echo "  4. 仅补申请证书（域名已配置）"
+    echo ""
+    read -rp "  请选择 [1-4，默认1]: " cert_choice
+    cert_choice="${cert_choice:-1}"
+
+    case "$cert_choice" in
+        2)
+            install_certbot
+            add_cf_account
+            log_info "========== 新增 CF 账号完成 =========="
+            return
+            ;;
+        3)
+            install_certbot
+            add_domain_and_cert
+            log_info "========== 新增域名完成 =========="
+            return
+            ;;
+        4)
+            install_certbot
+            load_domain_config >/dev/null 2>&1 || true
+            if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
+                log_error "未找到域名配置，请先执行首次完整配置"
+                return 1
+            fi
+            request_certificates
+            setup_auto_renew
+            log_info "========== 证书申请完成 =========="
+            return
+            ;;
+        1|*)
+            ;;
+    esac
+
+    # ── 选项 1（默认）：首次完整配置 ──
 
     # 1. 安装 certbot
     install_certbot
