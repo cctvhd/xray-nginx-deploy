@@ -5,11 +5,6 @@
 # 从 klzgrad/naiveproxy GitHub releases 下载二进制
 # ============================================================
 
-log_step() { echo -e "\e[36m[STEP]\e[0m $*"; }
-log_info()  { echo -e "\e[32m[INFO]\e[0m $*"; }
-log_warn()  { echo -e "\e[33m[WARN]\e[0m $*"; }
-log_error() { echo -e "\e[31m[ERROR]\e[0m $*"; }
-
 install_naive() {
     log_step "安装 NaïveProxy（klzgrad/naiveproxy）..."
 
