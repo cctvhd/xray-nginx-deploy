@@ -22,6 +22,24 @@ install_hysteria2() {
     local hy_ver
     hy_ver=$(hysteria version 2>&1 | grep -oP '[\d.]+' | head -1)
     log_info "Hysteria2 安装成功: v${hy_ver}"
+
+    # 下载 GeoIP/GeoSite 数据库（供 ACL 使用）
+    mkdir -p /var/lib/hysteria
+    local GEO_BASE="https://github.com/Loyalsoldier/v2ray-rules-dat/releases/latest/download"
+    if curl -fsSL "${GEO_BASE}/geoip.dat" -o /var/lib/hysteria/geoip.dat; then
+        log_info "geoip.dat 下载完成"
+    else
+        log_warn "geoip.dat 下载失败，请手动下载后放置到 /var/lib/hysteria/"
+        log_warn "  curl -fsSL ${GEO_BASE}/geoip.dat -o /var/lib/hysteria/geoip.dat"
+    fi
+    if curl -fsSL "${GEO_BASE}/geosite.dat" -o /var/lib/hysteria/geosite.dat; then
+        log_info "geosite.dat 下载完成"
+    else
+        log_warn "geosite.dat 下载失败，请手动下载后放置到 /var/lib/hysteria/"
+        log_warn "  curl -fsSL ${GEO_BASE}/geosite.dat -o /var/lib/hysteria/geosite.dat"
+    fi
+    chown -R hysteria:hysteria /var/lib/hysteria
+    chmod 644 /var/lib/hysteria/*.dat 2>/dev/null || true
 }
 
 configure_hysteria2() {
@@ -150,6 +168,24 @@ masquerade:
   proxy:
     url: ${MASQUERADE_URL}
     rewriteHost: true
+
+# ACL：拒绝中国大陆流量直连（防止 VPS IP 暴露）
+# Hysteria2 不支持 WireGuard 出站，CN 流量直接 reject
+# NaiveProxy 协议限制不支持 ACL，无法实现同等功能
+acl:
+  geoip: /var/lib/hysteria/geoip.dat
+  geosite: /var/lib/hysteria/geosite.dat
+  geoUpdateInterval: 168h
+  - "reject(10.0.0.0/8)"
+  - "reject(172.16.0.0/12)"
+  - "reject(192.168.0.0/16)"
+  - "reject(127.0.0.0/8)"
+  - "reject(fc00::/7)"
+  - "reject(::1/128)"
+  - "reject(geosite:cn)"
+  - "reject(geosite:tld-cn)"
+  - "reject(geoip:cn)"
+  - "direct(all)"
 EOF
 
     log_info "已写入 /etc/hysteria/config.yaml"
