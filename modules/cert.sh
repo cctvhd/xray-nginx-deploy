@@ -1170,8 +1170,12 @@ add_domain_and_cert() {
 # ── 迁移旧 cf_account_N.ini 到域名命名格式 ──────────────────
 migrate_cf_account_files() {
     local cf_dir="${CF_CONFIG_DIR}"
-    local migrated=0
+    local -a old_files=()
+    local -A auto_root=()
+    local -A ini_token=()
+    local -A ini_email=()
 
+    # ── 第一遍：收集所有待迁移文件，尝试自动识别域名 ────────
     for ini in "${cf_dir}"/cf_account_*.ini; do
         [[ -f "$ini" ]] || continue
         local bname
@@ -1180,26 +1184,109 @@ migrate_cf_account_files() {
         # 只处理旧编号格式（纯数字）
         [[ "$bname" =~ ^[0-9]+$ ]] || continue
 
-        # 检查是否已有对应域名命名的 ini（从 domain_map.conf 反查）
-        if grep -q "^CF_ACCOUNT_${bname}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null; then
-            continue
+        # 已迁移过则跳过
+        grep -q "^CF_ACCOUNT_${bname}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null && continue
+        grep -q "^CF_INI_.*=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null && {
+            # 检查是否有新格式文件已存在
+            local already=false
+            for dn in "${cf_dir}"/cf_account_*.ini; do
+                local dn_bname
+                dn_bname=$(basename "$dn" .ini | sed 's/^cf_account_//')
+                [[ "$dn_bname" =~ ^[0-9]+$ ]] && continue
+                if cmp -s "$ini" "$dn" 2>/dev/null; then
+                    already=true && break
+                fi
+            done
+            $already && continue
+        }
+
+        old_files+=("$ini")
+
+        # 缓存 token 和 email
+        ini_token["$ini"]=$(grep 'dns_cloudflare_api_token' "$ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+        ini_email["$ini"]=$(grep 'dns_cloudflare_email' "$ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+
+        # ── 自动从 Let's Encrypt renewal conf 反查域名 ─────
+        local auto_found=""
+        local ini_path
+        ini_path=$(realpath "$ini" 2>/dev/null || echo "$ini")
+
+        for renew_conf in /etc/letsencrypt/renewal/*.conf; do
+            [[ -f "$renew_conf" ]] || continue
+            # 检查 renewal conf 里是否引用了本 ini 文件
+            local cred_line
+            cred_line=$(grep 'dns_cloudflare_credentials' "$renew_conf" 2>/dev/null | head -1)
+            [[ -z "$cred_line" ]] && continue
+            local cred_path
+            cred_path=$(echo "$cred_line" | sed 's/.*=\s*//' | tr -d ' ')
+
+            # 匹配：直接引用旧编号文件，或引用 domain_<root>.ini 且 token 相同
+            if [[ "$cred_path" == "$ini_path" || "$cred_path" == *"cf_account_${bname}.ini" ]]; then
+                auto_found=$(basename "$renew_conf" .conf)
+                break
+            fi
+        done
+
+        # renewal 里没找到，尝试通过 domain_*.ini + token 匹配
+        if [[ -z "$auto_found" ]]; then
+            for dom_ini in "${cf_dir}"/domain_*.ini; do
+                [[ -f "$dom_ini" ]] || continue
+                local dom_token
+                dom_token=$(grep 'dns_cloudflare_api_token' "$dom_ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+                if [[ -n "$dom_token" && "$dom_token" == "${ini_token[$ini]}" ]]; then
+                    auto_found=$(basename "$dom_ini" .ini | sed 's/^domain_//')
+                    break
+                fi
+            done
         fi
 
-        # 需要迁移
-        local cf_email cf_token
-        cf_email=$(grep 'dns_cloudflare_email' "$ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-        cf_token=$(grep 'dns_cloudflare_api_token' "$ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-        local token_preview="${cf_token:0:12}"
+        [[ -n "$auto_found" ]] && auto_root["$ini"]="$auto_found"
+    done
 
-        echo ""
-        log_info "检测到旧格式 CF 账号文件: cf_account_${bname}.ini"
-        [[ -n "$cf_email" ]] && echo "  邮箱: ${cf_email}" || true
-        echo "  Token: ${token_preview}..."
+    # ── 没有待迁移文件则直接返回 ──────────────────────────
+    [[ ${#old_files[@]} -eq 0 ]] && return 0 || true
 
-        local cf_root
-        read -rp "  该账号管理的根域名是什么？（如 zhongning.tk）: " cf_root
-        cf_root="${cf_root,,}"
-        [[ -z "$cf_root" ]] && { log_warn "跳过迁移 cf_account_${bname}.ini（未输入域名）"; continue; }
+    # ── 显示迁移计划 ──────────────────────────────────────
+    echo ""
+    log_info "检测到旧格式账号文件，自动分析对应域名："
+    for ini in "${old_files[@]}"; do
+        local bname label
+        bname=$(basename "$ini" .ini | sed 's/^cf_account_//')
+        if [[ -n "${auto_root[$ini]:-}" ]]; then
+            label="发现证书：${auto_root[$ini]}（覆盖 *.${auto_root[$ini]}）→ 将重命名为 $(domain_to_ini_name "${auto_root[$ini]}").ini"
+        else
+            label="未找到对应证书，需手动输入"
+        fi
+        echo "  cf_account_${bname}.ini → ${label}"
+    done
+
+    # ── 确认 ──────────────────────────────────────────────
+    echo ""
+    local confirm_migrate
+    read -rp "确认迁移？[Y/n]: " confirm_migrate
+    [[ "${confirm_migrate,,}" == "n" ]] && { log_info "跳过迁移"; return 0; }
+
+    # ── 第二遍：执行迁移 ──────────────────────────────────
+    local migrated=0
+    for ini in "${old_files[@]}"; do
+        local bname cf_root
+        bname=$(basename "$ini" .ini | sed 's/^cf_account_//')
+        cf_root="${auto_root[$ini]:-}"
+
+        # 自动识别失败则回退到手动输入
+        if [[ -z "$cf_root" ]]; then
+            local cf_email cf_token token_preview
+            cf_email="${ini_email[$ini]}"
+            cf_token="${ini_token[$ini]}"
+            token_preview="${cf_token:0:12}"
+            echo ""
+            log_info "cf_account_${bname}.ini 未找到对应证书，请手动输入："
+            [[ -n "$cf_email" ]] && echo "  邮箱: ${cf_email}" || true
+            echo "  Token: ${token_preview}..."
+            read -rp "  该账号管理的根域名是什么？（如 zhongning.tk）: " cf_root
+            cf_root="${cf_root,,}"
+            [[ -z "$cf_root" ]] && { log_warn "跳过迁移 cf_account_${bname}.ini（未输入域名）"; continue; }
+        fi
 
         local new_base
         new_base=$(domain_to_ini_name "$cf_root")
@@ -1208,7 +1295,6 @@ migrate_cf_account_files() {
         cp "$ini" "$new_ini"
         chmod 600 "$new_ini"
 
-        # 写入 domain_map.conf 关联记录
         echo "CF_ACCOUNT_${bname}='${cf_root}'" >> "${CF_DOMAIN_MAP_FILE}"
         echo "CF_INI_${new_base}='${new_base}'"  >> "${CF_DOMAIN_MAP_FILE}"
 
