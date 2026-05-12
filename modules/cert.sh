@@ -1193,7 +1193,7 @@ migrate_cf_account_files() {
 
         echo ""
         log_info "检测到旧格式 CF 账号文件: cf_account_${bname}.ini"
-        [[ -n "$cf_email" ]] && echo "  邮箱: ${cf_email}"
+        [[ -n "$cf_email" ]] && echo "  邮箱: ${cf_email}" || true
         echo "  Token: ${token_preview}..."
 
         local cf_root
@@ -1216,11 +1216,12 @@ migrate_cf_account_files() {
         (( migrated++ )) || true
     done
 
-    [[ $migrated -gt 0 ]] && log_info "迁移完成，共处理 ${migrated} 个旧账号文件"
+    [[ $migrated -gt 0 ]] && log_info "迁移完成，共处理 ${migrated} 个旧账号文件" || true
 }
 
 # ── 模块入口 ─────────────────────────────────────────────────
 run_cert() {
+    set +e
     log_step "========== SSL 证书申请 =========="
 
     # 自动迁移旧格式 CF 账号文件
@@ -1314,4 +1315,5 @@ run_cert() {
     echo ""
     log_info "账号映射文件（可随时查看/手动修改）："
     list_domain_ini_files | while read -r f; do echo "  $f"; done
+    set -e
 }
