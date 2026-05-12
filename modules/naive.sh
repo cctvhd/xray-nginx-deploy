@@ -84,9 +84,3 @@ run_naive() {
     install_naive
     log_info "========== NaïveProxy 安装完成 =========="
 }
-
-# ── 直接执行入口 ─────────────────────────────────────────────
-if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
-    [[ $EUID -ne 0 ]] && { echo "必须使用 root 权限运行"; exit 1; }
-    run_naive
-fi
