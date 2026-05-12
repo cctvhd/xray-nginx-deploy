@@ -301,8 +301,31 @@ save_domain_config() {
         declare -p ALL_DOMAINS    2>/dev/null || echo "declare -a ALL_DOMAINS=()"
         declare -p CDN_DOMAINS    2>/dev/null || echo "declare -a CDN_DOMAINS=()"
         declare -p DIRECT_DOMAINS 2>/dev/null || echo "declare -a DIRECT_DOMAINS=()"
-        # 注意：域名↔账号映射不再存入此文件
-        # 映射关系由 /etc/cloudflare/domain_<root>.ini 文件体现
+        # 域名↔账号映射：从 domain_*.ini 反查，写入 CF_ACCOUNT_N 条目
+        # 用于 get_cf_account_by_domain() 自动匹配
+        local -A acct_domains_map=()
+        for dom_ini in "${CF_CONFIG_DIR}"/domain_*.ini; do
+            [[ -f "$dom_ini" ]] || continue
+            local dom_token dom_root
+            dom_token=$(grep 'dns_cloudflare_api_token' "$dom_ini" 2>/dev/null \
+                | awk -F' = ' '{print $2}' | xargs || true)
+            [[ -z "$dom_token" ]] && continue
+            dom_root=$(basename "$dom_ini" | sed 's/^domain_//;s/\.ini$//')
+            # 匹配到 cf_account_N.ini
+            for cf_ini in "${CF_CONFIG_DIR}"/cf_account_*.ini; do
+                [[ -f "$cf_ini" ]] || continue
+                local cf_token cf_idx
+                cf_token=$(grep 'dns_cloudflare_api_token' "$cf_ini" 2>/dev/null \
+                    | awk -F' = ' '{print $2}' | xargs || true)
+                [[ "$cf_token" == "$dom_token" ]] || continue
+                cf_idx=$(basename "$cf_ini" | grep -oP '\d+')
+                acct_domains_map["$cf_idx"]="${acct_domains_map[$cf_idx]} ${dom_root}"
+                break
+            done
+        done
+        for idx in "${!acct_domains_map[@]}"; do
+            echo "CF_ACCOUNT_${idx}='${acct_domains_map[$idx]# }'"
+        done
     } > "$CF_DOMAIN_MAP_FILE"
 
     chmod 600 "$CF_DOMAIN_MAP_FILE"
@@ -822,6 +845,36 @@ INI
     log_info "新账号已保存为 cf_account_${next_idx}.ini"
 }
 
+# ── 根据根域名反查 CF 账号 ───────────────────────────────────
+get_cf_account_by_domain() {
+    local input_domain="$1"
+    local root_domain
+    root_domain=$(echo "$input_domain" | awk -F. '{print $(NF-1)"."$NF}')
+
+    local matched_idx=""
+    local cf_dir="${CF_CONFIG_DIR}"
+
+    # 从 domain_map.conf 的 CF_ACCOUNT_N 条目中查找同根域名
+    for ini in "${cf_dir}"/cf_account_*.ini; do
+        [[ -f "$ini" ]] || continue
+        local idx
+        idx=$(basename "$ini" | grep -oP '\d+')
+        local mapped_domains
+        mapped_domains=$(grep "^CF_ACCOUNT_${idx}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null \
+            | cut -d= -f2- | tr -d "'\"")
+        for d in $mapped_domains; do
+            local r
+            r=$(echo "$d" | awk -F. '{print $(NF-1)"."$NF}')
+            if [[ "$r" == "$root_domain" ]]; then
+                matched_idx="$idx"
+                break 2
+            fi
+        done
+    done
+
+    echo "$matched_idx"
+}
+
 # ── 新增域名并申请证书 ───────────────────────────────────────
 add_domain_and_cert() {
     log_step "新增域名并申请证书"
@@ -910,15 +963,53 @@ add_domain_and_cert() {
         log_info "直连域名（${new_usage}），请确认 CF 已关闭代理（灰云/DNS only）"
     fi
 
-    read -rp "使用第几个 CF 账号（输入编号）: " new_cf_idx
+    # ── CF 账号自动匹配 ──────────────────────────────────────
+    local root_domain
+    root_domain=$(echo "$new_domain" | awk -F. '{print $(NF-1)"."$NF}')
+
+    local matched_idx
+    matched_idx=$(get_cf_account_by_domain "$new_domain")
+
+    if [[ -n "$matched_idx" ]]; then
+        log_info "检测到根域名 ${root_domain} 已关联 CF 账号 ${matched_idx}（cf_account_${matched_idx}.ini），自动使用"
+        local use_matched
+        read -rp "直接使用账号 ${matched_idx}？[Y/n]: " use_matched
+        if [[ "${use_matched,,}" != "n" ]]; then
+            new_cf_idx="$matched_idx"
+        fi
+    fi
+
+    # 未自动匹配的，手动选择
+    if [[ -z "${new_cf_idx:-}" ]]; then
+        echo ""
+        log_info "可用 CF 账号："
+        local cf_files
+        cf_files=$(ls "${CF_CONFIG_DIR}"/cf_account_*.ini 2>/dev/null || true)
+        for f in $cf_files; do
+            local idx2
+            idx2=$(basename "$f" | sed 's/cf_account_//;s/\.ini//')
+            local email2
+            email2=$(grep 'Email:' "$f" 2>/dev/null | head -1 | cut -d: -f2- | xargs || echo "?")
+            echo "  [${idx2}] cf_account_${idx2}.ini (${email2})"
+        done
+        read -rp "使用第几个 CF 账号（输入编号）: " new_cf_idx
+    fi
+
     [[ -f "${CF_CONFIG_DIR}/cf_account_${new_cf_idx}.ini" ]] || {
         log_error "CF 账号 ${new_cf_idx} 不存在"
         return 1
     }
 
+    # 写入账号-域名关联（供下次自动匹配）
+    local existing_acct_domains
+    existing_acct_domains=$(grep "^CF_ACCOUNT_${new_cf_idx}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null \
+        | cut -d= -f2- | tr -d "'\"" || true)
+    if [[ " $existing_acct_domains " != *" $new_domain "* ]]; then
+        sed -i "/^CF_ACCOUNT_${new_cf_idx}=/d" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || true
+        echo "CF_ACCOUNT_${new_cf_idx}='${existing_acct_domains} ${new_domain}'" >> "${CF_DOMAIN_MAP_FILE}"
+    fi
+
     # 更新对应 state 变量
-    local root_domain
-    root_domain=$(echo "$new_domain" | awk -F. '{print $(NF-1)"."$NF}')
 
     case "$new_usage" in
         xhttp)
