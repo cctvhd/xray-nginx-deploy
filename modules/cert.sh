@@ -883,30 +883,38 @@ add_domain_and_cert() {
     [[ -z "$new_domain" ]] && { log_error "域名不能为空"; return 1; }
 
     echo ""
-    echo "域名用途: xhttp / grpc / reality / anytls / naive / hysteria2"
-    read -rp "该域名用途: " new_usage
-    case "$new_usage" in
-        xhttp|grpc|reality|anytls|naive|hysteria2) ;;
-        *) log_error "无效用途: ${new_usage}"; return 1 ;;
+    echo "  请选择域名用途："
+    echo "  1. xhttp    — VLESS+XHTTP，经 CF CDN 中转（需开启 CF 橙云代理）"
+    echo "  2. grpc     — VLESS+gRPC，经 CF CDN 中转（需开启 CF 橙云代理）"
+    echo "  3. reality  — VLESS+Reality 直连伪装域名（需关闭 CF 代理，灰云）"
+    echo "  4. anytls   — Sing-Box AnyTLS 直连（需关闭 CF 代理，灰云）"
+    echo "  5. naive    — NaiveProxy 直连（需关闭 CF 代理，灰云）"
+    echo "  6. hysteria2 — Hysteria2 直连（需关闭 CF 代理，灰云）"
+    echo ""
+    local usage_choice
+    read -rp "  请选择 [1-6]: " usage_choice
+    case "${usage_choice:-}" in
+        1) new_usage="xhttp" ;;
+        2) new_usage="grpc" ;;
+        3) new_usage="reality" ;;
+        4) new_usage="anytls" ;;
+        5) new_usage="naive" ;;
+        6) new_usage="hysteria2" ;;
+        *) log_error "无效选择: ${usage_choice}"; return 1 ;;
     esac
+
+    # 用途自动判断代理要求
+    if [[ "$new_usage" =~ ^(xhttp|grpc)$ ]]; then
+        log_info "CDN 域名（${new_usage}），请确认 CF 已开启橙云代理"
+    else
+        log_info "直连域名（${new_usage}），请确认 CF 已关闭代理（灰云/DNS only）"
+    fi
 
     read -rp "使用第几个 CF 账号（输入编号）: " new_cf_idx
     [[ -f "${CF_CONFIG_DIR}/cf_account_${new_cf_idx}.ini" ]] || {
         log_error "CF 账号 ${new_cf_idx} 不存在"
         return 1
     }
-
-    # 直连域名（reality/anytls/hysteria2）提示关闭 CF 代理
-    if [[ "$new_usage" =~ ^(reality|anytls|hysteria2)$ ]]; then
-        local cf_proxy_off
-        read -rp "是否已在 Cloudflare 关闭代理（直连域名需关闭）[y/N]: " cf_proxy_off
-        if [[ "${cf_proxy_off,,}" != "y" ]]; then
-            log_warn "直连域名请先在 Cloudflare 面板关闭代理（DNS only），否则证书验证会失败"
-            log_warn "继续申请..."
-        fi
-    else
-        log_info "CDN 域名（${new_usage}），Cloudflare 代理应保持开启"
-    fi
 
     # 更新对应 state 变量
     local root_domain
