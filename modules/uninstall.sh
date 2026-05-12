@@ -114,6 +114,14 @@ reset_singbox_state() {
     save_state "CONF_SINGBOX" "0"
 }
 
+reset_hysteria2_state() {
+    save_state "INST_HYSTERIA2" "0"
+}
+
+reset_naive_state() {
+    save_state "INST_NAIVE" "0"
+}
+
 reset_warp_state() {
     save_state "WARP_PROXY_PORT" "40000"
     save_state "INST_WARP" "0"
@@ -317,6 +325,35 @@ cleanup_singbox_module() {
     log_info "Sing-Box 清理完成"
 }
 
+cleanup_hysteria2_module() {
+    log_step "清理 Hysteria2..."
+
+    systemctl disable --now hysteria-server.service >/dev/null 2>&1 || true
+
+    bash <(curl -fsSL https://get.hy2.sh/) --remove
+
+    reset_hysteria2_state
+    log_info "Hysteria2 清理完成"
+}
+
+cleanup_naive_module() {
+    log_step "清理 NaïveProxy..."
+
+    systemctl disable --now caddy-naive >/dev/null 2>&1 || true
+
+    remove_path_if_exists "/usr/local/bin/caddy-naive"
+    remove_path_if_exists "/etc/caddy-naive"
+    remove_path_if_exists "/var/lib/caddy-naive"
+    remove_path_if_exists "/etc/systemd/system/caddy-naive.service"
+    # 删除专用用户（如存在）
+    id -u caddy-naive &>/dev/null && userdel caddy-naive 2>/dev/null || true
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    reset_naive_state
+    log_info "NaïveProxy 清理完成"
+}
+
 cleanup_warp_module() {
     log_step "清理 Cloudflare WARP..."
 
@@ -349,6 +386,8 @@ cleanup_all_modules() {
     cleanup_warp_module
     cleanup_unbound_module
     cleanup_system_module
+    cleanup_hysteria2_module
+    cleanup_naive_module
 
     remove_path_if_exists "$STATE_FILE"
     rmdir "$STATE_DIR" 2>/dev/null || true
