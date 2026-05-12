@@ -338,7 +338,7 @@ cleanup_hysteria2_module() {
 }
 
 cleanup_naive_module() {
-    log_step "清理 NaïveProxy..."
+    log_step "清理 NaiveProxy..."
 
     systemctl disable --now caddy-naive >/dev/null 2>&1 || true
 
@@ -352,7 +352,7 @@ cleanup_naive_module() {
     systemctl daemon-reload >/dev/null 2>&1 || true
 
     reset_naive_state
-    log_info "NaïveProxy 清理完成"
+    log_info "NaiveProxy 清理完成"
 }
 
 cleanup_warp_module() {

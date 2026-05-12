@@ -437,7 +437,7 @@ show_status() {
     printf "    %-20s %s\n" "Xray"     "${s_xray}"
     printf "    %-20s %s\n" "Sing-Box"  "${s_singbox}"
     printf "    %-20s %s\n" "Hysteria2" "${s_hysteria2}"
-    printf "    %-20s %s\n" "NaïveProxy" "${s_naive}"
+    printf "    %-20s %s\n" "NaiveProxy" "${s_naive}"
     printf "    %-20s %s\n" "WARP"      "${s_warp}"
 
     echo ""
@@ -446,7 +446,7 @@ show_status() {
     printf "    %-20s %s\n" "Xray"     "${c_xray}"
     printf "    %-20s %s\n" "Sing-Box"  "${c_singbox}"
     printf "    %-20s %s\n" "Hysteria2" "${c_hysteria2}"
-    printf "    %-20s %s\n" "NaïveProxy" "${c_naive}"
+    printf "    %-20s %s\n" "NaiveProxy" "${c_naive}"
     printf "    %-20s %s\n" "WARP"      "${c_warp}"
 
     echo ""
@@ -487,19 +487,19 @@ main_menu() {
     echo "  5. 安装 Xray"
     echo "  6. 安装 Sing-Box"
     echo "  7. 安装 Hysteria2"
-    echo "  8. 安装 NaïveProxy"
+    echo "  8. 安装 NaiveProxy"
     echo ""
     echo "  === 配置 ==="
     echo "  9. 配置 Nginx"
     echo "  10. 配置 Xray"
     echo "  11. 配置 Sing-Box"
     echo "  12. 配置 Hysteria2"
-    echo "  13. 配置 NaïveProxy"
+    echo "  13. 配置 NaiveProxy"
 	echo " n. 重新配置 Nginx（先清理再生成）"
 	echo " x. 重新配置 Xray（先清理再生成）"
 	echo " g. 重新配置 Sing-Box（先清理再生成）"
 	echo " h. 重新配置 Hysteria2（先清理再生成）"
-	echo " i. 重新配置 NaïveProxy（先清理再生成）"
+	echo " i. 重新配置 NaiveProxy（先清理再生成）"
     echo ""
     echo "  === 其他 ==="
     echo "  a. 生成客户端链接"
@@ -792,7 +792,7 @@ do_inst_naive() {
     if command -v caddy-naive &>/dev/null; then
         local ver reinstall
         ver=$(caddy-naive version 2>&1 | head -1 || true)
-        log_info "NaïveProxy 已安装: ${ver}"
+        log_info "NaiveProxy 已安装: ${ver}"
         read -rp "是否重新安装？[y/N]: " reinstall
         if [[ "${reinstall,,}" != "y" ]]; then
             save_state "INST_NAIVE" "1"
@@ -805,7 +805,7 @@ do_inst_naive() {
     install_naive
     save_state "INST_NAIVE" "1"
 
-    log_info "NaïveProxy 安装完成"
+    log_info "NaiveProxy 安装完成"
     done_return
 }
 
@@ -1005,7 +1005,7 @@ do_reconf_hysteria2() {
 
 do_conf_naive() {
     if [[ "$(get_step INST_NAIVE)" != "1" ]] && ! command -v caddy-naive &>/dev/null; then
-        log_warn "请先完成步骤 8（安装 NaïveProxy）"
+        log_warn "请先完成步骤 8（安装 NaiveProxy）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
@@ -1030,15 +1030,15 @@ do_conf_naive() {
 }
 
 do_reconf_naive() {
-    read -rp "将清理 NaïveProxy 配置并重新生成，确认继续吗？[y/N]: " c
+    read -rp "将清理 NaiveProxy 配置并重新生成，确认继续吗？[y/N]: " c
     [[ "${c,,}" != "y" ]] && main_menu && return
 
     load_module uninstall
 
-    log_step "清理 NaïveProxy 配置文件..."
+    log_step "清理 NaiveProxy 配置文件..."
     rm -f /etc/caddy-naive/Caddyfile
     save_state "CONF_NAIVE" "0"
-    log_info "NaïveProxy 配置清理完成，开始重新生成..."
+    log_info "NaiveProxy 配置清理完成，开始重新生成..."
 
     do_conf_naive
 }
@@ -1079,7 +1079,7 @@ do_uninstall_menu() {
     echo "  5. 清理 Xray"
     echo "  6. 清理 Sing-Box"
     echo "  7. 清理 Hysteria2"
-    echo "  8. 清理 NaïveProxy"
+    echo "  8. 清理 NaiveProxy"
     echo "  9. 清理 Cloudflare WARP"
     echo "  10. 清理全部"
     echo "  q. 返回主菜单"
