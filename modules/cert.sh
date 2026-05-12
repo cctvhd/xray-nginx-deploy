@@ -1167,9 +1167,64 @@ add_domain_and_cert() {
     log_info "域名 ${new_domain} 添加完成"
 }
 
+# ── 迁移旧 cf_account_N.ini 到域名命名格式 ──────────────────
+migrate_cf_account_files() {
+    local cf_dir="${CF_CONFIG_DIR}"
+    local migrated=0
+
+    for ini in "${cf_dir}"/cf_account_*.ini; do
+        [[ -f "$ini" ]] || continue
+        local bname
+        bname=$(basename "$ini" .ini | sed 's/^cf_account_//')
+
+        # 只处理旧编号格式（纯数字）
+        [[ "$bname" =~ ^[0-9]+$ ]] || continue
+
+        # 检查是否已有对应域名命名的 ini（从 domain_map.conf 反查）
+        if grep -q "^CF_ACCOUNT_${bname}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null; then
+            continue
+        fi
+
+        # 需要迁移
+        local cf_email cf_token
+        cf_email=$(grep 'dns_cloudflare_email' "$ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+        cf_token=$(grep 'dns_cloudflare_api_token' "$ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+        local token_preview="${cf_token:0:12}"
+
+        echo ""
+        log_info "检测到旧格式 CF 账号文件: cf_account_${bname}.ini"
+        [[ -n "$cf_email" ]] && echo "  邮箱: ${cf_email}"
+        echo "  Token: ${token_preview}..."
+
+        local cf_root
+        read -rp "  该账号管理的根域名是什么？（如 zhongning.tk）: " cf_root
+        cf_root="${cf_root,,}"
+        [[ -z "$cf_root" ]] && { log_warn "跳过迁移 cf_account_${bname}.ini（未输入域名）"; continue; }
+
+        local new_base
+        new_base=$(domain_to_ini_name "$cf_root")
+        local new_ini="${cf_dir}/cf_account_${new_base}.ini"
+
+        cp "$ini" "$new_ini"
+        chmod 600 "$new_ini"
+
+        # 写入 domain_map.conf 关联记录
+        echo "CF_ACCOUNT_${bname}='${cf_root}'" >> "${CF_DOMAIN_MAP_FILE}"
+        echo "CF_INI_${new_base}='${new_base}'"  >> "${CF_DOMAIN_MAP_FILE}"
+
+        log_info "已将 cf_account_${bname}.ini 迁移为 ${new_base}.ini（旧文件保留）"
+        (( migrated++ )) || true
+    done
+
+    [[ $migrated -gt 0 ]] && log_info "迁移完成，共处理 ${migrated} 个旧账号文件"
+}
+
 # ── 模块入口 ─────────────────────────────────────────────────
 run_cert() {
     log_step "========== SSL 证书申请 =========="
+
+    # 自动迁移旧格式 CF 账号文件
+    migrate_cf_account_files
 
     # 子菜单
     echo ""
