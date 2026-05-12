@@ -826,8 +826,24 @@ INI
 add_domain_and_cert() {
     log_step "新增域名并申请证书"
 
-    # 加载现有配置
-    load_domain_config >/dev/null 2>&1 || true
+    # 加载现有配置（domain_map.conf 优先，state 兜底）
+    load_domain_config >/dev/null 2>&1 || {
+        XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
+        GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
+        REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+        ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+        NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
+        HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+        local _all _cdn _direct
+        _all=$(get_state "ALL_DOMAINS")
+        _cdn=$(get_state "CDN_DOMAINS")
+        _direct=$(get_state "DIRECT_DOMAINS")
+        ALL_DOMAINS=(); CDN_DOMAINS=(); DIRECT_DOMAINS=()
+        [[ -n "$_all"    ]] && read -ra ALL_DOMAINS    <<< "$_all"
+        [[ -n "$_cdn"    ]] && read -ra CDN_DOMAINS    <<< "$_cdn"
+        [[ -n "$_direct" ]] && read -ra DIRECT_DOMAINS <<< "$_direct"
+        true
+    }
 
     # 显示当前域名
     echo ""
@@ -1022,7 +1038,21 @@ run_cert() {
             ;;
         4)
             install_certbot
-            load_domain_config >/dev/null 2>&1 || true
+            # 从 state 恢复域名（domain_map.conf 可能不存在或过期）
+            XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
+            GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
+            REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+            ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+            NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
+            HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+            ALL_DOMAINS=(); CDN_DOMAINS=(); DIRECT_DOMAINS=()
+            local _all _cdn _direct
+            _all=$(get_state "ALL_DOMAINS")
+            _cdn=$(get_state "CDN_DOMAINS")
+            _direct=$(get_state "DIRECT_DOMAINS")
+            [[ -n "$_all"    ]] && read -ra ALL_DOMAINS    <<< "$_all"
+            [[ -n "$_cdn"    ]] && read -ra CDN_DOMAINS    <<< "$_cdn"
+            [[ -n "$_direct" ]] && read -ra DIRECT_DOMAINS <<< "$_direct"
             if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
                 log_error "未找到域名配置，请先执行首次完整配置"
                 return 1
