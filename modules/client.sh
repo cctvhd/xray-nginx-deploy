@@ -27,6 +27,11 @@ load_existing_params() {
     ANYTLS_DOMAIN=$(read_state_value "ANYTLS_DOMAIN")
     SINGBOX_PASSWORD=$(read_state_value "SINGBOX_PASSWORD")
     XHTTP_PADDING=$(read_state_value "XHTTP_PADDING")
+    HYSTERIA2_DOMAIN=$(read_state_value "HYSTERIA2_DOMAIN")
+    HYSTERIA2_PASSWORD=$(read_state_value "HYSTERIA2_PASSWORD")
+    NAIVE_DOMAIN=$(read_state_value "NAIVE_DOMAIN")
+    NAIVE_USER=$(read_state_value "NAIVE_USER")
+    NAIVE_PASS=$(read_state_value "NAIVE_PASS")
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
@@ -214,6 +219,39 @@ security=tls\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('AnyTLS-${ANYTLS_DOMAIN}'))" 2>/dev/null)"
 }
 
+# ── 生成 Hysteria2 节点链接 ────────────────────────────────────
+gen_hysteria2_url() {
+    if [[ -z "${HYSTERIA2_DOMAIN:-}" ]] || [[ -z "${HYSTERIA2_PASSWORD:-}" ]]; then
+        return
+    fi
+
+    local password_encoded
+    password_encoded=$(python3 -c "
+import urllib.parse
+print(urllib.parse.quote('${HYSTERIA2_PASSWORD}', safe=''))
+" 2>/dev/null || echo "${HYSTERIA2_PASSWORD}")
+
+    HYSTERIA2_URL="hysteria2://${password_encoded}@${HYSTERIA2_DOMAIN}:443\
+?sni=${HYSTERIA2_DOMAIN}\
+#Hysteria2"
+}
+
+# ── 生成 NaiveProxy 节点链接 ───────────────────────────────────
+gen_naive_url() {
+    if [[ -z "${NAIVE_DOMAIN:-}" ]] || [[ -z "${NAIVE_USER:-}" ]] || [[ -z "${NAIVE_PASS:-}" ]]; then
+        return
+    fi
+
+    local pass_encoded
+    pass_encoded=$(python3 -c "
+import urllib.parse
+print(urllib.parse.quote('${NAIVE_PASS}', safe=''))
+" 2>/dev/null || echo "${NAIVE_PASS}")
+
+    NAIVE_URL="naive+https://${NAIVE_USER}:${pass_encoded}@${NAIVE_DOMAIN}:443\
+#NaiveProxy"
+}
+
 # ── 保存并展示所有链接 ───────────────────────────────────────
 show_client_links() {
     local output_file="/root/xray_client_links.txt"
@@ -300,6 +338,38 @@ JSON
         } >> "$output_file"
     fi
 
+    # Hysteria2
+    if [[ -n "${HYSTERIA2_URL:-}" ]]; then
+        echo -e "${GREEN}[Hysteria2]${NC}"
+        echo "$HYSTERIA2_URL"
+        echo -e "  服务器: ${HYSTERIA2_DOMAIN}:443"
+        echo -e "  密码:   ${HYSTERIA2_PASSWORD}"
+        echo -e "  SNI:    ${HYSTERIA2_DOMAIN}"
+        echo -e "  协议:   UDP"
+        echo ""
+        {
+            echo "# Hysteria2"
+            echo "$HYSTERIA2_URL"
+            echo ""
+        } >> "$output_file"
+    fi
+
+    # NaiveProxy
+    if [[ -n "${NAIVE_URL:-}" ]]; then
+        echo -e "${GREEN}[NaiveProxy]${NC}"
+        echo "$NAIVE_URL"
+        echo -e "  服务器: ${NAIVE_DOMAIN}:443"
+        echo -e "  用户名: ${NAIVE_USER}"
+        echo -e "  密码:   ${NAIVE_PASS}"
+        echo -e "  协议:   HTTPS"
+        echo ""
+        {
+            echo "# NaiveProxy"
+            echo "$NAIVE_URL"
+            echo ""
+        } >> "$output_file"
+    fi
+
     echo ""
     echo -e "${BLUE}========================================${NC}"
     echo ""
@@ -332,6 +402,8 @@ run_client() {
     gen_grpc_url
     gen_reality_url
     gen_anytls_url
+    gen_hysteria2_url
+    gen_naive_url
     show_client_links
     log_info "========== 客户端链接生成完成 =========="
 }
