@@ -481,7 +481,7 @@ main_menu() {
     echo "  a. 生成客户端链接"
     echo "  b. 查看当前状态"
     echo "  s. 同步/更新模块到本地缓存"
-    echo "  w. 配置 WARP WireGuard 凭证（步骤 8/9 的前置依赖）"
+    echo "  w. 配置 WARP WireGuard 凭证（步骤 10/11 的前置依赖）"
     echo "  u. 卸载 / 清理模块"
     echo "  p. SELinux 管理"
     echo "  r. 全部重装（先清理再执行 1-9）"
@@ -705,7 +705,7 @@ do_inst_xray() {
     install_xray
     save_state "INST_XRAY" "1"
 
-    log_info "Xray 安装完成，请继续执行步骤 8"
+    log_info "Xray 安装完成，请继续执行步骤 10"
     done_return
 }
 
@@ -851,7 +851,7 @@ do_conf_xray() {
     fi
 
     if [[ "$(get_step CONF_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
-        log_warn "建议先完成步骤 7（配置 Nginx）"
+        log_warn "建议先完成步骤 9（配置 Nginx）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && main_menu && return
     fi
@@ -910,7 +910,7 @@ do_conf_singbox() {
     fi
 
     if [[ "$(get_step CONF_NGINX)" != "1" ]]; then
-        log_info "提示：Nginx 尚未配置（步骤 7），443 SNI 分流暂不可用；"
+        log_info "提示：Nginx 尚未配置（步骤 9），443 SNI 分流暂不可用；"
         log_info "      Sing-Box 本身可正常启动，待 Nginx 配置完成后流量即自动接通。"
     fi
 
