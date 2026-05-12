@@ -76,6 +76,43 @@ install_naive() {
     fi
 
     log_info "NaïveProxy 安装成功: ${latest_release}"
+
+    # ── 创建 systemd service ──────────────────────────────────
+    if ! id -u caddy-naive &>/dev/null; then
+        useradd -r -d /var/lib/caddy-naive -s /sbin/nologin caddy-naive
+        log_info "已创建系统用户 caddy-naive"
+    fi
+    mkdir -p /var/lib/caddy-naive /etc/caddy-naive
+    chown -R caddy-naive:caddy-naive /var/lib/caddy-naive /etc/caddy-naive
+
+    cat > /etc/systemd/system/caddy-naive.service << 'SVC'
+[Unit]
+Description=NaïveProxy (Caddy with forwardproxy)
+Documentation=https://github.com/klzgrad/naiveproxy
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=caddy-naive
+Group=caddy-naive
+# TODO: 配置模块实现后更新 ExecStart
+ExecStart=/usr/local/bin/caddy-naive run --config /etc/caddy-naive/Caddyfile
+ExecReload=/usr/local/bin/caddy-naive reload --config /etc/caddy-naive/Caddyfile
+TimeoutStopSec=5s
+LimitNOFILE=1048576
+LimitNPROC=512
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target
+SVC
+
+    systemctl daemon-reload
+    systemctl enable caddy-naive
+    log_info "已生成 /etc/systemd/system/caddy-naive.service（已 enable）"
 }
 
 # ── 模块入口 ─────────────────────────────────────────────────
