@@ -12,7 +12,7 @@ STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-ALL_MODULES=(system unbound nginx cert xray singbox warp client sync uninstall)
+ALL_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync uninstall)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -136,8 +136,10 @@ sync_modules() {
 _sync_inst_state() {
     command -v nginx    &>/dev/null && [[ "$(get_step INST_NGINX)"   != "1" ]] && save_state "INST_NGINX"   "1" || true
     command -v xray     &>/dev/null && [[ "$(get_step INST_XRAY)"    != "1" ]] && save_state "INST_XRAY"    "1" || true
-    command -v sing-box &>/dev/null && [[ "$(get_step INST_SINGBOX)" != "1" ]] && save_state "INST_SINGBOX" "1" || true
-    command -v wgcf     &>/dev/null && [[ "$(get_step INST_WARP)"    != "1" ]] && save_state "INST_WARP"    "1" || true
+    command -v sing-box   &>/dev/null && [[ "$(get_step INST_SINGBOX)"   != "1" ]] && save_state "INST_SINGBOX"   "1" || true
+    command -v hysteria   &>/dev/null && [[ "$(get_step INST_HYSTERIA2)" != "1" ]] && save_state "INST_HYSTERIA2" "1" || true
+    command -v caddy-naive &>/dev/null && [[ "$(get_step INST_NAIVE)"    != "1" ]] && save_state "INST_NAIVE"    "1" || true
+    command -v wgcf       &>/dev/null && [[ "$(get_step INST_WARP)"      != "1" ]] && save_state "INST_WARP"      "1" || true
     command -v unbound  &>/dev/null && [[ "$(get_step INST_UNBOUND)" != "1" ]] && save_state "INST_UNBOUND" "1" || true
     systemctl is-active --quiet nginx    2>/dev/null && [[ -f /etc/nginx/conf.d/servers.conf ]] && [[ "$(get_step CONF_NGINX)"   != "1" ]] && save_state "CONF_NGINX"   "1" || true
     systemctl is-active --quiet xray     2>/dev/null && [[ -f /usr/local/etc/xray/config.json ]]    && [[ "$(get_step CONF_XRAY)"    != "1" ]] && save_state "CONF_XRAY"    "1" || true
@@ -253,6 +255,8 @@ INST_NGINX='0'
 INST_CERT='0'
 INST_XRAY='0'
 INST_SINGBOX='0'
+INST_HYSTERIA2='0'
+INST_NAIVE='0'
 INST_WARP='0'
 
 CONF_NGINX='0'
@@ -344,7 +348,7 @@ refresh_unbound_after_cert() {
 }
 
 show_status() {
-    local s_system s_unbound s_nginx s_cert s_xray s_singbox s_warp
+    local s_system s_unbound s_nginx s_cert s_xray s_singbox s_hysteria2 s_naive s_warp
     local c_nginx c_xray c_singbox c_warp
 
     { [[ "$(get_step INST_SYSTEM)"  == "1" ]] || \
@@ -370,6 +374,14 @@ show_status() {
     { [[ "$(get_step INST_SINGBOX)" == "1" ]] || \
       command -v sing-box &>/dev/null; } \
       && s_singbox="OK" || s_singbox="--"
+
+    { [[ "$(get_step INST_HYSTERIA2)" == "1" ]] || \
+      command -v hysteria &>/dev/null; } \
+      && s_hysteria2="OK" || s_hysteria2="--"
+
+    { [[ "$(get_step INST_NAIVE)" == "1" ]] || \
+      command -v caddy-naive &>/dev/null; } \
+      && s_naive="OK" || s_naive="--"
 
     { [[ "$(get_step INST_WARP)"    == "1" ]] || \
       command -v wgcf &>/dev/null; } \
@@ -405,8 +417,10 @@ show_status() {
     printf "    %-20s %s\n" "Nginx"    "${s_nginx}"
     printf "    %-20s %s\n" "Cert"     "${s_cert}"
     printf "    %-20s %s\n" "Xray"     "${s_xray}"
-    printf "    %-20s %s\n" "Sing-Box" "${s_singbox}"
-    printf "    %-20s %s\n" "WARP"     "${s_warp}"
+    printf "    %-20s %s\n" "Sing-Box"  "${s_singbox}"
+    printf "    %-20s %s\n" "Hysteria2" "${s_hysteria2}"
+    printf "    %-20s %s\n" "NaïveProxy" "${s_naive}"
+    printf "    %-20s %s\n" "WARP"      "${s_warp}"
 
     echo ""
     echo "  [配置]"
@@ -452,11 +466,13 @@ main_menu() {
     echo "  4. 申请 SSL 证书"
     echo "  5. 安装 Xray"
     echo "  6. 安装 Sing-Box"
+    echo "  7. 安装 Hysteria2"
+    echo "  8. 安装 NaïveProxy"
     echo ""
     echo "  === 配置 ==="
-    echo "  7. 配置 Nginx"
-    echo "  8. 配置 Xray"
-    echo "  9. 配置 Sing-Box"
+    echo "  9. 配置 Nginx"
+    echo "  10. 配置 Xray"
+    echo "  11. 配置 Sing-Box"
 	echo " n. 重新配置 Nginx（先清理再生成）"
 	echo " x. 重新配置 Xray（先清理再生成）"
 	echo " g. 重新配置 Sing-Box（先清理再生成）"
@@ -484,9 +500,11 @@ main_menu() {
         4) do_inst_cert ;;
         5) do_inst_xray ;;
         6) do_inst_singbox ;;
-        7) do_conf_nginx ;;
-        8) do_conf_xray ;;
-        9) do_conf_singbox ;;
+        7) do_inst_hysteria2 ;;
+        8) do_inst_naive ;;
+        9) do_conf_nginx ;;
+       10) do_conf_xray ;;
+       11) do_conf_singbox ;;
       n|N) do_reconf_nginx ;;
       x|X) do_reconf_xray ;;
       g|G) do_reconf_singbox ;;
@@ -711,7 +729,55 @@ do_inst_singbox() {
     install_singbox
     save_state "INST_SINGBOX" "1"
 
-    log_info "Sing-Box 安装完成，请继续执行步骤 9"
+    log_info "Sing-Box 安装完成，请继续执行步骤 11"
+    done_return
+}
+
+do_inst_hysteria2() {
+    load_os_info
+    load_module hysteria2
+
+    if command -v hysteria &>/dev/null; then
+        local ver reinstall
+        ver=$(hysteria version 2>&1 | grep -oP '[\d.]+' | head -1 || true)
+        log_info "Hysteria2 已安装: v${ver}"
+        read -rp "是否重新安装？[y/N]: " reinstall
+        if [[ "${reinstall,,}" != "y" ]]; then
+            save_state "INST_HYSTERIA2" "1"
+            log_info "跳过安装"
+            done_return
+            return
+        fi
+    fi
+
+    install_hysteria2
+    save_state "INST_HYSTERIA2" "1"
+
+    log_info "Hysteria2 安装完成"
+    done_return
+}
+
+do_inst_naive() {
+    load_os_info
+    load_module naive
+
+    if command -v caddy-naive &>/dev/null; then
+        local ver reinstall
+        ver=$(caddy-naive version 2>&1 | head -1 || true)
+        log_info "NaïveProxy 已安装: ${ver}"
+        read -rp "是否重新安装？[y/N]: " reinstall
+        if [[ "${reinstall,,}" != "y" ]]; then
+            save_state "INST_NAIVE" "1"
+            log_info "跳过安装"
+            done_return
+            return
+        fi
+    fi
+
+    install_naive
+    save_state "INST_NAIVE" "1"
+
+    log_info "NaïveProxy 安装完成"
     done_return
 }
 
