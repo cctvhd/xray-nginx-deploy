@@ -28,6 +28,7 @@ sync_restore_domain_arrays() {
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     XHTTP_PATH=$(get_state "XHTTP_PATH")
 
     local sn_str

@@ -674,6 +674,14 @@ $(generate_sni_map)
         proxy_connect_timeout 10s;
         proxy_timeout         7200s;
     }
+
+    # -- 中间层: 消费 proxy_protocol 后转发给 caddy-naive -------
+    server {
+        listen 127.0.0.1:18444 proxy_protocol;
+        proxy_pass            127.0.0.1:8444;
+        proxy_connect_timeout 10s;
+        proxy_timeout         7200s;
+    }
 }
 CONF
 
@@ -726,6 +734,12 @@ generate_sni_map() {
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- AnyTLS -> nginx 中间层 -> sing-box ---------------"
         echo "        ${ANYTLS_DOMAIN}       127.0.0.1:18443;"
+    fi
+
+    if [[ -n "${NAIVE_DOMAIN:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        echo "        # -- NaiveProxy -> nginx 中间层 -> caddy-naive ------"
+        echo "        ${NAIVE_DOMAIN}       127.0.0.1:18444;"
     fi
 }
 

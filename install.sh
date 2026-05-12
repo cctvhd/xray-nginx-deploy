@@ -145,6 +145,7 @@ _sync_inst_state() {
     systemctl is-active --quiet xray     2>/dev/null && [[ -f /usr/local/etc/xray/config.json ]]    && [[ "$(get_step CONF_XRAY)"    != "1" ]] && save_state "CONF_XRAY"    "1" || true
     systemctl is-active --quiet sing-box 2>/dev/null && [[ -f /etc/sing-box/config.json ]]          && [[ "$(get_step CONF_SINGBOX)"   != "1" ]] && save_state "CONF_SINGBOX"   "1" || true
     systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f /etc/hysteria/config.yaml ]]   && [[ "$(get_step CONF_HYSTERIA2)" != "1" ]] && save_state "CONF_HYSTERIA2" "1" || true
+    systemctl is-active --quiet caddy-naive 2>/dev/null && [[ -f /etc/caddy-naive/Caddyfile ]]       && [[ "$(get_step CONF_NAIVE)"     != "1" ]] && save_state "CONF_NAIVE"     "1" || true
     [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]] && \
         [[ "$(get_step CONF_WARP)" != "1" ]] && save_state "CONF_WARP" "1" || true
     _sync_cert_state
@@ -227,6 +228,9 @@ XHTTP_DOMAIN=''
 GRPC_DOMAIN=''
 REALITY_DOMAIN=''
 ANYTLS_DOMAIN=''
+NAIVE_DOMAIN=''
+NAIVE_USER=''
+NAIVE_PASS=''
 ALL_DOMAINS=''
 CDN_DOMAINS=''
 DIRECT_DOMAINS=''
@@ -267,6 +271,7 @@ CONF_NGINX='0'
 CONF_XRAY='0'
 CONF_SINGBOX='0'
 CONF_HYSTERIA2='0'
+CONF_NAIVE='0'
 CONF_WARP='0'
 ENV
         chmod 600 "$STATE_FILE"
@@ -354,7 +359,7 @@ refresh_unbound_after_cert() {
 
 show_status() {
     local s_system s_unbound s_nginx s_cert s_xray s_singbox s_hysteria2 s_naive s_warp
-    local c_nginx c_xray c_singbox c_hysteria2 c_warp
+    local c_nginx c_xray c_singbox c_hysteria2 c_naive c_warp
 
     { [[ "$(get_step INST_SYSTEM)"  == "1" ]] || \
       sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q 'bbr'; } \
@@ -408,6 +413,10 @@ show_status() {
       ( systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f /etc/hysteria/config.yaml ]] ); } \
       && c_hysteria2="OK" || c_hysteria2="--"
 
+    { [[ "$(get_step CONF_NAIVE)" == "1" ]] || \
+      ( systemctl is-active --quiet caddy-naive 2>/dev/null && [[ -f /etc/caddy-naive/Caddyfile ]] ); } \
+      && c_naive="OK" || c_naive="--"
+
     { [[ "$(get_step CONF_WARP)"    == "1" ]] || \
       [[ -f /etc/wgcf/wgcf-profile.conf ]]; } \
       && c_warp="OK"    || c_warp="--"
@@ -437,6 +446,7 @@ show_status() {
     printf "    %-20s %s\n" "Xray"     "${c_xray}"
     printf "    %-20s %s\n" "Sing-Box"  "${c_singbox}"
     printf "    %-20s %s\n" "Hysteria2" "${c_hysteria2}"
+    printf "    %-20s %s\n" "NaïveProxy" "${c_naive}"
     printf "    %-20s %s\n" "WARP"      "${c_warp}"
 
     echo ""
@@ -484,10 +494,12 @@ main_menu() {
     echo "  10. 配置 Xray"
     echo "  11. 配置 Sing-Box"
     echo "  12. 配置 Hysteria2"
+    echo "  13. 配置 NaïveProxy"
 	echo " n. 重新配置 Nginx（先清理再生成）"
 	echo " x. 重新配置 Xray（先清理再生成）"
 	echo " g. 重新配置 Sing-Box（先清理再生成）"
 	echo " h. 重新配置 Hysteria2（先清理再生成）"
+	echo " i. 重新配置 NaïveProxy（先清理再生成）"
     echo ""
     echo "  === 其他 ==="
     echo "  a. 生成客户端链接"
@@ -518,10 +530,12 @@ main_menu() {
        10) do_conf_xray ;;
        11) do_conf_singbox ;;
        12) do_conf_hysteria2 ;;
+       13) do_conf_naive ;;
       n|N) do_reconf_nginx ;;
       x|X) do_reconf_xray ;;
       g|G) do_reconf_singbox ;;
       h|H) do_reconf_hysteria2 ;;
+      i|I) do_reconf_naive ;;
         a|A) do_client ;;
         b|B)
             show_status
@@ -987,6 +1001,46 @@ do_reconf_hysteria2() {
     log_info "Hysteria2 配置清理完成，开始重新生成..."
 
     do_conf_hysteria2
+}
+
+do_conf_naive() {
+    if [[ "$(get_step INST_NAIVE)" != "1" ]] && ! command -v caddy-naive &>/dev/null; then
+        log_warn "请先完成步骤 8（安装 NaïveProxy）"
+        read -rp "是否继续？[y/N]: " c
+        [[ "${c,,}" != "y" ]] && main_menu && return
+    fi
+    if command -v caddy-naive &>/dev/null && [[ "$(get_step INST_NAIVE)" != "1" ]]; then
+        save_state "INST_NAIVE" "1"
+    fi
+
+    if [[ "$(get_step INST_CERT)" != "1" ]]; then
+        log_warn "建议先完成步骤 4（申请 SSL 证书）"
+        read -rp "是否继续？[y/N]: " c
+        [[ "${c,,}" != "y" ]] && main_menu && return
+    fi
+
+    load_os_info
+    restore_domain_arrays
+    load_module naive
+    configure_naive
+
+    save_state "CONF_NAIVE" "1"
+
+    done_return
+}
+
+do_reconf_naive() {
+    read -rp "将清理 NaïveProxy 配置并重新生成，确认继续吗？[y/N]: " c
+    [[ "${c,,}" != "y" ]] && main_menu && return
+
+    load_module uninstall
+
+    log_step "清理 NaïveProxy 配置文件..."
+    rm -f /etc/caddy-naive/Caddyfile
+    save_state "CONF_NAIVE" "0"
+    log_info "NaïveProxy 配置清理完成，开始重新生成..."
+
+    do_conf_naive
 }
 
 do_client() {
