@@ -427,6 +427,9 @@ install_base_tools() {
             ethtool iproute2 sysstat procps \
             curl wget ca-certificates \
             htop iftop iotop net-tools \
+            tar xz-utils gzip unzip \
+            nano less openssl dnsutils \
+            cron lsof \
             >/dev/null 2>&1 || true
         log_info "Debian/Ubuntu 基础工具安装完成"
 
@@ -435,6 +438,9 @@ install_base_tools() {
             ethtool iproute iproute-tc sysstat procps-ng \
             curl wget ca-certificates \
             htop iftop iotop net-tools \
+            tar xz gzip unzip \
+            nano less openssl bind-utils \
+            cronie lsof \
             >/dev/null 2>&1 || true
         log_info "RHEL/AlmaLinux 基础工具安装完成"
 
@@ -443,6 +449,9 @@ install_base_tools() {
             ethtool iproute sysstat procps-ng \
             curl wget ca-certificates \
             htop net-tools \
+            tar xz gzip unzip \
+            nano less openssl bind-utils \
+            cronie lsof \
             >/dev/null 2>&1 || true
         log_info "CentOS/RHEL(yum) 基础工具安装完成"
 
