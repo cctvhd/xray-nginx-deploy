@@ -123,7 +123,6 @@ reset_naive_state() {
 }
 
 reset_warp_state() {
-    save_state "WARP_PROXY_PORT" "40000"
     save_state "INST_WARP" "0"
     save_state "CONF_WARP" "0"
 }
@@ -258,6 +257,8 @@ cleanup_cert_module() {
     remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
     remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/xray-deploy-reload.sh"
     remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/xray-nginx-deploy-reload.sh"
+    remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/hysteria-cert.sh"
+    remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/naive-cert.sh"
     remove_path_if_exists "/etc/xray-deploy/certs"
     remove_crontab_entry "certbot renew --quiet"
 
