@@ -1026,6 +1026,10 @@ do_conf_naive() {
 
     save_state "CONF_NAIVE" "1"
 
+    if systemctl is-active --quiet nginx; then
+        sync_refresh_nginx_routes "NaiveProxy"
+    fi
+
     done_return
 }
 
