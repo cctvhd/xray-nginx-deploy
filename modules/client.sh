@@ -167,7 +167,7 @@ encryption=none\
 &fp=chrome\
 &type=grpc\
 &serviceName=grpc.Service\
-&mode=multi\
+&mode=gun\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('gRPC-CDN-${GRPC_DOMAIN}'))" 2>/dev/null)"
 }
 

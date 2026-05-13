@@ -242,8 +242,9 @@ get_naive_domain() {
 DOMAIN=$(get_naive_domain)
 [[ -z "$DOMAIN" ]] && { echo "[Naive Hook] 无法读取域名"; exit 1; }
 
-SRC_FULLCHAIN="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-SRC_PRIVKEY="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+ROOT_DOMAIN=$(echo "$DOMAIN" | sed 's/^[^.]*\.//')
+SRC_FULLCHAIN="/etc/letsencrypt/live/${ROOT_DOMAIN}/fullchain.pem"
+SRC_PRIVKEY="/etc/letsencrypt/live/${ROOT_DOMAIN}/privkey.pem"
 
 if [[ -f "$SRC_FULLCHAIN" && -f "$SRC_PRIVKEY" ]]; then
     cp "$SRC_FULLCHAIN" /etc/caddy-naive/fullchain.pem
