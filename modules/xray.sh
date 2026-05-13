@@ -285,7 +285,7 @@ generate_xray_config() {
 
     local x_padding="${XRAY_PADDING:-}"
     case "${x_padding}" in
-        ""|"128-2048"|"128-1024") x_padding="100-1000" ;;
+        ""|"128-2048"|"128-1024"|"100-1000") x_padding="100-300" ;;
     esac
     XRAY_PADDING="${x_padding}"
 
@@ -403,10 +403,10 @@ generate_xray_config() {
                         "xPaddingBytes": "${x_padding}",
                         "headers":       {"User-Agent": "chrome"},
                         "xmux": {
-                            "maxConcurrency":   "4-8",
+                            "maxConcurrency":   "8-16",
                             "maxConnections":   0,
-                            "cMaxReuseTimes":   150,
-                            "hMaxRequestTimes": "150-300",
+                            "cMaxReuseTimes":   200,
+                            "hMaxRequestTimes": "200-400",
                             "hMaxReusableSecs": "1800-3600",
                             "hKeepAlivePeriod": 60
                         }
@@ -437,7 +437,7 @@ generate_xray_config() {
                 "security": "none",
                 "grpcSettings": {
                     "serviceName":          "grpc.Service",
-                    "multiMode":            true,
+                    "multiMode":            false,
                     "idle_timeout":         80,
                     "health_check_timeout": 20
                 }
@@ -463,6 +463,16 @@ generate_xray_config() {
                 ],
                 "decryption": "none",
                 "fallbacks":  [
+                    {
+                        "path": "${XHTTP_PATH}",
+                        "dest": "127.0.0.1:10080",
+                        "xver": 0
+                    },
+                    {
+                        "path": "/grpc.Service",
+                        "dest": "127.0.0.1:10080",
+                        "xver": 0
+                    },
                     {
                         "dest": "127.0.0.1:10080",
                         "xver": 0

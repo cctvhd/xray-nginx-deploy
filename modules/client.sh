@@ -120,7 +120,7 @@ for inb in c['inbounds']:
 " 2>/dev/null || echo "")
     fi
 
-    XHTTP_PADDING="${XHTTP_PADDING:-100-1000}"
+    XHTTP_PADDING="${XHTTP_PADDING:-100-300}"
 }
 
 # ── 获取服务器IP ─────────────────────────────────────────────
@@ -289,10 +289,10 @@ show_client_links() {
         "User-Agent": "chrome"
     },
     "xmux": {
-        "maxConcurrency": "4-8",
+        "maxConcurrency": "8-16",
         "maxConnections": 0,
-        "cMaxReuseTimes": 150,
-        "hMaxRequestTimes": "150-300",
+        "cMaxReuseTimes": 200,
+        "hMaxRequestTimes": "200-400",
         "hMaxReusableSecs": "1800-3600",
         "hKeepAlivePeriod": 60
     }
