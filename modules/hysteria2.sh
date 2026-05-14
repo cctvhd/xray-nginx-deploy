@@ -495,17 +495,16 @@ acl:
   geosite: /var/lib/hysteria/geosite.dat
   geoUpdateInterval: 168h
   inline:
-    rules:
-      - reject(10.0.0.0/8)
-      - reject(172.16.0.0/12)
-      - reject(192.168.0.0/16)
-      - reject(127.0.0.0/8)
-      - reject(fc00::/7)
-      - reject(::1/128)
-      - reject(geosite:cn)
-      - reject(geosite:tld-cn)
-      - reject(geoip:cn)
-      - reject(all)
+    - reject(10.0.0.0/8)
+    - reject(172.16.0.0/12)
+    - reject(192.168.0.0/16)
+    - reject(127.0.0.0/8)
+    - reject(fc00::/7)
+    - reject(::1/128)
+    - reject(geosite:cn)
+    - reject(geosite:tld-cn)
+    - reject(geoip:cn)
+    - reject(all)
 EOF
 
     # sniff（参考 hy2.sh: 1753-1757）
