@@ -174,13 +174,13 @@ configure_hysteria2() {
             ;;
     esac
 
-    # ── 6. QUIC 窗口参数 ─────────────────────────────────────
-    # Brutal 模式：根据 BDP 计算；其他模式：基于 rmem_max
+    # ── 6. QUIC 窗口参数（参考 hy2.sh: 1608-1618）────────────
+    # Brutal 模式：根据 BDP 计算；BBR/Reno：不设置，由 Hysteria 自行管理
     local init_stream max_stream init_conn max_conn
     local max_CRW=0
 
     if [[ "${congestion_mode}" == "brutal" ]]; then
-        # 带宽冗余 ×1.10 (参考 hy2.sh)
+        # 带宽冗余 ×1.10 (参考 hy2.sh: line 1562-1563)
         local brutal_dl=$(( download + download / 10 ))
         local brutal_ul=$(( upload + upload / 10 ))
         # CRW = 延迟(s) × 带宽(bps) × 2 (参考 hy2.sh: line 1566)
@@ -191,15 +191,12 @@ configure_hysteria2() {
         init_conn=$(( CRW ))
         max_conn=$(( CRW * 3 / 2 ))
         max_CRW=$(( CRW * 3 / 2 ))
+        log_info "QUIC 窗口: stream=${init_stream}/${max_stream} conn=${init_conn}/${max_conn}"
     else
-        # BBR/Reno 固定窗口值，避免 rmem_max 动态值过大导致内存耗尽
-        init_stream=8388608
-        max_stream=33554432
-        init_conn=20971520
-        max_conn=41943040
+        # BBR/Reno 不设置 QUIC 窗口（参考 hy2.sh: line 1614 del quic.*），
+        # 否则固定值会限制 BBR 的吞吐能力
+        log_info "QUIC 窗口: 由 Hysteria2 自行管理"
     fi
-
-    log_info "QUIC 窗口: stream=${init_stream}/${max_stream} conn=${init_conn}/${max_conn}"
 
     # ── 7. 混淆（salamander）（参考 hy2.sh: 1465-1478）─────────
     local obfs_status obfs_pass
@@ -401,7 +398,9 @@ EOF
     fi
 
     # quic（参考 hy2.sh: 1608-1618）
-    cat >> "$yaml" << EOF
+    # Brutal 模式写入 BDP 计算值；BBR/Reno 不设置，由内核自动管理
+    if [[ "${congestion_mode}" == "brutal" ]]; then
+        cat >> "$yaml" << EOF
 quic:
   initStreamReceiveWindow: ${init_stream}
   maxStreamReceiveWindow: ${max_stream}
@@ -411,19 +410,21 @@ quic:
   maxIncomingStreams: 1024
   disablePathMTUDiscovery: false
 EOF
+    else
+        cat >> "$yaml" << EOF
+quic:
+  maxIdleTimeout: 30s
+  maxIncomingStreams: 1024
+  disablePathMTUDiscovery: false
+EOF
+    fi
 
-    # bandwidth
+    # bandwidth（参考 hy2.sh: 1619-1624 — Brutal 写入，BBR/Reno 跳过）
     if [[ "${congestion_mode}" == "brutal" ]]; then
         cat >> "$yaml" << EOF
 bandwidth:
   up: ${brutal_ul:-${upload}} mbps
   down: ${brutal_dl:-${download}} mbps
-EOF
-    else
-        cat >> "$yaml" << EOF
-bandwidth:
-  up: 200 mbps
-  down: 200 mbps
 EOF
     fi
 
