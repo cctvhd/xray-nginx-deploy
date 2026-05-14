@@ -29,9 +29,16 @@ load_existing_params() {
     XHTTP_PADDING=$(read_state_value "XHTTP_PADDING")
     HYSTERIA2_DOMAIN=$(read_state_value "HYSTERIA2_DOMAIN")
     HYSTERIA2_PASSWORD=$(read_state_value "HYSTERIA2_PASSWORD")
+    HYSTERIA2_PH_START=$(read_state_value "HYSTERIA2_PH_START")
+    HYSTERIA2_PH_END=$(read_state_value "HYSTERIA2_PH_END")
+    HYSTERIA2_OBFS=$(read_state_value "HYSTERIA2_OBFS")
+    HYSTERIA2_CONGESTION=$(read_state_value "HYSTERIA2_CONGESTION")
+    HYSTERIA2_UPLOAD=$(read_state_value "HYSTERIA2_UPLOAD")
+    HYSTERIA2_DOWNLOAD=$(read_state_value "HYSTERIA2_DOWNLOAD")
     NAIVE_DOMAIN=$(read_state_value "NAIVE_DOMAIN")
     NAIVE_USER=$(read_state_value "NAIVE_USER")
     NAIVE_PASS=$(read_state_value "NAIVE_PASS")
+    NAIVE_PROBE_LINK=$(read_state_value "NAIVE_PROBE_LINK")
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
@@ -216,6 +223,7 @@ print(urllib.parse.quote('${SINGBOX_PASSWORD}', safe=''))
 security=tls\
 &sni=${ANYTLS_DOMAIN}\
 &alpn=h2\
+&insecure=0\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('AnyTLS-${ANYTLS_DOMAIN}'))" 2>/dev/null)"
 }
 
@@ -231,9 +239,14 @@ import urllib.parse
 print(urllib.parse.quote('${HYSTERIA2_PASSWORD}', safe=''))
 " 2>/dev/null || echo "${HYSTERIA2_PASSWORD}")
 
-    HYSTERIA2_URL="hysteria2://${password_encoded}@${HYSTERIA2_DOMAIN}:443\
-?sni=${HYSTERIA2_DOMAIN}\
-#Hysteria2"
+    local extra_params="sni=${HYSTERIA2_DOMAIN}&insecure=0"
+    [[ -n "${HYSTERIA2_PH_START:-}" && -n "${HYSTERIA2_PH_END:-}" ]] && extra_params+="&mport=${HYSTERIA2_PH_START}-${HYSTERIA2_PH_END}"
+    [[ -n "${HYSTERIA2_OBFS:-}" ]] && extra_params+="&obfs=${HYSTERIA2_OBFS}"
+    if [[ "${HYSTERIA2_CONGESTION}" == "brutal" ]]; then
+        [[ -n "${HYSTERIA2_UPLOAD:-}" ]] && extra_params+="&up=${HYSTERIA2_UPLOAD}"
+        [[ -n "${HYSTERIA2_DOWNLOAD:-}" ]] && extra_params+="&down=${HYSTERIA2_DOWNLOAD}"
+    fi
+    HYSTERIA2_URL="hysteria2://${password_encoded}@${HYSTERIA2_DOMAIN}:443?${extra_params}#Hysteria2"
 }
 
 # ── 生成 NaiveProxy 节点链接 ───────────────────────────────────
@@ -248,8 +261,9 @@ import urllib.parse
 print(urllib.parse.quote('${NAIVE_PASS}', safe=''))
 " 2>/dev/null || echo "${NAIVE_PASS}")
 
-    NAIVE_URL="naive+https://${NAIVE_USER}:${pass_encoded}@${NAIVE_DOMAIN}:443\
-#NaiveProxy"
+    local naive_params="padding=true"
+    [[ -n "${NAIVE_PROBE_LINK:-}" ]] && naive_params+="&probe-resistance=${NAIVE_PROBE_LINK}.${NAIVE_DOMAIN}"
+    NAIVE_URL="naive+https://${NAIVE_USER}:${pass_encoded}@${NAIVE_DOMAIN}:443?${naive_params}#NaiveProxy"
 }
 
 # ── 保存并展示所有链接 ───────────────────────────────────────

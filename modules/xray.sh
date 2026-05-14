@@ -288,6 +288,7 @@ generate_xray_config() {
         ""|"128-2048"|"128-1024"|"100-1000") x_padding="100-300" ;;
     esac
     XRAY_PADDING="${x_padding}"
+    save_state "XHTTP_PADDING" "${x_padding}"
 
     local user_timeout=30000
 
