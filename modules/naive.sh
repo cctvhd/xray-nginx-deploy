@@ -301,6 +301,7 @@ configure_naive() {
     # ── 5. probe_resistance 链接 ──────────────────────────────
     local probe_link
     probe_link=$(openssl rand -hex 8)
+    save_state "NAIVE_PROBE_LINK" "${probe_link}"
     log_info "probe_resistance: ${probe_link}.${NAIVE_DOMAIN}"
 
     # ── 6. 伪装反代 ──────────────────────────────────────────
@@ -410,6 +411,12 @@ HOOK
     log_info "密码：   ${NAIVE_PASS}"
     log_info "协议：   HTTPS"
     log_info "probe_resistance: ${probe_link}.${NAIVE_DOMAIN}"
+
+    local naive_pass_encoded
+    naive_pass_encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${NAIVE_PASS}', safe=''))" 2>/dev/null || echo "${NAIVE_PASS}")
+    local naive_url_extra="padding=true"
+    [[ -n "${probe_link}" ]] && naive_url_extra+="&probe-resistance=${probe_link}.${NAIVE_DOMAIN}"
+    log_info "链接：     naive+https://${NAIVE_USER}:${naive_pass_encoded}@${NAIVE_DOMAIN}:443?${naive_url_extra}#NaiveProxy"
     echo ""
 }
 

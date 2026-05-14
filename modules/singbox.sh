@@ -90,6 +90,7 @@ generate_singbox_params() {
         SINGBOX_PASSWORD="${SINGBOX_PASSWORD}-$(openssl rand -hex 4)"
         log_info "生成新 AnyTLS 密码"
     fi
+    save_state "SINGBOX_PASSWORD" "${SINGBOX_PASSWORD}"
 
     log_info "AnyTLS 密码: ${SINGBOX_PASSWORD}"
     if [[ "${SINGBOX_PASSWORD}" == *"#"* || \
@@ -110,6 +111,7 @@ collect_singbox_params() {
     else
         read -rp "输入 AnyTLS 域名: " ANYTLS_DOMAIN
     fi
+    save_state "ANYTLS_DOMAIN" "${ANYTLS_DOMAIN}"
 
     local root_domain
     root_domain=$(echo "$ANYTLS_DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
@@ -341,5 +343,9 @@ run_singbox() {
     log_info "关键参数（请保存）："
     echo "  AnyTLS 域名:  ${ANYTLS_DOMAIN}"
     echo "  AnyTLS 密码:  ${SINGBOX_PASSWORD}"
-    echo "  监听端口:     8443"
+    echo "  监听端口:     8443 (nginx → 127.0.0.1:8443)"
+
+    local anytls_pass_encoded
+    anytls_pass_encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${SINGBOX_PASSWORD}', safe=''))" 2>/dev/null || echo "${SINGBOX_PASSWORD}")
+    log_info "链接：     anytls://${anytls_pass_encoded}@${ANYTLS_DOMAIN}:443?security=tls&sni=${ANYTLS_DOMAIN}&alpn=h2&insecure=0#AnyTLS-${ANYTLS_DOMAIN}"
 }
