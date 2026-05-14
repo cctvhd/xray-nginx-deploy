@@ -6,39 +6,32 @@
 
 # ── 读取已有配置参数 ─────────────────────────────────────────
 load_existing_params() {
-    local state_file="/etc/xray-deploy/config.env"
     local xray_config="/usr/local/etc/xray/config.json"
     local sb_config="/etc/sing-box/config.json"
 
-    read_state_value() {
-        local key="$1"
-        grep "^${key}=" "$state_file" 2>/dev/null | \
-            head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//"
-    }
-
-    XRAY_UUID=$(read_state_value "XRAY_UUID")
-    XHTTP_PATH=$(read_state_value "XHTTP_PATH")
-    XHTTP_DOMAIN=$(read_state_value "XHTTP_DOMAIN")
-    GRPC_DOMAIN=$(read_state_value "GRPC_DOMAIN")
-    XRAY_PUBLIC_KEY=$(read_state_value "XRAY_PUBLIC_KEY")
-    REALITY_SNI=$(read_state_value "REALITY_SNI")
-    REALITY_SHORT_ID=$(read_state_value "REALITY_SHORT_ID")
-    REALITY_SPIDER_X=$(read_state_value "REALITY_SPIDER_X")
-    ANYTLS_DOMAIN=$(read_state_value "ANYTLS_DOMAIN")
-    SINGBOX_PASSWORD=$(read_state_value "SINGBOX_PASSWORD")
-    XHTTP_PADDING=$(read_state_value "XHTTP_PADDING")
-    HYSTERIA2_DOMAIN=$(read_state_value "HYSTERIA2_DOMAIN")
-    HYSTERIA2_PASSWORD=$(read_state_value "HYSTERIA2_PASSWORD")
-    HYSTERIA2_PH_START=$(read_state_value "HYSTERIA2_PH_START")
-    HYSTERIA2_PH_END=$(read_state_value "HYSTERIA2_PH_END")
-    HYSTERIA2_OBFS=$(read_state_value "HYSTERIA2_OBFS")
-    HYSTERIA2_CONGESTION=$(read_state_value "HYSTERIA2_CONGESTION")
-    HYSTERIA2_UPLOAD=$(read_state_value "HYSTERIA2_UPLOAD")
-    HYSTERIA2_DOWNLOAD=$(read_state_value "HYSTERIA2_DOWNLOAD")
-    NAIVE_DOMAIN=$(read_state_value "NAIVE_DOMAIN")
-    NAIVE_USER=$(read_state_value "NAIVE_USER")
-    NAIVE_PASS=$(read_state_value "NAIVE_PASS")
-    NAIVE_PROBE_LINK=$(read_state_value "NAIVE_PROBE_LINK")
+    XRAY_UUID=$(get_state "XRAY_UUID")
+    XHTTP_PATH=$(get_state "XHTTP_PATH")
+    XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
+    GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
+    XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
+    REALITY_SNI=$(get_state "REALITY_SNI")
+    REALITY_SHORT_ID=$(get_state "REALITY_SHORT_ID")
+    REALITY_SPIDER_X=$(get_state "REALITY_SPIDER_X")
+    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
+    XHTTP_PADDING=$(get_state "XHTTP_PADDING")
+    HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+    HYSTERIA2_PASSWORD=$(get_state "HYSTERIA2_PASSWORD")
+    HYSTERIA2_PH_START=$(get_state "HYSTERIA2_PH_START")
+    HYSTERIA2_PH_END=$(get_state "HYSTERIA2_PH_END")
+    HYSTERIA2_OBFS=$(get_state "HYSTERIA2_OBFS")
+    HYSTERIA2_CONGESTION=$(get_state "HYSTERIA2_CONGESTION")
+    HYSTERIA2_UPLOAD=$(get_state "HYSTERIA2_UPLOAD")
+    HYSTERIA2_DOWNLOAD=$(get_state "HYSTERIA2_DOWNLOAD")
+    NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
+    NAIVE_USER=$(get_state "NAIVE_USER")
+    NAIVE_PASS=$(get_state "NAIVE_PASS")
+    NAIVE_PROBE_LINK=$(get_state "NAIVE_PROBE_LINK")
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
@@ -48,8 +41,8 @@ load_existing_params() {
             XHTTP_PATH=$(grep -oP '"path":\s*"\K[^"]+' "$xray_config" | head -1)
         [[ -n "${XHTTP_DOMAIN:-}" ]] || \
             XHTTP_DOMAIN=$(grep -oP '"host":\s*"\K[^"]+' "$xray_config" | head -1)
-        REALITY_DEST=$(grep -oP '"dest":\s*"\K[^"]+' "$xray_config" | head -1)
-        XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1)
+        REALITY_DEST=$(grep -oP '"dest":\s*"\K[^"]+' "$xray_config" | head -1 || true)
+        XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1 || true)
 
         # 读取第一个非空 shortId
         [[ -n "${REALITY_SHORT_ID:-}" ]] || REALITY_SHORT_ID=$(python3 -c "
@@ -91,8 +84,8 @@ for inb in c['inbounds']:
             reality_privkey=$(grep -oP '"privateKey":\s*"\K[^"]+' "$xray_config" | head -1)
             if [[ -n "${reality_privkey:-}" ]]; then
                 local keypair
-                keypair=$(xray x25519 -i "$reality_privkey" 2>/dev/null)
-                XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
+                keypair=$(xray x25519 -i "$reality_privkey" 2>/dev/null || true)
+                XRAY_PUBLIC_KEY=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}' || true)
             fi
         fi
 
@@ -100,7 +93,7 @@ for inb in c['inbounds']:
         if [[ -z "${GRPC_DOMAIN:-}" ]]; then
             GRPC_DOMAIN=$(grep -oP 'server_name\s+\K\S+' \
                 /etc/nginx/conf.d/servers.conf 2>/dev/null | \
-                grep -v "^\." | sed -n '2p' | tr -d ';')
+                grep -v "^\." | sed -n '2p' | tr -d ';' || true)
         fi
     fi
 
