@@ -488,39 +488,23 @@ EOF
         echo "  listenHTTPS: :${HY2_PORT}" >> "$yaml"
     fi
 
-    # ACL（参考 hy2.sh: 1625 + 本地规则）
-    mkdir -p /etc/hihy/acl
-    local acl_file="/etc/hihy/acl/hysteria2.acl"
-    > "$acl_file"
-    if [[ "${block_http3}" == "true" ]]; then
-        echo "reject(all, udp/443)" >> "$acl_file"
-    fi
-    cat >> "$acl_file" << EOF
-reject(10.0.0.0/8)
-reject(172.16.0.0/12)
-reject(192.168.0.0/16)
-reject(127.0.0.0/8)
-reject(fc00::/7)
-reject(::1/128)
-EOF
-    cat >> "$yaml" << EOF
-acl:
-  file: ${acl_file}
-  geoip: /var/lib/hysteria/geoip.dat
-  geosite: /var/lib/hysteria/geosite.dat
-  geoUpdateInterval: 168h
-  inline:
-    - reject(10.0.0.0/8)
-    - reject(172.16.0.0/12)
-    - reject(192.168.0.0/16)
-    - reject(127.0.0.0/8)
-    - reject(fc00::/7)
-    - reject(::1/128)
-    - reject(geosite:cn)
-    - reject(geosite:tld-cn)
-    - reject(geoip:cn)
-    - reject(all)
-EOF
+    # ACL — only inline（acl.file 和 acl.inline 不能共存，二选一）
+    local acl_entries=()
+    [[ "${block_http3}" == "true" ]] && acl_entries+=("reject(all, udp/443)")
+    acl_entries+=("reject(10.0.0.0/8)" "reject(172.16.0.0/12)" "reject(192.168.0.0/16)")
+    acl_entries+=("reject(127.0.0.0/8)" "reject(fc00::/7)" "reject(::1/128)")
+    acl_entries+=("reject(geosite:cn)" "reject(geosite:tld-cn)" "reject(geoip:cn)")
+    acl_entries+=("reject(all)")
+    {
+        echo "acl:"
+        echo "  geoip: /var/lib/hysteria/geoip.dat"
+        echo "  geosite: /var/lib/hysteria/geosite.dat"
+        echo "  geoUpdateInterval: 168h"
+        echo "  inline:"
+        for entry in "${acl_entries[@]}"; do
+            echo "    - ${entry}"
+        done
+    } >> "$yaml"
 
     # sniff（参考 hy2.sh: 1753-1757）
     cat >> "$yaml" << EOF
