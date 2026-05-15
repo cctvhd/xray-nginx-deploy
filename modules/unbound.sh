@@ -291,12 +291,12 @@ _build_own_domain_zones() {
             done
         fi
         if [[ $is_cdn -eq 0 ]]; then
-            echo "    local-zone: "${hy2_domain}." static"
+            echo "    local-zone: \"${hy2_domain}.\" static"
             if [[ -n "$server_ipv4" ]]; then
-                echo "    local-data: "${hy2_domain}. 300 IN A ${server_ipv4}""
+                echo "    local-data: \"${hy2_domain}. 300 IN A ${server_ipv4}\""
             fi
             if [[ -n "$server_ipv6" ]]; then
-                echo "    local-data: "${hy2_domain}. 300 IN AAAA ${server_ipv6}""
+                echo "    local-data: \"${hy2_domain}. 300 IN AAAA ${server_ipv6}\""
             fi
         fi
     fi
@@ -312,12 +312,12 @@ _build_own_domain_zones() {
             done
         fi
         if [[ $is_cdn -eq 0 ]]; then
-            echo "    local-zone: "${naive_domain}." static"
+            echo "    local-zone: \"${naive_domain}.\" static"
             if [[ -n "$server_ipv4" ]]; then
-                echo "    local-data: "${naive_domain}. 300 IN A ${server_ipv4}""
+                echo "    local-data: \"${naive_domain}. 300 IN A ${server_ipv4}\""
             fi
             if [[ -n "$server_ipv6" ]]; then
-                echo "    local-data: "${naive_domain}. 300 IN AAAA ${server_ipv6}""
+                echo "    local-data: \"${naive_domain}. 300 IN AAAA ${server_ipv6}\""
             fi
         fi
     fi
