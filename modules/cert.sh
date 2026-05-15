@@ -110,6 +110,25 @@ install_certbot_legacy() {
 }
 
 # ── 安装 Certbot + CF 插件 ───────────────────────────────────
+update_certbot_deps() {
+    log_step "========== Certbot 依赖检查/更新 =========="
+
+    if certbot_uses_snap; then
+        log_info "检测到 snap 版 certbot，刷新插件..."
+        snap refresh certbot 2>/dev/null || true
+        snap refresh certbot-dns-cloudflare 2>/dev/null || true
+        snap install certbot-dns-cloudflare 2>/dev/null || true
+        log_info "snap 插件更新完成"
+    else
+        log_info "检测到传统版 certbot，更新插件..."
+        pip3 install --upgrade certbot certbot-dns-cloudflare 2>/dev/null \
+            || $PKG_INSTALL certbot python3-certbot-dns-cloudflare
+        log_info "传统插件更新完成"
+    fi
+
+    certbot --version 2>&1 | grep -v "^$" | head -3
+}
+
 install_certbot() {
     if check_certbot_installed; then
         log_info "Certbot 已安装，跳过"
@@ -1355,6 +1374,7 @@ run_cert() {
     echo "  2. 新增 Cloudflare 账号"
     echo "  3. 新增域名并申请证书（复用已有CF账号）"
     echo "  4. 仅补申请证书（域名已配置）"
+    echo "  5. 检查/更新 Certbot 及 DNS 插件"
     echo ""
     read -rp "  请选择 [1-4，默认1]: " cert_choice
     cert_choice="${cert_choice:-1}"
@@ -1370,6 +1390,10 @@ run_cert() {
             install_certbot
             add_domain_and_cert
             log_info "========== 新增域名完成 =========="
+            return
+            ;;
+        5)
+            update_certbot_deps
             return
             ;;
         4)
