@@ -448,7 +448,6 @@ show_status() {
         for _d in "${CDN_DOMAINS[@]:-}"; do
             [[ "$_d" == "$domain" ]] && tag="CDN" && break
         done
-        local n=1
         for _ini in /etc/cloudflare/cf_account_*.ini; do
             [[ -f "$_ini" ]] || continue
             local _root_domain
@@ -457,7 +456,6 @@ show_status() {
             if [[ -f "$_dom_ini" ]]; then
                 ini=" [domain_${_root_domain}.ini]"
             fi
-            (( n++ ))
         done
         printf "  %-10s : %-30s %s%s\n" "$label" "$domain" "$tag" "$ini"
     }
