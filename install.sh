@@ -291,6 +291,8 @@ ENV
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+    NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     XHTTP_PATH=$(get_state "XHTTP_PATH")
     XRAY_UUID=$(get_state "XRAY_UUID")
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
@@ -945,6 +947,8 @@ do_conf_singbox() {
     load_os_info
     restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+    NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
 
     _ensure_wgcf
 
@@ -1270,6 +1274,8 @@ run_full_install_flow() {
 
     restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+    NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     generate_singbox_params
     collect_singbox_params
     generate_singbox_config
