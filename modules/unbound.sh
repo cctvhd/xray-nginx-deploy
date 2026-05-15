@@ -276,6 +276,52 @@ _build_own_domain_zones() {
         fi
     fi
 
+    local hy2_domain naive_domain
+    hy2_domain=$(get_state "HYSTERIA2_DOMAIN" "")
+    naive_domain=$(get_state "NAIVE_DOMAIN" "")
+
+    # Hysteria2 域名：static zone + A/AAAA 记录（CDN域名跳过）
+    if [[ -n "$hy2_domain" ]]; then
+        local is_cdn=0
+        if [[ -n "$cdn_str" ]]; then
+            local _cdn_arr=()
+            read -ra _cdn_arr <<< "$cdn_str"
+            for _d in "${_cdn_arr[@]}"; do
+                [[ "$_d" == "$hy2_domain" ]] && is_cdn=1 && break
+            done
+        fi
+        if [[ $is_cdn -eq 0 ]]; then
+            echo "    local-zone: "${hy2_domain}." static"
+            if [[ -n "$server_ipv4" ]]; then
+                echo "    local-data: "${hy2_domain}. 300 IN A ${server_ipv4}""
+            fi
+            if [[ -n "$server_ipv6" ]]; then
+                echo "    local-data: "${hy2_domain}. 300 IN AAAA ${server_ipv6}""
+            fi
+        fi
+    fi
+
+    # NaiveProxy 域名：static zone + A/AAAA 记录（CDN域名跳过）
+    if [[ -n "$naive_domain" ]]; then
+        local is_cdn=0
+        if [[ -n "$cdn_str" ]]; then
+            local _cdn_arr=()
+            read -ra _cdn_arr <<< "$cdn_str"
+            for _d in "${_cdn_arr[@]}"; do
+                [[ "$_d" == "$naive_domain" ]] && is_cdn=1 && break
+            done
+        fi
+        if [[ $is_cdn -eq 0 ]]; then
+            echo "    local-zone: "${naive_domain}." static"
+            if [[ -n "$server_ipv4" ]]; then
+                echo "    local-data: "${naive_domain}. 300 IN A ${server_ipv4}""
+            fi
+            if [[ -n "$server_ipv6" ]]; then
+                echo "    local-data: "${naive_domain}. 300 IN AAAA ${server_ipv6}""
+            fi
+        fi
+    fi
+
     # CDN 域名：只标注注释，不做本地解析
     if [[ -n "$cdn_str" ]]; then
         local cdn_domains=()
@@ -289,7 +335,7 @@ _build_own_domain_zones() {
         done
     fi
 
-    if [[ -z "$reality_domain" && -z "$anytls_domain" && -z "$cdn_str" ]]; then
+    if [[ -z "$reality_domain" && -z "$anytls_domain" && -z "$hy2_domain" && -z "$naive_domain" && -z "$cdn_str" ]]; then
         echo "    # 暂无自有域名配置"
     fi
 }
