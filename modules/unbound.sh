@@ -704,8 +704,12 @@ run_unbound() {
         echo " 1. 跳过"
         echo " 2. 重新配置"
         echo " 3. 完整重装"
-        read -rp "请选择 [1-3，默认1]: " unbound_choice
+        echo " 4. 仅刷新域名配置（不重建基础环境）"
+        read -rp "请选择 [1-4，默认1]: " unbound_choice
         case "${unbound_choice:-1}" in
+            4)
+                refresh_unbound_generated_config && log_info "域名配置已刷新" || log_error "刷新失败"
+                ;;
             3)
                 collect_unbound_stack_mode
                 collect_unbound_service_name
