@@ -451,9 +451,11 @@ show_status() {
         local n=1
         for _ini in /etc/cloudflare/cf_account_*.ini; do
             [[ -f "$_ini" ]] || continue
-            local _dom_ini="/etc/cloudflare/domain_${domain}.ini"
+            local _root_domain
+            _root_domain=$(echo "$domain" | awk -F'.' '{print $(NF-1)"."$NF}')
+            local _dom_ini="/etc/cloudflare/domain_${_root_domain}.ini"
             if [[ -f "$_dom_ini" ]]; then
-                ini=" [cf_account_${n}.ini]"
+                ini=" [domain_${_root_domain}.ini]"
             fi
             (( n++ ))
         done
