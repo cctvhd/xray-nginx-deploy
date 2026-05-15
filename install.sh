@@ -455,6 +455,8 @@ show_status() {
     [[ -n "${GRPC_DOMAIN:-}"    ]] && echo "    gRPC    : ${GRPC_DOMAIN}"
     [[ -n "${REALITY_DOMAIN:-}" ]] && echo "    Reality : ${REALITY_DOMAIN}"
     [[ -n "${ANYTLS_DOMAIN:-}"  ]] && echo "    AnyTLS  : ${ANYTLS_DOMAIN}"
+    [[ -n "${HYSTERIA2_DOMAIN:-}"  ]] && echo "  Hysteria2  : ${HYSTERIA2_DOMAIN}"
+    [[ -n "${NAIVE_DOMAIN:-}"  ]]     && echo "  NaiveProxy : ${NAIVE_DOMAIN}"
 
     if [[ -n "${HW_CPU_CORES:-}" ]]; then
         echo ""
@@ -706,9 +708,7 @@ do_inst_cert() {
     REALITY_DOMAIN="${REALITY_DOMAIN:-}"
     ANYTLS_DOMAIN="${ANYTLS_DOMAIN:-}"
 
-    if [[ "$(get_step INST_UNBOUND)" == "1" ]] || command -v unbound &>/dev/null; then
-        refresh_unbound_after_cert
-    fi
+
 
     done_return
 }
@@ -1196,9 +1196,7 @@ run_full_install_flow() {
     save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
     save_state "INST_CERT"      "1"
 
-    if [[ "$(get_step INST_UNBOUND)" == "1" ]] || command -v unbound &>/dev/null; then
-        refresh_unbound_after_cert
-    fi
+
 
     restore_domain_arrays
     XHTTP_PATH=$(get_state "XHTTP_PATH")
