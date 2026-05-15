@@ -362,6 +362,8 @@ refresh_unbound_after_cert() {
 show_status() {
     local s_system s_unbound s_nginx s_cert s_xray s_singbox s_hysteria2 s_naive s_warp
     local c_nginx c_xray c_singbox c_hysteria2 c_naive c_warp
+    restore_domain_arrays 2>/dev/null || true
+    local cf_ini_for_domain=""
 
     { [[ "$(get_step INST_SYSTEM)"  == "1" ]] || \
       sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q 'bbr'; } \
@@ -453,12 +455,31 @@ show_status() {
 
     echo ""
     echo "  [域名]"
-    [[ -n "${XHTTP_DOMAIN:-}"   ]] && echo "    xhttp   : ${XHTTP_DOMAIN}"
-    [[ -n "${GRPC_DOMAIN:-}"    ]] && echo "    gRPC    : ${GRPC_DOMAIN}"
-    [[ -n "${REALITY_DOMAIN:-}" ]] && echo "    Reality : ${REALITY_DOMAIN}"
-    [[ -n "${ANYTLS_DOMAIN:-}"  ]] && echo "    AnyTLS  : ${ANYTLS_DOMAIN}"
-    [[ -n "${HYSTERIA2_DOMAIN:-}"  ]] && echo "  Hysteria2  : ${HYSTERIA2_DOMAIN}"
-    [[ -n "${NAIVE_DOMAIN:-}"  ]]     && echo "  NaiveProxy : ${NAIVE_DOMAIN}"
+    _show_domain() {
+        local label="$1" domain="$2"
+        [[ -z "$domain" ]] && return
+        local tag="直连"
+        local ini=""
+        for _d in "${CDN_DOMAINS[@]:-}"; do
+            [[ "$_d" == "$domain" ]] && tag="CDN" && break
+        done
+        local n=1
+        for _ini in /etc/cloudflare/cf_account_*.ini; do
+            [[ -f "$_ini" ]] || continue
+            local _dom_ini="/etc/cloudflare/domain_${domain}.ini"
+            if [[ -f "$_dom_ini" ]]; then
+                ini=" [cf_account_${n}.ini]"
+            fi
+            (( n++ ))
+        done
+        printf "  %-10s : %-30s %s%s\n" "$label" "$domain" "$tag" "$ini"
+    }
+    _show_domain "xhttp"     "${XHTTP_DOMAIN:-}"
+    _show_domain "gRPC"      "${GRPC_DOMAIN:-}"
+    _show_domain "Reality"   "${REALITY_DOMAIN:-}"
+    _show_domain "AnyTLS"    "${ANYTLS_DOMAIN:-}"
+    _show_domain "Hysteria2" "${HYSTERIA2_DOMAIN:-}"
+    _show_domain "NaiveProxy" "${NAIVE_DOMAIN:-}"
 
     if [[ -n "${HW_CPU_CORES:-}" ]]; then
         echo ""
