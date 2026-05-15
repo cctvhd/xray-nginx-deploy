@@ -112,8 +112,8 @@ install_certbot_legacy() {
 # ── 安装 Certbot + CF 插件 ───────────────────────────────────
 install_certbot() {
     if check_certbot_installed; then
-        read -rp "Certbot 已安装，是否重新安装？[y/N]: " reinstall
-        [[ "${reinstall,,}" != "y" ]] && return
+        log_info "Certbot 已安装，跳过"
+        return 0
     fi
 
     log_step "安装 Certbot + Cloudflare 插件..."
