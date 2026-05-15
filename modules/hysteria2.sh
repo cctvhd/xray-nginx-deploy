@@ -247,7 +247,8 @@ configure_hysteria2() {
             ;;
         3)
             masquerade_type="file"
-            masquerade_file="/etc/hihy/file"
+            masquerade_file="/etc/hysteria2/masquerade"
+            mkdir -p "${masquerade_file}"
             log_info "伪装: file / ${masquerade_file}"
             ;;
         *)
