@@ -343,21 +343,6 @@ restore_domain_arrays() {
     sync_restore_domain_arrays
 }
 
-refresh_unbound_after_cert() {
-    if ! command -v unbound &>/dev/null; then
-        return 0
-    fi
-
-    load_module unbound
-
-    restore_domain_arrays
-    UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
-    if refresh_unbound_generated_config; then
-        log_info "Unbound 配置已按当前设置刷新"
-    else
-        log_warn "Unbound 配置刷新失败，请先根据上面的诊断信息修复后再执行步骤 2"
-    fi
-}
 
 show_status() {
     local s_system s_unbound s_nginx s_cert s_xray s_singbox s_hysteria2 s_naive s_warp
