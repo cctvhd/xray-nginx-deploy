@@ -1362,6 +1362,7 @@ migrate_cf_account_files() {
 # ── 模块入口 ─────────────────────────────────────────────────
 run_cert() {
     set +e
+    trap "set -e" RETURN
     log_step "========== SSL 证书申请 =========="
 
     # 自动迁移旧格式 CF 账号文件
@@ -1376,7 +1377,7 @@ run_cert() {
     echo "  4. 仅补申请证书（域名已配置）"
     echo "  5. 检查/更新 Certbot 及 DNS 插件"
     echo ""
-    read -rp "  请选择 [1-4，默认1]: " cert_choice
+    read -rp "  请选择 [1-5，默认1]: " cert_choice
     cert_choice="${cert_choice:-1}"
 
     case "$cert_choice" in
