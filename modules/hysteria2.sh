@@ -510,7 +510,7 @@ EOF
     # sniff（参考 hy2.sh: 1753-1757）
     cat >> "$yaml" << EOF
 sniff:
-  enabled: true
+  enable: true
   timeout: 2s
   rewriteDomain: false
   tcpPorts: 80,443
