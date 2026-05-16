@@ -523,7 +523,7 @@ outbounds:
   - name: direct
     type: direct
     direct:
-      mode: auto
+      mode: 64
       fastOpen: false
   - name: v4_only
     type: direct
