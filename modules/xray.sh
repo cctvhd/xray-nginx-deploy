@@ -512,7 +512,7 @@ generate_xray_config() {
             "tag":      "direct",
             "protocol": "freedom",
             "settings": {
-                "domainStrategy": "ForceIPv4v6"
+                "domainStrategy": "UseIPv6v4"
             },
             "streamSettings": {
                 "sockopt": {

@@ -394,7 +394,7 @@ ${iface_ipv6}
     so-sndbuf: 8m
 
     # === 安全加固 ===
-    prefer-ip6: no
+    prefer-ip6: yes
     deny-any: yes
     harden-glue: yes
     harden-referral-path: yes
