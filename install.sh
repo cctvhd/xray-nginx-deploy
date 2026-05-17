@@ -33,6 +33,17 @@ check_root() {
     fi
 }
 
+# ── 获取全局文件锁，防止并发 ────────────────────────────────
+acquire_lock() {
+    local lock_file="${STATE_DIR}/install.lock"
+    mkdir -p "$STATE_DIR" 2>/dev/null || lock_file="/tmp/xray-nginx-deploy.lock"
+    exec {LOCK_FD}>"$lock_file"
+    if ! flock -n "$LOCK_FD" 2>/dev/null; then
+        log_error "另一个 xray-nginx-deploy 实例正在运行"
+        exit 1
+    fi
+}
+
 get_state() {
     local key="$1"
     local default="${2:-}"
@@ -78,11 +89,24 @@ load_module() {
     local cached_path="${LOCAL_MODULES_DIR}/${module}.sh"
     local local_path="${MODULES_DIR}/${module}.sh"
     local remote_url="${BASE_URL}/modules/${module}.sh"
+    local first_line
 
     if [[ -f "$cached_path" ]]; then
+        first_line=$(head -n 1 "$cached_path" 2>/dev/null || true)
+        if [[ -z "$first_line" ]] || { [[ "$first_line" != '#!'* ]] && [[ "$first_line" != '#' ]]; }; then
+            log_error "模块 ${module}.sh 首行安全检查失败: ${first_line:-<空>}"
+            rm -f "$cached_path"
+            exit 1
+        fi
         # shellcheck source=/dev/null
         source "$cached_path"
     elif [[ -f "$local_path" ]]; then
+        first_line=$(head -n 1 "$local_path" 2>/dev/null || true)
+        if [[ -z "$first_line" ]] || { [[ "$first_line" != '#!'* ]] && [[ "$first_line" != '#' ]]; }; then
+            log_error "模块 ${module}.sh 首行安全检查失败: ${first_line:-<空>}"
+            rm -f "$local_path"
+            exit 1
+        fi
         # shellcheck source=/dev/null
         source "$local_path"
     else
@@ -92,6 +116,12 @@ load_module() {
         if curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
             chmod 600 "$cached_path"
             log_info "模块 ${module}.sh 已缓存至 ${cached_path}"
+            first_line=$(head -n 1 "$cached_path" 2>/dev/null || true)
+            if [[ -z "$first_line" ]] || { [[ "$first_line" != '#!'* ]] && [[ "$first_line" != '#' ]]; }; then
+                log_error "远程模块 ${module}.sh 首行安全检查失败: ${first_line:-<空>}"
+                rm -f "$cached_path"
+                exit 1
+            fi
             # shellcheck source=/dev/null
             source "$cached_path"
         else
@@ -1477,5 +1507,6 @@ main_menu_loop() {
 }
 
 check_root
+acquire_lock
 init_state
 main_menu_loop
