@@ -43,7 +43,7 @@ get_state() {
     fi
 
     local value
-    value=$(grep "^${key}=" "$STATE_FILE" 2>/dev/null | \
+    value=$(grep -F "${key}=" "$STATE_FILE" 2>/dev/null | \
         head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true)
 
     if [[ -n "$value" ]]; then
@@ -479,100 +479,11 @@ show_status() {
     echo ""
 }
 
-main_menu() {
-    clear
-    echo ""
-    echo -e "${BLUE}==========================================${NC}"
-    echo -e "${BLUE}   Xray + Nginx + Sing-Box 部署工具${NC}"
-    echo -e "${BLUE}   GitHub: cctvhd/xray-nginx-deploy${NC}"
-    echo -e "${BLUE}==========================================${NC}"
-
-    show_status
-
-    echo "  === 安装 ==="
-    echo "  1. 系统初始化与优化"
-    echo "  2. 安装并配置 Unbound"
-    echo "  3. 安装 Nginx"
-    echo "  4. 申请 SSL 证书"
-    echo "  5. 安装 Xray"
-    echo "  6. 安装 Sing-Box"
-    echo "  7. 安装 Hysteria2"
-    echo "  8. 安装 NaiveProxy"
-    echo ""
-    echo "  === 配置 ==="
-    echo "  9. 配置 Nginx"
-    echo "  10. 配置 Xray"
-    echo "  11. 配置 Sing-Box"
-    echo "  12. 配置 Hysteria2"
-    echo "  13. 配置 NaiveProxy"
-	echo " n. 重新配置 Nginx（先清理再生成）"
-	echo " x. 重新配置 Xray（先清理再生成）"
-	echo " g. 重新配置 Sing-Box（先清理再生成）"
-	echo " h. 重新配置 Hysteria2（先清理再生成）"
-	echo " i. 重新配置 NaiveProxy（先清理再生成）"
-    echo ""
-    echo "  === 其他 ==="
-    echo "  a. 生成客户端链接"
-    echo "  b. 查看当前状态"
-    echo "  s. 同步/更新模块到本地缓存"
-    echo "  w. 配置 WARP WireGuard 凭证（步骤 10/11 的前置依赖）"
-    echo "  u. 卸载 / 清理模块"
-    echo "  p. SELinux 管理"
-    echo "  r. 全部重装（先清理再执行 1-9）"
-    echo "  0. 全流程一键安装（步骤 1-9）"
-    echo "  q. 退出"
-    echo ""
-    echo -e "  再次运行: ${CYAN}bash <(curl -fsSL ${BASE_URL}/install.sh)${NC}"
-    echo ""
-    read -rp "  请选择: " choice
-    echo ""
-
-    case "$choice" in
-        1) do_inst_system ;;
-        2) do_inst_unbound ;;
-        3) do_inst_nginx ;;
-        4) do_inst_cert ;;
-        5) do_inst_xray ;;
-        6) do_inst_singbox ;;
-        7) do_inst_hysteria2 ;;
-        8) do_inst_naive ;;
-        9) do_conf_nginx ;;
-       10) do_conf_xray ;;
-       11) do_conf_singbox ;;
-       12) do_conf_hysteria2 ;;
-       13) do_conf_naive ;;
-      n|N) do_reconf_nginx ;;
-      x|X) do_reconf_xray ;;
-      g|G) do_reconf_singbox ;;
-      h|H) do_reconf_hysteria2 ;;
-      i|I) do_reconf_naive ;;
-        a|A) do_client ;;
-        b|B)
-            show_status
-            read -rp "按回车返回主菜单..." _
-            main_menu
-            ;;
-        s|S) do_sync_modules ;;
-        w|W) do_warp ;;
-        u|U) do_uninstall_menu ;;
-        p|P) do_selinux_mgmt ;;
-        r|R) do_reinstall_all ;;
-        0) do_full_install ;;
-        q|Q) exit 0 ;;
-        *)
-            log_error "无效选择"
-            sleep 1
-            main_menu
-            ;;
-    esac
-}
-
 do_sync_modules() {
     echo ""
     log_warn "将从 GitHub 下载所有模块覆盖本地缓存，需要网络连接。"
     read -rp "确认继续？[y/N]: " confirm
     if [[ "${confirm,,}" != "y" ]]; then
-        main_menu
         return
     fi
     echo ""
@@ -607,8 +518,6 @@ _ensure_wgcf() {
 done_return() {
     echo ""
     read -rp "按回车返回主菜单..." _
-    init_state
-    main_menu
 }
 
 do_inst_system() {
@@ -821,7 +730,7 @@ do_conf_nginx() {
     if [[ "$(get_step INST_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
         log_warn "请先完成步骤 3（安装 Nginx）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
     if command -v nginx &>/dev/null && [[ "$(get_step INST_NGINX)" != "1" ]]; then
         save_state "INST_NGINX" "1"
@@ -880,7 +789,7 @@ do_conf_xray() {
     if [[ "$(get_step INST_XRAY)" != "1" ]] && ! command -v xray &>/dev/null; then
         log_warn "请先完成步骤 5（安装 Xray）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
     if command -v xray &>/dev/null && [[ "$(get_step INST_XRAY)" != "1" ]]; then
         save_state "INST_XRAY" "1"
@@ -889,7 +798,7 @@ do_conf_xray() {
     if [[ "$(get_step CONF_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
         log_warn "建议先完成步骤 9（配置 Nginx）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
 
     load_os_info
@@ -933,7 +842,7 @@ do_conf_singbox() {
     if [[ "$(get_step INST_SINGBOX)" != "1" ]] && ! command -v sing-box &>/dev/null; then
         log_warn "请先完成步骤 6（安装 Sing-Box）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
     if command -v sing-box &>/dev/null && [[ "$(get_step INST_SINGBOX)" != "1" ]]; then
         save_state "INST_SINGBOX" "1"
@@ -942,7 +851,7 @@ do_conf_singbox() {
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
         log_warn "建议先完成步骤 4（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
 
     if [[ "$(get_step CONF_NGINX)" != "1" ]]; then
@@ -977,7 +886,7 @@ do_conf_hysteria2() {
     if [[ "$(get_step INST_HYSTERIA2)" != "1" ]] && ! command -v hysteria &>/dev/null; then
         log_warn "请先完成步骤 7（安装 Hysteria2）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
     if command -v hysteria &>/dev/null && [[ "$(get_step INST_HYSTERIA2)" != "1" ]]; then
         save_state "INST_HYSTERIA2" "1"
@@ -986,7 +895,7 @@ do_conf_hysteria2() {
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
         log_warn "建议先完成步骤 4（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
 
     load_os_info
@@ -1001,7 +910,7 @@ do_conf_hysteria2() {
 
 do_reconf_hysteria2() {
     read -rp "将清理 Hysteria2 配置并重新生成，确认继续吗？[y/N]: " c
-    [[ "${c,,}" != "y" ]] && main_menu && return
+    [[ "${c,,}" != "y" ]] && return
 
     load_module uninstall
 
@@ -1017,7 +926,7 @@ do_conf_naive() {
     if [[ "$(get_step INST_NAIVE)" != "1" ]] && ! command -v caddy-naive &>/dev/null; then
         log_warn "请先完成步骤 8（安装 NaiveProxy）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
     if command -v caddy-naive &>/dev/null && [[ "$(get_step INST_NAIVE)" != "1" ]]; then
         save_state "INST_NAIVE" "1"
@@ -1026,7 +935,7 @@ do_conf_naive() {
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
         log_warn "建议先完成步骤 4（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
-        [[ "${c,,}" != "y" ]] && main_menu && return
+        [[ "${c,,}" != "y" ]] && return
     fi
 
     load_os_info
@@ -1045,7 +954,7 @@ do_conf_naive() {
 
 do_reconf_naive() {
     read -rp "将清理 NaiveProxy 配置并重新生成，确认继续吗？[y/N]: " c
-    [[ "${c,,}" != "y" ]] && main_menu && return
+    [[ "${c,,}" != "y" ]] && return
 
     load_module uninstall
 
@@ -1116,7 +1025,6 @@ do_uninstall_menu() {
        10)
             read -rp "这会删除本脚本生成的大部分服务、配置和证书，确认继续吗？[y/N]: " confirm_cleanup
             if [[ "${confirm_cleanup,,}" != "y" ]]; then
-                main_menu
                 return
             fi
             cleanup_all_modules
@@ -1124,18 +1032,12 @@ do_uninstall_menu() {
             init_state
             ;;
         q|Q)
-            main_menu
-            return
             ;;
         *)
             log_error "无效选择"
             sleep 1
-            main_menu
-            return
             ;;
     esac
-
-    done_return
 }
 
 run_full_install_flow() {
@@ -1303,7 +1205,7 @@ do_full_install() {
 # ── 重新配置（先清理配置再重新生成）─────────────────────
 do_reconf_nginx() {
 	read -rp "将清理 Nginx 配置并重新生成，确认继续吗？[y/N]: " c
-	[[ "${c,,}" != "y" ]] && main_menu && return
+	[[ "${c,,}" != "y" ]] && return
 
 	load_module uninstall
 
@@ -1322,7 +1224,7 @@ do_reconf_nginx() {
 
 do_reconf_xray() {
 	read -rp "将清理 Xray 配置并重新生成，确认继续吗？[y/N]: " c
-	[[ "${c,,}" != "y" ]] && main_menu && return
+	[[ "${c,,}" != "y" ]] && return
 
 	load_module uninstall
 
@@ -1346,7 +1248,7 @@ do_reconf_xray() {
 
 do_reconf_singbox() {
 	read -rp "将清理 Sing-Box 配置并重新生成，确认继续吗？[y/N]: " c
-	[[ "${c,,}" != "y" ]] && main_menu && return
+	[[ "${c,,}" != "y" ]] && return
 
 	load_module uninstall
 
@@ -1370,7 +1272,6 @@ do_selinux_mgmt() {
         log_info "当前系统未安装 SELinux，无需管理"
         echo ""
         read -rp "按回车返回主菜单..." _
-        main_menu
         return
     fi
 
@@ -1470,13 +1371,12 @@ do_selinux_mgmt() {
 
     echo ""
     read -rp "按回车返回主菜单..." _
-    main_menu
+    return
 }
 
 do_reinstall_all() {
     read -rp "这会先清理全部，再重新执行完整安装流程，确认继续吗？[y/N]: " reinstall_all
     if [[ "${reinstall_all,,}" != "y" ]]; then
-        main_menu
         return
     fi
 
@@ -1485,9 +1385,97 @@ do_reinstall_all() {
     rm -f "$STATE_FILE"
     init_state
     run_full_install_flow
-    done_return
+}
+
+# ── 主循环 ─────────────────────────────────────────────────
+main_menu_loop() {
+    while true; do
+        clear
+        echo ""
+        echo -e "${BLUE}==========================================${NC}"
+        echo -e "${BLUE}   Xray + Nginx + Sing-Box 部署工具${NC}"
+        echo -e "${BLUE}   GitHub: cctvhd/xray-nginx-deploy${NC}"
+        echo -e "${BLUE}==========================================${NC}"
+
+        show_status
+
+        echo "  === 安装 ==="
+        echo "  1. 系统初始化与优化"
+        echo "  2. 安装并配置 Unbound"
+        echo "  3. 安装 Nginx"
+        echo "  4. 申请 SSL 证书"
+        echo "  5. 安装 Xray"
+        echo "  6. 安装 Sing-Box"
+        echo "  7. 安装 Hysteria2"
+        echo "  8. 安装 NaiveProxy"
+        echo ""
+        echo "  === 配置 ==="
+        echo "  9. 配置 Nginx"
+        echo "  10. 配置 Xray"
+        echo "  11. 配置 Sing-Box"
+        echo "  12. 配置 Hysteria2"
+        echo "  13. 配置 NaiveProxy"
+        echo " n. 重新配置 Nginx（先清理再生成）"
+        echo " x. 重新配置 Xray（先清理再生成）"
+        echo " g. 重新配置 Sing-Box（先清理再生成）"
+        echo " h. 重新配置 Hysteria2（先清理再生成）"
+        echo " i. 重新配置 NaiveProxy（先清理再生成）"
+        echo ""
+        echo "  === 其他 ==="
+        echo "  a. 生成客户端链接"
+        echo "  b. 查看当前状态"
+        echo "  s. 同步/更新模块到本地缓存"
+        echo "  w. 配置 WARP WireGuard 凭证（步骤 10/11 的前置依赖）"
+        echo "  u. 卸载 / 清理模块"
+        echo "  p. SELinux 管理"
+        echo "  r. 全部重装（先清理再执行 1-9）"
+        echo "  0. 全流程一键安装（步骤 1-9）"
+        echo "  q. 退出"
+        echo ""
+        echo -e "  再次运行: ${CYAN}bash <(curl -fsSL ${BASE_URL}/install.sh)${NC}"
+        echo ""
+        read -rp "  请选择: " choice
+        echo ""
+
+        case "$choice" in
+            1) do_inst_system ;;
+            2) do_inst_unbound ;;
+            3) do_inst_nginx ;;
+            4) do_inst_cert ;;
+            5) do_inst_xray ;;
+            6) do_inst_singbox ;;
+            7) do_inst_hysteria2 ;;
+            8) do_inst_naive ;;
+            9) do_conf_nginx ;;
+           10) do_conf_xray ;;
+           11) do_conf_singbox ;;
+           12) do_conf_hysteria2 ;;
+           13) do_conf_naive ;;
+          n|N) do_reconf_nginx ;;
+          x|X) do_reconf_xray ;;
+          g|G) do_reconf_singbox ;;
+          h|H) do_reconf_hysteria2 ;;
+          i|I) do_reconf_naive ;;
+            a|A) do_client ;;
+            b|B)
+                show_status
+                read -rp "按回车返回主菜单..." _
+                ;;
+            s|S) do_sync_modules ;;
+            w|W) do_warp ;;
+            u|U) do_uninstall_menu ;;
+            p|P) do_selinux_mgmt ;;
+            r|R) do_reinstall_all ;;
+            0) run_full_install_flow ;;
+            q|Q) exit 0 ;;
+            *)
+                log_error "无效选择"
+                sleep 1
+                ;;
+        esac
+    done
 }
 
 check_root
 init_state
-main_menu
+main_menu_loop
