@@ -520,9 +520,11 @@ generate_nginx_conf() {
     # 代理转发会同时占用客户端和上游连接，按 worker_connections 动态留余量。
     local worker_rlimit_nofile=$(( NGINX_WORKER_CONNECTIONS * 2 + 8192 ))
 
-    [[ -f /etc/nginx/nginx.conf ]] && \
+    if [[ -f /etc/nginx/nginx.conf ]]; then
+        rm -f /etc/nginx/nginx.conf.bak.*
         cp /etc/nginx/nginx.conf \
            "/etc/nginx/nginx.conf.bak.$(date +%Y%m%d%H%M%S)"
+    fi
 
     cat > /etc/nginx/nginx.conf << CONF
 # ============================================================
