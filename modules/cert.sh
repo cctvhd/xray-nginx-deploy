@@ -404,8 +404,8 @@ load_domain_config() {
         _key="${_line%%=*}"
         _value="${_line#*=}"
         # 去掉可选的引号
-        [[ "$_value" == \"*" || "$_value" == \"* ]] && _value="${_value:1}"
-        [[ "$_value" == *\" || "$_value" == *\' ]] && _value="${_value%?}"
+        [[ "$_value" == '"'* || "$_value" == "'"* ]] && _value="${_value:1}"
+        [[ "$_value" == *'"' || "$_value" == *"'" ]] && _value="${_value%?}"
 
         declare -g "$_key=$_value" 2>/dev/null || true
     done < "$CF_DOMAIN_MAP_FILE"
