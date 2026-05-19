@@ -1113,23 +1113,7 @@ add_domain_and_cert() {
         echo "  （暂无）"
     fi
 
-    # 显示 CF 账号列表
-    echo ""
-    log_info "当前 CF 账号（如需新增请退出后选择选项2）："
-    local cf_files
-    cf_files=$(_filter_dup_cf_accounts)
-    if [[ -z "$cf_files" ]]; then
-        log_error "未找到任何 CF 账号，请先执行选项 2 添加账号"
-        return 1
-    fi
-    for f in $cf_files; do
-        local label base
-        base=$(basename "$f" .ini | sed 's/^cf_account_//')
-        label=$(_cf_account_label "$f")
-        echo "  [${base}] $(basename "$f")  |  ${label}"
-    done
-
-    # ── 循环添加域名 ──────────────────────────────────────────
+    # 循环添加域名
     local new_domains=()
 
     while true; do
@@ -1177,40 +1161,57 @@ add_domain_and_cert() {
             *)           mode="direct" ;;
         esac
 
-        # ── 关联 CF 账号（自动匹配 → 手动选）─────────────────
+        # ── 关联 CF 账号（自动匹域名 → 手动选）─────────────
         root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-        local _ini_base _ini_file
+        local _ini_base _ini_file _matched_ini=() _auto_ini
         _ini_base=$(domain_to_ini_name "$root_domain")
         _ini_file="${CF_CONFIG_DIR}/${_ini_base}.ini"
 
         if [[ -f "$_ini_file" ]]; then
-            log_info "已自动匹配 CF 账号: ${_ini_base}.ini"
-            cp "$_ini_file" "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
-            chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+            # 精确匹配成功
+            _auto_ini="$_ini_file"
+            log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
         else
-            echo ""
-            log_info "可用 CF 账号："
-            for f in $cf_files; do
-                local lb b
-                b=$(basename "$f" .ini | sed 's/^cf_account_//')
-                lb=$(_cf_account_label "$f")
-                echo "  [${b}]  $(basename "$f")  |  ${lb}"
+            # 模糊匹配：扫描所有 ini（排除 domain_ 映射文件），找出包含根域的文件
+            for _f in "${CF_CONFIG_DIR}"/*.ini; do
+                [[ -f "$_f" ]] || continue
+                [[ "$(basename "$_f")" == domain_* ]] && continue
+                [[ "$(basename "$_f")" == *"${_ini_base}"* ]] && _matched_ini+=("$_f")
             done
-            local cf_choice _src_ini
-            read -rp "输入方括号内标识选择 CF 账号: " cf_choice
-            [[ -z "$cf_choice" ]] && { log_error "未选择账号"; return 1; }
 
-            # 兼容新格式 <name>.ini 和旧格式 cf_account_N.ini
-            _src_ini="${CF_CONFIG_DIR}/${cf_choice}.ini"
-            [[ -f "$_src_ini" ]] || _src_ini="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
+            if [[ ${#_matched_ini[@]} -eq 1 ]]; then
+                _auto_ini="${_matched_ini[0]}"
+                log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
+            else
+                # 匹配不到或有多于一个候选，展示列表让手动选择
+                echo ""
+                log_info "可用 CF 账号："
+                for _f in "${CF_CONFIG_DIR}"/*.ini; do
+                    [[ -f "$_f" ]] || continue
+                    [[ "$(basename "$_f")" == domain_* ]] && continue
+                    local _lb _b
+                    _b=$(basename "$_f" .ini | sed 's/^cf_account_//')
+                    _lb=$(_cf_account_label "$_f")
+                    echo "  [${_b}] $(basename "$_f")  (token: ${_lb})"
+                done
+                local cf_choice _src_ini
+                read -rp "输入方括号内标识选择 CF 账号: " cf_choice
+                [[ -z "$cf_choice" ]] && { log_error "未选择账号"; return 1; }
 
-            [[ -f "$_src_ini" ]] || {
-                log_error "CF 账号文件不存在: ${_src_ini}"
-                return 1
-            }
-            cp "$_src_ini" "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
-            chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+                _src_ini="${CF_CONFIG_DIR}/${cf_choice}.ini"
+                [[ -f "$_src_ini" ]] || _src_ini="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
+
+                [[ -f "$_src_ini" ]] || {
+                    log_error "CF 账号文件不存在: ${_src_ini}"
+                    return 1
+                }
+                _auto_ini="$_src_ini"
+            fi
         fi
+
+        # 复制到 domain_ 映射文件以共后续证书申请使用
+        cp "$_auto_ini" "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+        chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
 
         # 注册域名
         register_domain "$domain" "$mode" "$protocols"
