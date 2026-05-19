@@ -1220,6 +1220,7 @@ add_domain_and_cert() {
         _dom_ini_base=$(domain_to_ini_name "$root_domain")
         cp "$_auto_ini" "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
         chmod 600 "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
+        sed -i '/^[[:space:]]*dns_cloudflare_email/d' "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
 
         # 注册域名
         register_domain "$domain" "$mode" "$protocols"
