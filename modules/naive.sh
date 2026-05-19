@@ -19,8 +19,50 @@ _get_forwardproxy_module() {
     echo "$mod_path"
 }
 
+# ── 检查 naive 模块运行所需的基础依赖 ────────────────────
+_check_naive_system_deps() {
+    local missing=()
+
+    # 优先尝试自动安装 tar/curl（AlmaLinux 等精简镜像常见缺失）
+    for pkg in curl tar; do
+        if ! command -v "$pkg" &>/dev/null; then
+            log_warn "${pkg} 未找到，尝试自动安装..."
+            if command -v apt-get &>/dev/null; then
+                apt-get install -y -qq "$pkg" > /dev/null
+            elif command -v dnf &>/dev/null; then
+                dnf install -y "$pkg" > /dev/null
+            elif command -v yum &>/dev/null; then
+                yum install -y "$pkg" > /dev/null
+            fi
+            if ! command -v "$pkg" &>/dev/null; then
+                missing+=("$pkg")
+            fi
+        fi
+    done
+
+    for cmd in mktemp openssl python3 awk systemctl; do
+        if ! command -v "$cmd" &>/dev/null; then
+            missing+=("$cmd")
+        fi
+    done
+
+    if [[ ${#missing[@]} -gt 0 ]]; then
+        log_error "以下必要工具缺失，请先安装: ${missing[*]}"
+        if command -v apt-get &>/dev/null; then
+            log_info "Debian/Ubuntu 用户可尝试: apt-get install -y curl tar mktemp openssl python3 gawk"
+        elif command -v dnf &>/dev/null; then
+            log_info "RHEL/AlmaLinux 用户可尝试: dnf install -y curl tar mktemp openssl python3 gawk"
+        elif command -v yum &>/dev/null; then
+            log_info "RHEL/CentOS 用户可尝试: yum install -y curl tar mktemp openssl python3 gawk"
+        fi
+        exit 1
+    fi
+}
+
 install_naive() {
+    set -x  # DEBUG: 追踪执行
     log_step "安装 NaiveProxy 服务端（xcaddy 编译 Caddy+forwardproxy）..."
+    _check_naive_system_deps
 
     # ── 0. 检测架构 ────────────────────────────────────────
     local arch go_arch
@@ -32,18 +74,18 @@ install_naive() {
         *) log_error "不支持的架构: $arch"; exit 1 ;;
     esac
 
-    # ── 1. 安装编译依赖：gcc git ──────────────────────────
+    # ── 1. 安装编译依赖：gcc git tar curl ──────────────────
     if command -v apt-get &>/dev/null; then
         apt-get update -qq
-        apt-get install -y -qq gcc git > /dev/null
+        apt-get install -y -qq gcc git tar curl > /dev/null
     elif command -v dnf &>/dev/null; then
-        dnf install -y gcc git > /dev/null
+        dnf install -y gcc git tar curl > /dev/null
     elif command -v yum &>/dev/null; then
-        yum install -y gcc git > /dev/null
+        yum install -y gcc git tar curl > /dev/null
     else
-        log_warn "无法自动安装 gcc/git，请手动确保已安装"
+        log_warn "无法自动安装 gcc/git/tar/curl，请手动确保已安装"
     fi
-    log_info "编译依赖 (gcc/git) 就绪"
+    log_info "编译依赖 (gcc/git/tar/curl) 就绪"
 
     # ── 2. 安装 Go (≥1.21) ─────────────────────────────────
     local go_bin
@@ -82,13 +124,18 @@ install_naive() {
         fi
 
         rm -rf /usr/local/go
-        tar -C /usr/local -xzf "${tmpdir}/${go_tar}"
+        if ! tar -C /usr/local -xzf "${tmpdir}/${go_tar}"; then
+            log_error "Go 压缩包解压失败: ${tmpdir}/${go_tar}"
+            rm -rf "$tmpdir"
+            set +x
+            exit 1
+        fi
         rm -rf "$tmpdir"
 
         export PATH="/usr/local/go/bin:$PATH"
         grep -q '/usr/local/go/bin' /etc/profile 2>/dev/null \
             || echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
-        log_info "Go $(go version 2>&1 | grep -oP 'go[\d.]+' | head -1) 安装完成"
+        log_info "Go $(go version 2>&1 | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1) 安装完成"
     else
         log_info "Go 已就绪: $(go version)"
     fi
@@ -132,9 +179,21 @@ install_naive() {
         exit 1
     fi
 
-    cp "${build_tmpdir}/caddy" /usr/local/bin/caddy-naive
+    if ! cp "${build_tmpdir}/caddy" /usr/local/bin/caddy-naive; then
+        log_error "安装 caddy-naive 失败: 无法复制到 /usr/local/bin/"
+        rm -rf "$build_tmpdir"
+        set +x
+        exit 1
+    fi
     chmod +x /usr/local/bin/caddy-naive
     rm -rf "$build_tmpdir"
+
+    # SELinux: 标记 Caddy 二进制为普通 bin_t（AlmaLinux/CentOS 12/SuSE 等加固环境）
+    if command -v semanage &>/dev/null; then
+        semanage fcontext -a -t bin_t /usr/local/bin/caddy-naive 2>/dev/null || true
+        semodule -i /dev/null 2>/dev/null || true
+        restorecon -v /usr/local/bin/caddy-naive 2>/dev/null || true
+    fi
 
     local caddy_ver
     caddy_ver=$(caddy-naive version 2>&1 | head -1)
@@ -142,11 +201,17 @@ install_naive() {
 
     # ── 6. 创建系统用户 & systemd service ──────────────────
     if ! id -u caddy-naive &>/dev/null; then
-        useradd -r -d /var/lib/caddy-naive -s /sbin/nologin caddy-naive
+        local nologin_shell
+        nologin_shell=$(command -v nologin 2>/dev/null || echo "/usr/sbin/nologin")
+        useradd -r -d /var/lib/caddy-naive -s "$nologin_shell" caddy-naive
         log_info "已创建系统用户 caddy-naive"
     fi
     mkdir -p /var/lib/caddy-naive /etc/caddy-naive
-    chown -R caddy-naive:caddy-naive /var/lib/caddy-naive /etc/caddy-naive
+    if ! chown -R caddy-naive:caddy-naive /var/lib/caddy-naive /etc/caddy-naive; then
+        log_error "chown 失败，请确认 caddy-naive 用户存在"
+        set +x
+        exit 1
+    fi
 
     cat > /etc/systemd/system/caddy-naive.service << 'SVC'
 [Unit]
@@ -175,6 +240,7 @@ SVC
     systemctl daemon-reload
     systemctl enable caddy-naive
     log_info "已生成 systemd service（已 enable）"
+    set +x  # DEBUG: 关闭追踪
 }
 
 # ── 辅助：从 nginx 配置探测 naive Caddy 端口 ──────────────
