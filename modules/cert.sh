@@ -996,23 +996,11 @@ _filter_dup_cf_accounts() {
     done
 }
 
-# ── 从 ini 文件提取账号显示标签 ──────────────────────────────
+# ── 从 ini 文件提取 token 预览（前8位…后4位）───────────────────
 _cf_account_label() {
-    local ini_file="$1"
-    local email token token_display
-    email=$(grep 'dns_cloudflare_email' "$ini_file" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-    token=$(grep 'dns_cloudflare_api_token' "$ini_file" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-    local token_len=${#token}
-    if [[ "$token_len" -ge 16 ]]; then
-        token_display="${token:0:12}...${token: -4}"
-    else
-        token_display="${token:0:8}..."
-    fi
-    if [[ -n "$email" ]]; then
-        echo "邮箱: ${email}  |  token: ${token_display}"
-    else
-        echo "token: ${token_display}"
-    fi
+    local token
+    token=$(grep 'dns_cloudflare_api_token' "$1" 2>/dev/null | cut -d= -f2 | tr -d ' ')
+    echo "${token:0:8}...${token: -4}"
 }
 
 # ── 新增 Cloudflare 账号 ─────────────────────────────────────
@@ -1189,55 +1177,40 @@ add_domain_and_cert() {
             *)           mode="direct" ;;
         esac
 
-        # ── 关联 CF 账号 ──────────────────────────────────────
+        # ── 关联 CF 账号（自动匹配 → 手动选）─────────────────
         root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+        local _ini_base _ini_file
+        _ini_base=$(domain_to_ini_name "$root_domain")
+        _ini_file="${CF_CONFIG_DIR}/${_ini_base}.ini"
 
-        local matched_file
-        matched_file=$(get_cf_account_by_domain "$domain")
-        local new_cf_file
-
-        if [[ -n "$matched_file" && -f "$matched_file" ]]; then
-            local matched_base
-            matched_base=$(basename "$matched_file" .ini | sed 's/^cf_account_//')
-            log_info "检测到根域名 ${root_domain} 已关联 CF 账号（${matched_base}）"
-            local use_matched
-            read -rp "直接使用该账号？[Y/n]: " use_matched
-            if [[ "${use_matched,,}" != "n" ]]; then
-                new_cf_file="$matched_file"
-            fi
-        fi
-
-        if [[ -z "${new_cf_file:-}" ]]; then
+        if [[ -f "$_ini_file" ]]; then
+            log_info "已自动匹配 CF 账号: ${_ini_base}.ini"
+            cp "$_ini_file" "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+            chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+        else
             echo ""
             log_info "可用 CF 账号："
             for f in $cf_files; do
                 local lb b
                 b=$(basename "$f" .ini | sed 's/^cf_account_//')
                 lb=$(_cf_account_label "$f")
-                echo "  [${b}] $(basename "$f")  |  ${lb}"
+                echo "  [${b}]  $(basename "$f")  |  ${lb}"
             done
-            read -rp "使用哪个 CF 账号（输入方括号内的标识）: " cf_choice
+            local cf_choice _src_ini
+            read -rp "输入方括号内标识选择 CF 账号: " cf_choice
             [[ -z "$cf_choice" ]] && { log_error "未选择账号"; return 1; }
-            new_cf_file="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
-        fi
 
-        [[ -f "${new_cf_file}" ]] || {
-            log_error "CF 账号文件不存在: ${new_cf_file}"
-            return 1
-        }
+            # 兼容新格式 <name>.ini 和旧格式 cf_account_N.ini
+            _src_ini="${CF_CONFIG_DIR}/${cf_choice}.ini"
+            [[ -f "$_src_ini" ]] || _src_ini="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
 
-        # 写入 CF 映射
-        local cf_idx
-        cf_idx=$(basename "$new_cf_file" .ini | sed 's/^cf_account_//')
-        local existing_acct_domains
-        existing_acct_domains=$(grep "^CF_ACCOUNT_${cf_idx}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null \
-            | cut -d= -f2- | tr -d "'\"" || true)
-        if [[ " $existing_acct_domains " != *" $domain "* ]]; then
-            sed -i "/^CF_ACCOUNT_${cf_idx}=/d" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || true
-            echo "CF_ACCOUNT_${cf_idx}='${existing_acct_domains} ${domain}'" >> "${CF_DOMAIN_MAP_FILE}"
+            [[ -f "$_src_ini" ]] || {
+                log_error "CF 账号文件不存在: ${_src_ini}"
+                return 1
+            }
+            cp "$_src_ini" "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+            chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
         fi
-        cp "$new_cf_file" "${CF_CONFIG_DIR}/domain_${root_domain}.ini" 2>/dev/null || true
-        chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini" 2>/dev/null || true
 
         # 注册域名
         register_domain "$domain" "$mode" "$protocols"
@@ -1474,7 +1447,8 @@ run_cert() {
         2)
             install_certbot
             add_cf_account
-            log_info "========== 新增 CF 账号完成 =========="
+            log_info "新增 CF 账号完成，继续添加域名..."
+            add_domain_and_cert
             return
             ;;
         3)
