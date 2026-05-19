@@ -89,7 +89,7 @@ install_naive() {
 
     # ── 2. 安装 Go (≥1.21) ─────────────────────────────────
     local go_bin
-    go_bin=$(command -v go 2>/dev/null)
+    go_bin=$(command -v go 2>/dev/null || true)
 
     if [[ -n "$go_bin" ]]; then
         local go_ver go_major go_minor
