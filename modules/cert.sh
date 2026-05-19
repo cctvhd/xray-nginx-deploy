@@ -1024,13 +1024,12 @@ add_cf_account() {
         echo ""
     fi
 
-    local cf_root cf_email cf_token
-    read -rp "该账号管理的根域名（如 zhongning.tk，CF 面板可查）: " cf_root
+    local cf_root cf_token
+    read -rp "该账号管理的根域名（如 zhongning.tk）: " cf_root
     cf_root="${cf_root,,}"
     [[ -z "$cf_root" ]] && { log_error "根域名不能为空"; return 1; }
 
-    read -rp "请输入新 CF 账号的 Email: " cf_email
-    read -rp "请输入新 CF 账号的 API Token（或 Global API Key）: " cf_token
+    read -rp "请输入 CF API Token: " cf_token
 
     local filebase
     filebase=$(domain_to_ini_name "$cf_root")
@@ -1038,7 +1037,6 @@ add_cf_account() {
 
     cat > "$ini_file" << INI
 # Cloudflare API Token — ${cf_root}
-dns_cloudflare_email = ${cf_email}
 dns_cloudflare_api_token = ${cf_token}
 INI
     chmod 600 "$ini_file"
@@ -1209,9 +1207,11 @@ add_domain_and_cert() {
             fi
         fi
 
-        # 复制到 domain_ 映射文件以共后续证书申请使用
-        cp "$_auto_ini" "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
-        chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+        # 复制到 domain_ 映射文件以供后续证书申请使用
+        local _dom_ini_base
+        _dom_ini_base=$(domain_to_ini_name "$root_domain")
+        cp "$_auto_ini" "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
+        chmod 600 "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
 
         # 注册域名
         register_domain "$domain" "$mode" "$protocols"
@@ -1411,6 +1411,8 @@ migrate_cf_account_files() {
         local new_ini="${cf_dir}/${new_base}.ini"
 
         cp "$ini" "$new_ini"
+        # 旧格式可能有 email 字段，Token 认证不需要，过滤掉
+        sed -i '/^[[:space:]]*dns_cloudflare_email/d' "$new_ini"
         chmod 600 "$new_ini"
 
         echo "CF_ACCOUNT_${bname}='${cf_root}'" >> "${CF_DOMAIN_MAP_FILE}"
