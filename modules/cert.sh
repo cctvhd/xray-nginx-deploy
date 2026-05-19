@@ -449,6 +449,33 @@ normalize_domain_arrays() {
 # ════════════════════════════════════════════════════════════
 
 # ── 收集域名信息 ─────────────────────────────────────────────
+_collect_domain_cf() {
+    local domain="$1"
+    local root_domain
+    root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+
+    [[ -z "$domain" ]] && return
+    has_domain_ini "$root_domain" && return
+
+    local cf_idx="1"
+
+    if [[ "${CF_ACCOUNT_COUNT:-1}" -gt 1 ]]; then
+        echo ""
+        echo "  为 *.${root_domain} 选择 Cloudflare 账号："
+        for j in $(seq 1 "$CF_ACCOUNT_COUNT"); do
+            local token_preview
+            token_preview=$(grep 'api_token' \
+                "${CF_CONFIG_DIR}/cf_account_${j}.ini" 2>/dev/null | \
+                awk '{print $3}' | cut -c1-12)
+            echo "    [${j}] ${token_preview}..."
+        done
+        read -rp "  使用第几个 CF 账号？[1-${CF_ACCOUNT_COUNT}]: " cf_idx
+        cf_idx="${cf_idx:-1}"
+    fi
+
+    link_domain_to_cf_account "$root_domain" "$cf_idx"
+}
+
 collect_domains() {
     echo ""
     log_step "配置域名信息"
@@ -456,32 +483,32 @@ collect_domains() {
 
     if load_domain_config; then
         log_info "发现已有域名配置："
-        [[ -n "${XHTTP_DOMAIN:-}"   ]] && echo "  xhttp CDN:  $XHTTP_DOMAIN"
-        [[ -n "${GRPC_DOMAIN:-}"    ]] && echo "  gRPC  CDN:  $GRPC_DOMAIN"
-        [[ -n "${REALITY_DOMAIN:-}" ]] && echo "  Reality:    $REALITY_DOMAIN"
-        [[ -n "${ANYTLS_DOMAIN:-}"  ]] && echo "  AnyTLS:     $ANYTLS_DOMAIN"
+        local _all _cdn _direct
+        _all=$(get_state "ALL_DOMAINS")
+        _cdn=$(get_state "CDN_DOMAINS")
+        _direct=$(get_state "DIRECT_DOMAINS")
+        [[ -n "$_all"    ]] && read -ra ALL_DOMAINS    <<< "$_all"
+        [[ -n "$_cdn"    ]] && read -ra CDN_DOMAINS    <<< "$_cdn"
+        [[ -n "$_direct" ]] && read -ra DIRECT_DOMAINS <<< "$_direct"
+
+        for d in "${ALL_DOMAINS[@]}"; do
+            local suffix mode protos
+            suffix=$(echo "$d" | tr '.' '_')
+            mode=$(get_state "DOMAIN_MODE_${suffix}")
+            protos=$(get_state "DOMAIN_PROTO_${suffix}")
+            echo "  $d  [${mode} / ${protos}]"
+        done
+
         echo ""
-
-        # 显示已有的 domain ini 映射关系
-        if list_domain_ini_files >/dev/null 2>&1; then
-            log_info "已有账号映射（domain ini 文件）："
-            list_domain_ini_files | while read -r f; do
-                echo "  $f"
-            done
-            echo ""
-        fi
-
         read -rp "是否直接复用已有域名配置？[Y/n]: " reuse_domains
         if [[ "${reuse_domains,,}" != "n" ]]; then
             normalize_domain_arrays
 
-            # 检查是否有域名缺少 domain ini（兼容旧版配置）
             local missing_ini=()
             for domain in "${ALL_DOMAINS[@]}"; do
                 local root_domain
                 root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
                 if ! has_domain_ini "$root_domain"; then
-                    # 避免重复加入
                     local already=false
                     for m in "${missing_ini[@]}"; do
                         [[ "$m" == "$root_domain" ]] && already=true && break
@@ -515,89 +542,95 @@ collect_domains() {
     NAIVE_DOMAIN=""
     HYSTERIA2_DOMAIN=""
 
-    # 清除旧的 domain ini 映射
     rm -f "${CF_CONFIG_DIR}"/domain_*.ini 2>/dev/null || true
+    save_state "DOMAIN_REGISTRY" ""
 
-    # 内部：为单个域名选择 CF 账号并写入 domain ini
-    _choose_and_link() {
-        local domain="$1"
-        local root_domain
-        root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-
-        # 同根域名已处理过则跳过
-        has_domain_ini "$root_domain" && return
-
-        local cf_idx="1"
-
-        if [[ "${CF_ACCOUNT_COUNT:-1}" -gt 1 ]]; then
-            echo ""
-            echo "  为 *.${root_domain} 选择 Cloudflare 账号："
-            for j in $(seq 1 "$CF_ACCOUNT_COUNT"); do
-                local token_preview
-                token_preview=$(grep 'api_token' \
-                    "${CF_CONFIG_DIR}/cf_account_${j}.ini" 2>/dev/null | \
-                    awk '{print $3}' | cut -c1-12)
-                echo "    [${j}] ${token_preview}..."
-            done
-            read -rp "  使用第几个 CF 账号？[1-${CF_ACCOUNT_COUNT}]: " cf_idx
-            cf_idx="${cf_idx:-1}"
-        fi
-
-        link_domain_to_cf_account "$root_domain" "$cf_idx"
-    }
-
-    _add_domain() {
-        local usage_key="$1"
-        local prompt_text="$2"
-        local domain
-
-        echo ""
-        read -rp "${prompt_text}" domain
-        domain="${domain,,}"
-        [[ -z "$domain" ]] && return
-
-        _choose_and_link "$domain"
-
-        case "$usage_key" in
-            xhttp)   XHTTP_DOMAIN="$domain";   CDN_DOMAINS+=("$domain");    log_info "域名 $domain → xhttp-CDN" ;;
-            grpc)    GRPC_DOMAIN="$domain";     CDN_DOMAINS+=("$domain");    log_info "域名 $domain → gRPC-CDN" ;;
-            reality) REALITY_DOMAIN="$domain";  DIRECT_DOMAINS+=("$domain"); log_info "域名 $domain → Reality" ;;
-            anytls)  ANYTLS_DOMAIN="$domain";   DIRECT_DOMAINS+=("$domain"); log_info "域名 $domain → AnyTLS" ;;
-            naive)   NAIVE_DOMAIN="$domain";    DIRECT_DOMAINS+=("$domain"); log_info "域名 $domain → NaiveProxy" ;;
-            hysteria2) HYSTERIA2_DOMAIN="$domain"; DIRECT_DOMAINS+=("$domain"); log_info "域名 $domain → Hysteria2" ;;
-            *)       log_warn "未知用途: ${usage_key}"; return ;;
-        esac
-
-        ALL_DOMAINS+=("$domain")
-    }
-
-    echo "  域名用途说明："
-    echo "    xhttp    - VLESS+XHTTP 经 CF CDN 中转（开启 CF 代理）"
-    echo "    grpc     - VLESS+gRPC 经 CF CDN 中转（开启 CF 代理）"
-    echo "    reality  - VLESS+Reality 直连伪装域名（关闭 CF 代理）"
-    echo "    anytls   - Sing-Box AnyTLS 直连（关闭 CF 代理）"
-    echo "  没有某一类域名时可直接留空跳过。"
+    echo "  协议说明："
+    echo "    xray      - VLESS 相关 (XHTTP/gRPC via CDN, Reality via Direct)"
+    echo "    singbox   - Sing-Box AnyTLS"
+    echo "    hysteria2 - Hysteria2"
+    echo "    naiveproxy- NaiveProxy"
+    echo "    nginx     - 独立 Nginx 站点"
+    echo ""
+    echo "  连接方式："
+    echo "    cdn    - 经 Cloudflare CDN 中转（橙云）"
+    echo "    direct - 直连（关闭 CF 代理 / 灰云）"
     echo ""
 
-    _add_domain "xhttp"   "请输入 xhttp 域名（没有可留空）: "
-    _add_domain "grpc"    "请输入 grpc 域名（没有可留空）: "
-    _add_domain "reality" "请输入 reality 域名（没有可留空）: "
-    _add_domain "anytls"  "请输入 anytls 域名（没有可留空）: "
+    while true; do
+        local domain protocols mode
+
+        read -rp "请输入域名（留空结束添加）: " domain
+        domain="${domain,,}"
+        [[ -z "$domain" ]] && break
+
+        if domain_is_registered "$domain"; then
+            log_warn "域名 $domain 已存在，跳过"
+            continue
+        fi
+
+        # ── 多选协议 ──
+        echo ""
+        echo "  请为 $domain 选择协议（多选，空格分隔序号）："
+        echo "    1. xray       - VLESS 系列 (XHTTP/gRPC + Reality)"
+        echo "    2. singbox    - AnyTLS"
+        echo "    3. hysteria2  - Hysteria2"
+        echo "    4. naiveproxy - NaiveProxy"
+        echo "    5. nginx      - 独立 Nginx 站点"
+        local choices
+        read -rp "  输入序号如: 1 3 5: " choices
+
+        protocols=""
+        for choice in $choices; do
+            case "$choice" in
+                1) protocols="${protocols:+$protocols,}xray" ;;
+                2) protocols="${protocols:+$protocols,}singbox" ;;
+                3) protocols="${protocols:+$protocols,}hysteria2" ;;
+                4) protocols="${protocols:+$protocols,}naiveproxy" ;;
+                5) protocols="${protocols:+$protocols,}nginx" ;;
+                *) log_warn "无效选项: $choice"; ;;
+            esac
+        done
+        [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
+
+        # ── 连接方式 ──
+        local mode_r
+        read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
+        case "${mode_r:-d}" in
+            c|C|cdn|CDN) mode="cdn" ;;
+            *)           mode="direct" ;;
+        esac
+
+        # ── 注册 & 关联 ──
+        register_domain "$domain" "$mode" "$protocols"
+        log_info "已添加: $domain [mode=$mode, proto=$protocols]"
+        _collect_domain_cf "$domain"
+
+        read -rp "继续添加更多域名？[Y/n]: " more
+        if [[ "${more,,}" == "n" ]]; then
+            break
+        fi
+        echo ""
+    done
+
+    rebuild_protocol_domains
+    load_domain_state
 
     echo ""
     log_info "域名配置汇总："
-    [[ -n "${XHTTP_DOMAIN:-}"   ]] && echo "  xhttp CDN:  $XHTTP_DOMAIN"
-    [[ -n "${GRPC_DOMAIN:-}"    ]] && echo "  gRPC  CDN:  $GRPC_DOMAIN"
-    [[ -n "${REALITY_DOMAIN:-}" ]] && echo "  Reality:    $REALITY_DOMAIN"
-    [[ -n "${ANYTLS_DOMAIN:-}"  ]] && echo "  AnyTLS:     $ANYTLS_DOMAIN"
-    echo ""
-    log_info "账号映射文件："
-    list_domain_ini_files | while read -r f; do echo "  $f"; done
+    for d in "${ALL_DOMAINS[@]}"; do
+        local suffix m p
+        suffix=$(echo "$d" | tr '.' '_')
+        m=$(get_state "DOMAIN_MODE_${suffix}")
+        p=$(get_state "DOMAIN_PROTO_${suffix}")
+        echo "  $d  [${m} / ${p}]"
+    done
     echo ""
 
     read -rp "确认以上配置？[Y/n]: " confirm
     if [[ "${confirm,,}" == "n" ]]; then
         rm -f "${CF_CONFIG_DIR}"/domain_*.ini 2>/dev/null || true
+        save_state "DOMAIN_REGISTRY" ""
         log_warn "重新配置域名..."
         collect_domains
         return
@@ -1072,39 +1105,23 @@ get_cf_account_by_domain() {
 add_domain_and_cert() {
     log_step "新增域名并申请证书"
 
-    # 强制从 state 恢复所有域名变量和数组
-    XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
-    GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
-    REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
-    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
-    NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
-    HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
-
-    ALL_DOMAINS=()
-    CDN_DOMAINS=()
-    DIRECT_DOMAINS=()
-
-    local _all _cdn _direct
-    _all=$(get_state "ALL_DOMAINS")
-    _cdn=$(get_state "CDN_DOMAINS")
-    _direct=$(get_state "DIRECT_DOMAINS")
-    [[ -n "$_all"    ]] && read -ra ALL_DOMAINS    <<< "$_all"
-    [[ -n "$_cdn"    ]] && read -ra CDN_DOMAINS    <<< "$_cdn"
-    [[ -n "$_direct" ]] && read -ra DIRECT_DOMAINS <<< "$_direct"
-
-    # domain_map.conf 可能有更完整的配置（如 CF_ACCOUNT_COUNT），加载覆盖
+    load_domain_state
     load_domain_config >/dev/null 2>&1 || true
 
     # 显示当前域名
     echo ""
     log_info "当前已有域名："
-    [[ -n "${XHTTP_DOMAIN:-}"   ]] && echo "  xhttp:    ${XHTTP_DOMAIN}"
-    [[ -n "${GRPC_DOMAIN:-}"    ]] && echo "  grpc:     ${GRPC_DOMAIN}"
-    [[ -n "${REALITY_DOMAIN:-}" ]] && echo "  reality:  ${REALITY_DOMAIN}"
-    [[ -n "${ANYTLS_DOMAIN:-}"  ]] && echo "  anytls:   ${ANYTLS_DOMAIN}"
-    [[ -n "${NAIVE_DOMAIN:-}"   ]] && echo "  naive:    ${NAIVE_DOMAIN}"
-    [[ -n "${HYSTERIA2_DOMAIN:-}" ]] && echo "  hysteria2: ${HYSTERIA2_DOMAIN}"
-    if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY")
+    if [[ -n "$registry" ]]; then
+        for d in $registry; do
+            local suffix mode protos
+            suffix=$(echo "$d" | tr '.' '_')
+            mode=$(get_state "DOMAIN_MODE_${suffix}")
+            protos=$(get_state "DOMAIN_PROTO_${suffix}")
+            echo "  $d  [${mode} / ${protos}]"
+        done
+    else
         echo "  （暂无）"
     fi
 
@@ -1124,149 +1141,135 @@ add_domain_and_cert() {
         echo "  [${base}] $(basename "$f")  |  ${label}"
     done
 
-    # 收集新域名信息
-    echo ""
-    local new_domain new_usage
-    read -rp "请输入新域名（如 np.zhongning.cf）: " new_domain
-    new_domain="${new_domain,,}"
-    [[ -z "$new_domain" ]] && { log_error "域名不能为空"; return 1; }
+    # ── 循环添加域名 ──────────────────────────────────────────
+    local new_domains=()
 
-    echo ""
-    echo "  请选择域名用途："
-    echo "  1. xhttp    — VLESS+XHTTP，经 CF CDN 中转（需开启 CF 橙云代理）"
-    echo "  2. grpc     — VLESS+gRPC，经 CF CDN 中转（需开启 CF 橙云代理）"
-    echo "  3. reality  — VLESS+Reality 直连伪装域名（需关闭 CF 代理，灰云）"
-    echo "  4. anytls   — Sing-Box AnyTLS 直连（需关闭 CF 代理，灰云）"
-    echo "  5. naive    — NaiveProxy 直连（需关闭 CF 代理，灰云）"
-    echo "  6. hysteria2 — Hysteria2 直连（需关闭 CF 代理，灰云）"
-    echo ""
-    local usage_choice
-    read -rp "  请选择 [1-6]: " usage_choice
-    case "${usage_choice:-}" in
-        1) new_usage="xhttp" ;;
-        2) new_usage="grpc" ;;
-        3) new_usage="reality" ;;
-        4) new_usage="anytls" ;;
-        5) new_usage="naive" ;;
-        6) new_usage="hysteria2" ;;
-        *) log_error "无效选择: ${usage_choice}"; return 1 ;;
-    esac
-
-    # 用途自动判断代理要求
-    if [[ "$new_usage" =~ ^(xhttp|grpc)$ ]]; then
-        log_info "CDN 域名（${new_usage}），请确认 CF 已开启橙云代理"
-    else
-        log_info "直连域名（${new_usage}），请确认 CF 已关闭代理（灰云/DNS only）"
-    fi
-
-    # ── CF 账号自动匹配 ──────────────────────────────────────
-    local root_domain
-    root_domain=$(echo "$new_domain" | awk -F. '{print $(NF-1)"."$NF}')
-
-    local matched_file
-    matched_file=$(get_cf_account_by_domain "$new_domain")
-
-    if [[ -n "$matched_file" && -f "$matched_file" ]]; then
-        local matched_base
-        matched_base=$(basename "$matched_file" .ini | sed 's/^cf_account_//')
-        log_info "检测到根域名 ${root_domain} 已关联 CF 账号（${matched_base}），自动使用"
-        local use_matched
-        read -rp "直接使用该账号？[Y/n]: " use_matched
-        if [[ "${use_matched,,}" != "n" ]]; then
-            new_cf_file="$matched_file"
-        fi
-    fi
-
-    # 未自动匹配的，手动选择
-    if [[ -z "${new_cf_file:-}" ]]; then
+    while true; do
         echo ""
-        log_info "可用 CF 账号："
-        local cf_files
-        cf_files=$(_filter_dup_cf_accounts)
-        for f in $cf_files; do
-            local label base
-            base=$(basename "$f" .ini | sed 's/^cf_account_//')
-            label=$(_cf_account_label "$f")
-            echo "  [${base}] $(basename "$f")  |  ${label}"
+        local domain protocols mode root_domain cf_choice
+
+        read -rp "请输入新域名（留空结束）: " domain
+        domain="${domain,,}"
+        [[ -z "$domain" ]] && break
+
+        if domain_is_registered "$domain"; then
+            log_warn "域名 $domain 已存在，跳过"
+            continue
+        fi
+
+        # ── 多选协议 ──
+        echo ""
+        echo "  请为 $domain 选择协议（多选，空格分隔序号）："
+        echo "    1. xray       - VLESS 系列"
+        echo "    2. singbox    - AnyTLS"
+        echo "    3. hysteria2  - Hysteria2"
+        echo "    4. naiveproxy - NaiveProxy"
+        echo "    5. nginx      - 独立 Nginx 站点"
+        local choices
+        read -rp "  输入序号如: 1 3 5: " choices
+
+        protocols=""
+        for choice in $choices; do
+            case "$choice" in
+                1) protocols="${protocols:+$protocols,}xray" ;;
+                2) protocols="${protocols:+$protocols,}singbox" ;;
+                3) protocols="${protocols:+$protocols,}hysteria2" ;;
+                4) protocols="${protocols:+$protocols,}naiveproxy" ;;
+                5) protocols="${protocols:+$protocols,}nginx" ;;
+                *) log_warn "无效选项: $choice"; ;;
+            esac
         done
-        local selected_base
-        read -rp "使用哪个 CF 账号（输入方括号内的标识）: " selected_base
-        [[ -z "$selected_base" ]] && { log_error "未选择账号"; return 1; }
-        new_cf_file="${CF_CONFIG_DIR}/cf_account_${selected_base}.ini"
-    fi
+        [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
 
-    [[ -f "${new_cf_file}" ]] || {
-        log_error "CF 账号文件不存在: ${new_cf_file}"
-        return 1
-    }
+        # ── 连接方式 ──
+        local mode_r
+        read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
+        case "${mode_r:-d}" in
+            c|C|cdn|CDN) mode="cdn" ;;
+            *)           mode="direct" ;;
+        esac
 
-    # 写入账号-域名关联 + domain→CF 账号映射
-    local cf_idx
-    cf_idx=$(basename "$new_cf_file" .ini | sed 's/^cf_account_//')
-    local existing_acct_domains
-    existing_acct_domains=$(grep "^CF_ACCOUNT_${cf_idx}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null \
-        | cut -d= -f2- | tr -d "'\"" || true)
-    if [[ " $existing_acct_domains " != *" $new_domain "* ]]; then
-        sed -i "/^CF_ACCOUNT_${cf_idx}=/d" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || true
-        echo "CF_ACCOUNT_${cf_idx}='${existing_acct_domains} ${new_domain}'" >> "${CF_DOMAIN_MAP_FILE}"
-    fi
-    # 写入 domain_<root>.ini 映射
-    cp "$new_cf_file" "${CF_CONFIG_DIR}/domain_${root_domain}.ini" 2>/dev/null || true
-    chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini" 2>/dev/null || true
+        # ── 关联 CF 账号 ──────────────────────────────────────
+        root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
 
-    # 更新对应 state 变量
+        local matched_file
+        matched_file=$(get_cf_account_by_domain "$domain")
+        local new_cf_file
 
-    case "$new_usage" in
-        xhttp)
-            XHTTP_DOMAIN="$new_domain"
-            [[ " ${CDN_DOMAINS[*]} " != *" $new_domain "* ]] && CDN_DOMAINS+=("$new_domain")
-            ;;
-        grpc)
-            GRPC_DOMAIN="$new_domain"
-            [[ " ${CDN_DOMAINS[*]} " != *" $new_domain "* ]] && CDN_DOMAINS+=("$new_domain")
-            ;;
-        reality)
-            REALITY_DOMAIN="$new_domain"
-            [[ " ${DIRECT_DOMAINS[*]} " != *" $new_domain "* ]] && DIRECT_DOMAINS+=("$new_domain")
-            ;;
-        anytls)
-            ANYTLS_DOMAIN="$new_domain"
-            [[ " ${DIRECT_DOMAINS[*]} " != *" $new_domain "* ]] && DIRECT_DOMAINS+=("$new_domain")
-            ;;
-        naive)
-            NAIVE_DOMAIN="$new_domain"
-            [[ " ${DIRECT_DOMAINS[*]} " != *" $new_domain "* ]] && DIRECT_DOMAINS+=("$new_domain")
-            ;;
-        hysteria2)
-            HYSTERIA2_DOMAIN="$new_domain"
-            [[ " ${DIRECT_DOMAINS[*]} " != *" $new_domain "* ]] && DIRECT_DOMAINS+=("$new_domain")
-            ;;
-    esac
+        if [[ -n "$matched_file" && -f "$matched_file" ]]; then
+            local matched_base
+            matched_base=$(basename "$matched_file" .ini | sed 's/^cf_account_//')
+            log_info "检测到根域名 ${root_domain} 已关联 CF 账号（${matched_base}）"
+            local use_matched
+            read -rp "直接使用该账号？[Y/n]: " use_matched
+            if [[ "${use_matched,,}" != "n" ]]; then
+                new_cf_file="$matched_file"
+            fi
+        fi
 
-    [[ " ${ALL_DOMAINS[*]} " != *" $new_domain "* ]] && ALL_DOMAINS+=("$new_domain")
+        if [[ -z "${new_cf_file:-}" ]]; then
+            echo ""
+            log_info "可用 CF 账号："
+            for f in $cf_files; do
+                local lb b
+                b=$(basename "$f" .ini | sed 's/^cf_account_//')
+                lb=$(_cf_account_label "$f")
+                echo "  [${b}] $(basename "$f")  |  ${lb}"
+            done
+            read -rp "使用哪个 CF 账号（输入方括号内的标识）: " cf_choice
+            [[ -z "$cf_choice" ]] && { log_error "未选择账号"; return 1; }
+            new_cf_file="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
+        fi
 
-    # 持久化 domain_map.conf
+        [[ -f "${new_cf_file}" ]] || {
+            log_error "CF 账号文件不存在: ${new_cf_file}"
+            return 1
+        }
+
+        # 写入 CF 映射
+        local cf_idx
+        cf_idx=$(basename "$new_cf_file" .ini | sed 's/^cf_account_//')
+        local existing_acct_domains
+        existing_acct_domains=$(grep "^CF_ACCOUNT_${cf_idx}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null \
+            | cut -d= -f2- | tr -d "'\"" || true)
+        if [[ " $existing_acct_domains " != *" $domain "* ]]; then
+            sed -i "/^CF_ACCOUNT_${cf_idx}=/d" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || true
+            echo "CF_ACCOUNT_${cf_idx}='${existing_acct_domains} ${domain}'" >> "${CF_DOMAIN_MAP_FILE}"
+        fi
+        cp "$new_cf_file" "${CF_CONFIG_DIR}/domain_${root_domain}.ini" 2>/dev/null || true
+        chmod 600 "${CF_CONFIG_DIR}/domain_${root_domain}.ini" 2>/dev/null || true
+
+        # 注册域名
+        register_domain "$domain" "$mode" "$protocols"
+        new_domains+=("$domain")
+        log_info "已添加: $domain [mode=$mode, proto=$protocols]"
+
+        # ── 继续询问 ──
+        local more
+        read -rp "继续添加更多域名？[Y/n]: " more
+        [[ "${more,,}" == "n" ]] && break
+        echo ""
+    done
+
+    # 重建并持久化
+    rebuild_protocol_domains
+    load_domain_state
     save_domain_config
-    save_state "NAIVE_DOMAIN"      "${NAIVE_DOMAIN:-}"
-    save_state "HYSTERIA2_DOMAIN"  "${HYSTERIA2_DOMAIN:-}"
-    save_state "XHTTP_DOMAIN"      "${XHTTP_DOMAIN:-}"
-    save_state "GRPC_DOMAIN"       "${GRPC_DOMAIN:-}"
-    save_state "REALITY_DOMAIN"    "${REALITY_DOMAIN:-}"
-    save_state "ANYTLS_DOMAIN"     "${ANYTLS_DOMAIN:-}"
-    save_state "ALL_DOMAINS"       "${ALL_DOMAINS[*]:-}"
-    save_state "CDN_DOMAINS"       "${CDN_DOMAINS[*]:-}"
-    save_state "DIRECT_DOMAINS"    "${DIRECT_DOMAINS[*]:-}"
-    save_state "INST_CERT"         "1"
 
-    # 申请该根域证书
-    log_info "申请证书: *.${root_domain}"
+    # ── 为所有新域名申请证书 ────────────────────────────────
+    for domain in "${new_domains[@]}"; do
+        local root_domain
+        root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+        log_info "申请证书: *.${root_domain}"
 
-    local ini_file="${CF_CONFIG_DIR}/domain_${root_domain}.ini"
-    local certbot_output certbot_rc
+        local ini_file="${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+        local certbot_output certbot_rc
 
-    if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
-        log_info "证书已存在，跳过申请: *.${root_domain}"
-    else
+        if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
+            log_info "证书已存在，跳过申请: *.${root_domain}"
+            continue
+        fi
+
         if certbot_output=$(certbot certonly \
             --dns-cloudflare \
             --dns-cloudflare-credentials "$ini_file" \
@@ -1288,11 +1291,10 @@ add_domain_and_cert() {
             log_error "证书申请失败（退出码: ${certbot_rc}）"
             while IFS= read -r line; do echo "  $line"; done <<< "$certbot_output"
             log_warn "请检查域名 DNS 解析和 CF API Token 权限"
-            return 1
         fi
-    fi
+    done
 
-    # 自动配置续期（如果还没配）
+    # 自动配置续期
     setup_auto_renew
 
     # 询问是否重新生成 Nginx 配置
@@ -1306,7 +1308,7 @@ add_domain_and_cert() {
         }
     fi
 
-    log_info "域名 ${new_domain} 添加完成"
+    log_info "域名添加完成: ${#new_domains[@]} 个"
 }
 
 # ── 迁移旧 cf_account_N.ini 到域名命名格式 ──────────────────

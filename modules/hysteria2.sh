@@ -52,33 +52,12 @@ configure_hysteria2() {
         echo
     })
 
-    # ── 1. 确定域名 ──────────────────────────────────────────
+    # ── 1. 域名（从 state 自动读取，不再交互询问）────────
     local HY2_DOMAIN
     HY2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
 
     if [[ -z "${HY2_DOMAIN}" ]]; then
-        HY2_DOMAIN="${ANYTLS_DOMAIN:-}"
-        [[ -n "${HY2_DOMAIN}" ]] && log_info "复用 AnyTLS 域名: ${HY2_DOMAIN}"
-    fi
-
-    if [[ -z "${HY2_DOMAIN}" ]]; then
-        if [[ ${#ALL_DOMAINS[@]} -gt 0 ]]; then
-            log_info "可用域名:"
-            local i=1
-            for d in "${ALL_DOMAINS[@]}"; do
-                echo "  ${i}. ${d}"
-                (( i++ ))
-            done
-            local sel
-            read -rp "请选择 Hysteria2 域名 [1-$(( i - 1 ))]: " sel
-            if [[ "${sel}" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel < i )); then
-                HY2_DOMAIN="${ALL_DOMAINS[$(( sel - 1 ))]}"
-            fi
-        fi
-    fi
-
-    if [[ -z "${HY2_DOMAIN}" ]]; then
-        log_error "无法确定 Hysteria2 域名，请先完成证书申请（步骤 4）"
+        log_error "Hysteria2 域名未配置，请先执行步骤 4（SSL 证书）添加域名并分配协议"
         exit 1
     fi
 

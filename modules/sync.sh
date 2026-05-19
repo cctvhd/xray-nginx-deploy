@@ -5,31 +5,37 @@
 # ============================================================
 
 sync_restore_domain_arrays() {
-    local all_str cdn_str direct_str
-    all_str=$(get_state "ALL_DOMAINS")
-    cdn_str=$(get_state "CDN_DOMAINS")
-    direct_str=$(get_state "DIRECT_DOMAINS")
+    # 优先使用 install.sh 中更新的 load_domain_state
+    if command -v load_domain_state &>/dev/null; then
+        load_domain_state
+    else
+        local all_str cdn_str direct_str
+        all_str=$(get_state "ALL_DOMAINS")
+        cdn_str=$(get_state "CDN_DOMAINS")
+        direct_str=$(get_state "DIRECT_DOMAINS")
 
-    ALL_DOMAINS=()
-    CDN_DOMAINS=()
-    DIRECT_DOMAINS=()
+        ALL_DOMAINS=()
+        CDN_DOMAINS=()
+        DIRECT_DOMAINS=()
 
-    if [[ -n "$all_str" ]]; then
-        read -ra ALL_DOMAINS <<< "$all_str"
-    fi
-    if [[ -n "$cdn_str" ]]; then
-        read -ra CDN_DOMAINS <<< "$cdn_str"
-    fi
-    if [[ -n "$direct_str" ]]; then
-        read -ra DIRECT_DOMAINS <<< "$direct_str"
-    fi
+        if [[ -n "$all_str" ]]; then
+            read -ra ALL_DOMAINS <<< "$all_str"
+        fi
+        if [[ -n "$cdn_str" ]]; then
+            read -ra CDN_DOMAINS <<< "$cdn_str"
+        fi
+        if [[ -n "$direct_str" ]]; then
+            read -ra DIRECT_DOMAINS <<< "$direct_str"
+        fi
 
-    XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
-    GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
-    REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
-    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
-    NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
-    XHTTP_PATH=$(get_state "XHTTP_PATH")
+        XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
+        GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
+        REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+        ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+        NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
+        HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+        XHTTP_PATH=$(get_state "XHTTP_PATH")
+    fi
 
     local sn_str
     sn_str=$(get_state "REALITY_SERVER_NAMES")

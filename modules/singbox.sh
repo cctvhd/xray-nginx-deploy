@@ -106,12 +106,11 @@ collect_singbox_params() {
     log_step "配置 AnyTLS 参数"
     echo ""
 
-    if [[ -n "${ANYTLS_DOMAIN:-}" ]]; then
-        log_info "AnyTLS 域名: ${ANYTLS_DOMAIN}"
-    else
-        read -rp "输入 AnyTLS 域名: " ANYTLS_DOMAIN
+    if ! [[ -n "${ANYTLS_DOMAIN:-}" ]]; then
+        log_error "AnyTLS 域名未配置，请先执行步骤 4（SSL 证书）添加域名并分配协议"
+        exit 1
     fi
-    save_state "ANYTLS_DOMAIN" "${ANYTLS_DOMAIN}"
+    log_info "AnyTLS 域名: ${ANYTLS_DOMAIN}"
 
     local root_domain
     root_domain=$(echo "$ANYTLS_DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
