@@ -215,32 +215,12 @@ _detect_naive_caddy_port() {
 configure_naive() {
     log_step "配置 NaiveProxy..."
 
-    # ── 1. 确定域名（与 hysteria2.sh 风格一致）───────────────
+    # ── 1. 域名（从 state 自动读取，不再交互询问）────────
     local NAIVE_DOMAIN
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
 
     if [[ -z "${NAIVE_DOMAIN}" ]]; then
-        NAIVE_DOMAIN="${ANYTLS_DOMAIN:-}"
-        [[ -n "${NAIVE_DOMAIN}" ]] && log_info "复用 AnyTLS 域名: ${NAIVE_DOMAIN}"
-    fi
-
-    if [[ -z "${NAIVE_DOMAIN}" ]]; then
-        if [[ ${#ALL_DOMAINS[@]} -gt 0 ]]; then
-            log_info "可用域名:"
-            local i=1
-            for d in "${ALL_DOMAINS[@]}"; do
-                echo " ${i}. ${d}"
-                (( i++ ))
-            done
-            local sel
-            read -rp "请选择 NaiveProxy 域名 [1-$(( i - 1 ))]: " sel
-            if [[ "${sel}" =~ ^[0-9]+$ ]] && (( sel >= 1 && sel < i )); then
-                NAIVE_DOMAIN="${ALL_DOMAINS[$(( sel - 1 ))]}"
-            fi
-        fi
-    fi
-
-    if [[ -z "${NAIVE_DOMAIN}" ]]; then
+        log_error "NaiveProxy 域名未配置，请先执行步骤 4（SSL 证书）添加域名并分配协议"
         log_error "无法确定 NaiveProxy 域名，请先完成证书申请（步骤 4）"
         exit 1
     fi

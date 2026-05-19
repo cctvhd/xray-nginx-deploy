@@ -83,6 +83,104 @@ get_step() {
     get_state "$1" "0"
 }
 
+# ── 域名注册与重建 ──────────────────────────────────────────
+_domain_state_suffix() {
+    local domain="$1"
+    echo "${domain//./_}"
+}
+
+domain_is_registered() {
+    local domain="$1"
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+    [[ " ${registry} " == *" ${domain} "* ]]
+}
+
+register_domain() {
+    local domain="$1" mode="$2" protocols="$3"
+    local suffix
+    suffix=$(_domain_state_suffix "$domain")
+    [[ -z "$domain" ]] && return 1
+
+    save_state "DOMAIN_MODE_${suffix}" "$mode"
+    save_state "DOMAIN_PROTO_${suffix}" "$protocols"
+
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+    if [[ " ${registry} " != *" ${domain} "* ]]; then
+        registry="${registry:+$registry }$domain"
+        save_state "DOMAIN_REGISTRY" "$registry"
+    fi
+}
+
+rebuild_protocol_domains() {
+    local registry xhttp_domain="" grpc_domain="" reality_domain="" anytls_domain="" hyst_domain="" naive_domain=""
+    local all_d="" cdn_d="" direct_d=""
+
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+
+    for domain in $registry; do
+        local suffix mode protocols
+        suffix=$(_domain_state_suffix "$domain")
+        mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
+        protocols=$(get_state "DOMAIN_PROTO_${suffix}" "")
+        [[ -z "$protocols" ]] && continue
+
+        all_d="${all_d:+$all_d }$domain"
+        if [[ "$mode" == "cdn" ]]; then
+            cdn_d="${cdn_d:+$cdn_d }$domain"
+        else
+            direct_d="${direct_d:+$direct_d }$domain"
+        fi
+
+        if [[ "$protocols" == *"xray"* ]]; then
+            if [[ "$mode" == "cdn" ]]; then
+                xhttp_domain="${domain}"
+                [[ -z "$grpc_domain" ]] && grpc_domain="${domain}"
+            else
+                reality_domain="${domain}"
+            fi
+        fi
+        if [[ "$protocols" == *"singbox"* ]]; then
+            anytls_domain="${domain}"
+        fi
+        if [[ "$protocols" == *"hysteria2"* ]]; then
+            hyst_domain="${domain}"
+        fi
+        if [[ "$protocols" == *"naiveproxy"* ]]; then
+            naive_domain="${domain}"
+        fi
+    done
+
+    save_state "ALL_DOMAINS" "$all_d"
+    save_state "CDN_DOMAINS" "$cdn_d"
+    save_state "DIRECT_DOMAINS" "$direct_d"
+    save_state "XHTTP_DOMAIN" "$xhttp_domain"
+    save_state "GRPC_DOMAIN" "$grpc_domain"
+    save_state "REALITY_DOMAIN" "$reality_domain"
+    save_state "ANYTLS_DOMAIN" "$anytls_domain"
+    save_state "HYSTERIA2_DOMAIN" "$hyst_domain"
+    save_state "NAIVE_DOMAIN" "$naive_domain"
+}
+
+load_domain_state() {
+    ALL_DOMAINS=(); CDN_DOMAINS=(); DIRECT_DOMAINS=()
+    local all_str cdn_str direct_str
+    all_str=$(get_state "ALL_DOMAINS")
+    cdn_str=$(get_state "CDN_DOMAINS")
+    direct_str=$(get_state "DIRECT_DOMAINS")
+    [[ -n "$all_str" ]] && read -ra ALL_DOMAINS <<< "$all_str"
+    [[ -n "$cdn_str" ]] && read -ra CDN_DOMAINS <<< "$cdn_str"
+    [[ -n "$direct_str" ]] && read -ra DIRECT_DOMAINS <<< "$direct_str"
+
+    XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
+    GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
+    REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+    ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
+    HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+}
+
 # ── 模块加载：本地缓存 → 脚本同级目录 → 远程下载并缓存 ─────
 load_module() {
     local module="$1"
@@ -347,6 +445,33 @@ ENV
     WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT")
 
     _sync_inst_state
+
+    # ── 旧格式迁移：scalar 域名变量 → DOMAIN_REGISTRY ────────
+    if [[ -z "$(get_state "DOMAIN_REGISTRY")" ]]; then
+        local _xhttp _grpc _reality _anytls _naive _hysteria2
+        _xhttp=$(get_state "XHTTP_DOMAIN")
+        _grpc=$(get_state "GRPC_DOMAIN")
+        _reality=$(get_state "REALITY_DOMAIN")
+        _anytls=$(get_state "ANYTLS_DOMAIN")
+        _naive=$(get_state "NAIVE_DOMAIN")
+        _hysteria2=$(get_state "HYSTERIA2_DOMAIN")
+
+        [[ -n "$_xhttp" ]] && register_domain "$_xhttp" "cdn" "xray"
+        # grpc 若与 xhttp 不同则单独注册
+        [[ -n "$_grpc" && "$_grpc" != "$_xhttp" ]] && register_domain "$_grpc" "cdn" "xray"
+        [[ -n "$_reality" ]] && register_domain "$_reality" "direct" "xray"
+        [[ -n "$_anytls" ]] && register_domain "$_anytls" "direct" "singbox"
+        [[ -n "$_hysteria2" ]] && register_domain "$_hysteria2" "direct" "hysteria2"
+        [[ -n "$_naive" && "$_naive" != "$_anytls" ]] && register_domain "$_naive" "direct" "naiveproxy"
+
+        if [[ -n "$(get_state "DOMAIN_REGISTRY")" ]]; then
+            rebuild_protocol_domains
+            log_info "域名配置已自动迁移到新格式"
+        fi
+    fi
+
+    # 恢复域名数组变量（供 show_status 等使用）
+    load_domain_state
 }
 
 load_os_info() {
@@ -470,31 +595,22 @@ show_status() {
 
     echo ""
     echo "  [域名]"
-    _show_domain() {
-        local label="$1" domain="$2"
-        [[ -z "$domain" ]] && return
-        local tag="直连"
-        local ini=""
-        for _d in "${CDN_DOMAINS[@]:-}"; do
-            [[ "$_d" == "$domain" ]] && tag="CDN" && break
-        done
-        for _ini in /etc/cloudflare/cf_account_*.ini; do
-            [[ -f "$_ini" ]] || continue
-            local _root_domain
-            _root_domain=$(echo "$domain" | awk -F'.' '{print $(NF-1)"."$NF}')
-            local _dom_ini="/etc/cloudflare/domain_${_root_domain}.ini"
-            if [[ -f "$_dom_ini" ]]; then
-                ini=" [domain_${_root_domain}.ini]"
-            fi
-        done
-        printf "  %-10s : %-30s %s%s\n" "$label" "$domain" "$tag" "$ini"
+    {
+        local registry
+        registry=$(get_state "DOMAIN_REGISTRY")
+        if [[ -n "$registry" ]]; then
+            for d in $registry; do
+                local suffix mode protos tag
+                suffix=$(echo "$d" | tr '.' '_')
+                mode=$(get_state "DOMAIN_MODE_${suffix}")
+                protos=$(get_state "DOMAIN_PROTO_${suffix}")
+                [[ "$mode" == "cdn" ]] && tag="CDN" || tag="直连"
+                printf "  %-10s : %-30s %s\n" "$protos" "$d" "$tag"
+            done
+        else
+            echo "  暂无"
+        fi
     }
-    _show_domain "xhttp"     "${XHTTP_DOMAIN:-}"
-    _show_domain "gRPC"      "${GRPC_DOMAIN:-}"
-    _show_domain "Reality"   "${REALITY_DOMAIN:-}"
-    _show_domain "AnyTLS"    "${ANYTLS_DOMAIN:-}"
-    _show_domain "Hysteria2" "${HYSTERIA2_DOMAIN:-}"
-    _show_domain "NaiveProxy" "${NAIVE_DOMAIN:-}"
 
     if [[ -n "${HW_CPU_CORES:-}" ]]; then
         echo ""

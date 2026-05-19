@@ -93,6 +93,14 @@ reset_cert_state() {
     save_state "ALL_DOMAINS" ""
     save_state "CDN_DOMAINS" ""
     save_state "DIRECT_DOMAINS" ""
+    save_state "DOMAIN_REGISTRY" ""
+    save_state "NAIVE_DOMAIN" ""
+    save_state "HYSTERIA2_DOMAIN" ""
+    # 清理动态域名注册条目
+    if [[ -n "${STATE_FILE:-}" && -f "${STATE_FILE}" ]]; then
+        sed -i '/^DOMAIN_MODE_/d' "${STATE_FILE}"
+        sed -i '/^DOMAIN_PROTO_/d' "${STATE_FILE}"
+    fi
     save_state "INST_CERT" "0"
 }
 
