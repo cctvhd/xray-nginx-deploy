@@ -262,7 +262,9 @@ link_domain_to_cf_account() {
     local root_domain="$1"
     local cf_idx="$2"
     local src="${CF_CONFIG_DIR}/cf_account_${cf_idx}.ini"
-    local dst="${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+    local _base _dst
+    _base=$(domain_to_ini_name "$root_domain")
+    local dst="${CF_CONFIG_DIR}/domain_${_base}.ini"
 
     if [[ ! -f "$src" ]]; then
         log_error "CF账号配置文件不存在: $src"
@@ -277,7 +279,9 @@ link_domain_to_cf_account() {
 # ── 获取根域名对应的 ini 文件路径 ───────────────────────────
 get_domain_ini() {
     local root_domain="$1"
-    local f="${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+    local _base
+    _base=$(domain_to_ini_name "$root_domain")
+    local f="${CF_CONFIG_DIR}/domain_${_base}.ini"
 
     if [[ -f "$f" ]]; then
         echo "$f"
@@ -296,7 +300,9 @@ list_domain_ini_files() {
 # ── 检查某根域名是否已有 domain ini ─────────────────────────
 has_domain_ini() {
     local root_domain="$1"
-    [[ -f "${CF_CONFIG_DIR}/domain_${root_domain}.ini" ]]
+    local _base
+    _base=$(domain_to_ini_name "$root_domain")
+    [[ -f "${CF_CONFIG_DIR}/domain_${_base}.ini" ]]
 }
 
 # ════════════════════════════════════════════════════════════
@@ -769,8 +775,10 @@ show_cert_request_summary() {
         for root_domain in "${FAILED_CF_ACCOUNTS[@]}"; do
             [[ -n "${seen_failed_accounts[$root_domain]:-}" ]] && continue
             seen_failed_accounts["$root_domain"]=1
-            local ini_file="${CF_CONFIG_DIR}/domain_${root_domain}.ini"
-            echo "    *.${root_domain} → ${ini_file}"
+            local _ini_base _ini_file
+            _ini_base=$(domain_to_ini_name "$root_domain")
+            _ini_file="${CF_CONFIG_DIR}/domain_${_ini_base}.ini"
+            echo "    *.${root_domain} → ${_ini_file}"
         done
     fi
 }
@@ -1236,7 +1244,9 @@ add_domain_and_cert() {
         root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
         log_info "申请证书: *.${root_domain}"
 
-        local ini_file="${CF_CONFIG_DIR}/domain_${root_domain}.ini"
+        local _ini_base
+        _ini_base=$(domain_to_ini_name "$root_domain")
+        local ini_file="${CF_CONFIG_DIR}/domain_${_ini_base}.ini"
         local certbot_output certbot_rc
 
         if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
