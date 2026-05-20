@@ -69,14 +69,14 @@ save_state() {
     local value="$2"
     local escaped
 
-    mkdir -p "$STATE_DIR"
-    chmod 700 "$STATE_DIR"
-    touch "$STATE_FILE"
-    chmod 600 "$STATE_FILE"
+    mkdir -p "$STATE_DIR" || return 1
+    chmod 700 "$STATE_DIR" || return 1
+    touch "$STATE_FILE" || return 1
+    chmod 600 "$STATE_FILE" || return 1
 
     escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
-    sed -i "/^${key}=/d" "$STATE_FILE" 2>/dev/null || true
-    echo "${key}='${escaped}'" >> "$STATE_FILE"
+    sed -i "/^${key}=/d" "$STATE_FILE" || return 1
+    echo "${key}='${escaped}'" >> "$STATE_FILE" || return 1
 }
 
 get_step() {
@@ -110,19 +110,49 @@ merge_domain_protocols() {
 }
 
 _save_state_verified() {
-    local key="$1" value="$2" actual attempt
+    local key="$1" value="$2" actual attempt rc
 
     for attempt in 1 2 3; do
-        save_state "$key" "$value"
+        if save_state "$key" "$value"; then
+            :
+        else
+            rc=$?
+            log_warn "${key} 写入命令失败，退出码: ${rc}，正在重试 (${attempt}/3)"
+            _debug_state_write "$key" "$value" ""
+            sleep 0.2
+            continue
+        fi
+
         actual=$(get_state "$key" "")
         [[ "$actual" == "$value" ]] && return 0
 
         log_warn "${key} 写入验证失败，正在重试 (${attempt}/3)"
+        _debug_state_write "$key" "$value" "$actual"
         sleep 0.2
     done
 
     log_error "${key} 写入失败，请检查 ${STATE_FILE}"
+    _debug_state_write "$key" "$value" "$(get_state "$key" "")"
     return 1
+}
+
+_debug_state_write() {
+    local key="$1" expected="$2" actual="${3:-}"
+
+    log_warn "  期望值: [${expected}]"
+    log_warn "  实际值: [${actual:-<空>}]"
+    if [[ -d "$STATE_DIR" ]]; then
+        log_warn "  状态目录: $(ls -ld "$STATE_DIR" 2>/dev/null || true)"
+    else
+        log_warn "  状态目录不存在: ${STATE_DIR}"
+    fi
+    if [[ -e "$STATE_FILE" ]]; then
+        log_warn "  状态文件: $(ls -l "$STATE_FILE" 2>/dev/null || true)"
+        log_warn "  ${key} 原始匹配行:"
+        awk -F= -v k="$key" '$1 == k { printf "    %d:%s\n", NR, $0 }' "$STATE_FILE" 2>/dev/null || true
+    else
+        log_warn "  状态文件不存在: ${STATE_FILE}"
+    fi
 }
 
 register_domain() {
