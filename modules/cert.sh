@@ -1011,6 +1011,19 @@ _cf_account_label() {
     echo "${token:0:8}...${token: -4}"
 }
 
+_cf_ini_token() {
+    grep 'dns_cloudflare_api_token' "$1" 2>/dev/null | cut -d= -f2 | tr -d ' '
+}
+
+_cf_tokens_match() {
+    local left="$1" right="$2"
+    local left_token right_token
+    [[ -f "$left" && -f "$right" ]] || return 1
+    left_token=$(_cf_ini_token "$left")
+    right_token=$(_cf_ini_token "$right")
+    [[ -n "$left_token" && "$left_token" == "$right_token" ]]
+}
+
 # ── 新增 Cloudflare 账号 ─────────────────────────────────────
 add_cf_account() {
     log_step "新增 Cloudflare 账号"
@@ -1299,6 +1312,90 @@ add_domain_and_cert() {
     log_info "域名添加完成: ${#new_domains[@]} 个"
 }
 
+refresh_domain_assignments() {
+    log_step "刷新域名协议分配"
+
+    load_domain_state
+    load_domain_config >/dev/null 2>&1 || true
+
+    local domain
+    for domain in "${ALL_DOMAINS[@]:-}"; do
+        [[ -z "$domain" ]] && continue
+        local suffix mode protocols
+        suffix=$(echo "$domain" | tr '.' '_')
+        mode=$(get_state "DOMAIN_MODE_${suffix}" "")
+        protocols=$(get_state "DOMAIN_PROTO_${suffix}" "")
+        if [[ -z "$mode" ]]; then
+            [[ " ${CDN_DOMAINS[*]:-} " == *" ${domain} "* ]] && mode="cdn" || mode="direct"
+        fi
+        [[ -n "$protocols" ]] && register_domain "$domain" "$mode" "$protocols"
+    done
+
+    [[ -n "${XHTTP_DOMAIN:-}" ]] && register_domain "$XHTTP_DOMAIN" "cdn" "xray"
+    [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]] && register_domain "$GRPC_DOMAIN" "cdn" "xray"
+    [[ -n "${REALITY_DOMAIN:-}" ]] && register_domain "$REALITY_DOMAIN" "direct" "xray"
+    [[ -n "${ANYTLS_DOMAIN:-}" ]] && register_domain "$ANYTLS_DOMAIN" "direct" "singbox"
+    [[ -n "${NAIVE_DOMAIN:-}" ]] && register_domain "$NAIVE_DOMAIN" "direct" "naiveproxy"
+    [[ -n "${HYSTERIA2_DOMAIN:-}" ]] && register_domain "$HYSTERIA2_DOMAIN" "direct" "hysteria2"
+
+    rebuild_protocol_domains
+    load_domain_state
+
+    if [[ -z "${HYSTERIA2_DOMAIN:-}" ]]; then
+        local registry
+        registry=$(get_state "DOMAIN_REGISTRY")
+        if [[ -n "$registry" ]]; then
+            echo ""
+            log_warn "HYSTERIA2_DOMAIN 仍为空，可从已有域名追加 hysteria2 协议"
+            for domain in $registry; do
+                local suffix mode protos
+                suffix=$(echo "$domain" | tr '.' '_')
+                mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
+                protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+                printf "  %-30s [%s / %s]\n" "$domain" "$mode" "$protos"
+            done
+            echo ""
+            local hy_domain
+            read -rp "输入要分配给 Hysteria2 的已有域名（留空跳过）: " hy_domain
+            hy_domain="${hy_domain,,}"
+            if [[ -n "$hy_domain" ]]; then
+                if domain_is_registered "$hy_domain"; then
+                    local hy_suffix hy_mode
+                    hy_suffix=$(echo "$hy_domain" | tr '.' '_')
+                    hy_mode=$(get_state "DOMAIN_MODE_${hy_suffix}" "direct")
+                    register_domain "$hy_domain" "$hy_mode" "hysteria2"
+                    rebuild_protocol_domains
+                    load_domain_state
+                    log_info "已将 ${hy_domain} 分配给 Hysteria2"
+                else
+                    log_error "域名 ${hy_domain} 不在 DOMAIN_REGISTRY 中，请先添加域名"
+                fi
+            fi
+        fi
+    fi
+
+    save_domain_config
+
+    echo ""
+    log_info "刷新后的域名分配："
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY")
+    if [[ -n "$registry" ]]; then
+        for domain in $registry; do
+            local suffix mode protos
+            suffix=$(echo "$domain" | tr '.' '_')
+            mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
+            protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+            printf "  %-30s [%s / %s]\n" "$domain" "$mode" "$protos"
+        done
+    else
+        echo "  （暂无）"
+    fi
+
+    log_info "HYSTERIA2_DOMAIN=${HYSTERIA2_DOMAIN:-}"
+    log_info "NAIVE_DOMAIN=${NAIVE_DOMAIN:-}"
+}
+
 # ── 迁移旧 cf_account_N.ini 到域名命名格式 ──────────────────
 migrate_cf_account_files() {
     local cf_dir="${CF_CONFIG_DIR}"
@@ -1306,6 +1403,11 @@ migrate_cf_account_files() {
     local -A auto_root=()
     local -A ini_token=()
     local -A ini_email=()
+
+    mkdir -p "$cf_dir"
+    chmod 700 "$cf_dir"
+    touch "$CF_DOMAIN_MAP_FILE"
+    chmod 600 "$CF_DOMAIN_MAP_FILE"
 
     # ── 第一遍：收集所有待迁移文件，尝试自动识别域名 ────────
     for ini in "${cf_dir}"/cf_account_*.ini; do
@@ -1318,6 +1420,17 @@ migrate_cf_account_files() {
 
         # 已迁移过则跳过
         grep -q "^CF_ACCOUNT_${bname}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null && continue
+        if grep -q "^CF_INI_.*=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null; then
+            local mapped_dup=false
+            for mapped_ini in "${cf_dir}"/*.ini; do
+                [[ -f "$mapped_ini" ]] || continue
+                local mapped_bname
+                mapped_bname=$(basename "$mapped_ini" .ini | sed 's/^cf_account_//')
+                [[ "$mapped_bname" =~ ^[0-9]+$ ]] && continue
+                _cf_tokens_match "$ini" "$mapped_ini" && mapped_dup=true && break
+            done
+            $mapped_dup && continue
+        fi
         grep -q "^CF_INI_.*=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null && {
             # 检查是否有新格式文件已存在（token 内容相同）
             local already=false
@@ -1325,14 +1438,12 @@ migrate_cf_account_files() {
                 local dn_bname
                 dn_bname=$(basename "$dn" .ini | sed 's/^cf_account_//')
                 [[ "$dn_bname" =~ ^[0-9]+$ ]] && continue
-                if cmp -s "$ini" "$dn" 2>/dev/null; then
+                if _cf_tokens_match "$ini" "$dn"; then
                     already=true && break
                 fi
             done
             $already && continue
         }
-
-        old_files+=("$ini")
 
         # 缓存 token 和 email
         ini_token["$ini"]=$(grep 'dns_cloudflare_api_token' "$ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
@@ -1372,7 +1483,22 @@ migrate_cf_account_files() {
             done
         fi
 
-        [[ -n "$auto_found" ]] && auto_root["$ini"]="$auto_found"
+        if [[ -n "$auto_found" ]]; then
+            auto_root["$ini"]="$auto_found"
+
+            local auto_base auto_ini
+            auto_base=$(domain_to_ini_name "$auto_found")
+            auto_ini="${cf_dir}/${auto_base}.ini"
+            if [[ -f "$auto_ini" ]] && _cf_tokens_match "$ini" "$auto_ini"; then
+                grep -q "^CF_ACCOUNT_${bname}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || \
+                    echo "CF_ACCOUNT_${bname}='${auto_found}'" >> "${CF_DOMAIN_MAP_FILE}"
+                grep -q "^CF_INI_${auto_base}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || \
+                    echo "CF_INI_${auto_base}='${auto_base}'" >> "${CF_DOMAIN_MAP_FILE}"
+                continue
+            fi
+        fi
+
+        old_files+=("$ini")
     done
 
     # ── 没有待迁移文件则直接返回 ──────────────────────────
@@ -1424,13 +1550,24 @@ migrate_cf_account_files() {
         new_base=$(domain_to_ini_name "$cf_root")
         local new_ini="${cf_dir}/${new_base}.ini"
 
+        if [[ -f "$new_ini" ]] && _cf_tokens_match "$ini" "$new_ini"; then
+            grep -q "^CF_ACCOUNT_${bname}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || \
+                echo "CF_ACCOUNT_${bname}='${cf_root}'" >> "${CF_DOMAIN_MAP_FILE}"
+            grep -q "^CF_INI_${new_base}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || \
+                echo "CF_INI_${new_base}='${new_base}'" >> "${CF_DOMAIN_MAP_FILE}"
+            log_info "已存在 ${new_base}.ini，跳过旧账号迁移提示"
+            continue
+        fi
+
         cp "$ini" "$new_ini"
         # 旧格式可能有 email 字段，Token 认证不需要，过滤掉
         sed -i '/^[[:space:]]*dns_cloudflare_email/d' "$new_ini"
         chmod 600 "$new_ini"
 
-        echo "CF_ACCOUNT_${bname}='${cf_root}'" >> "${CF_DOMAIN_MAP_FILE}"
-        echo "CF_INI_${new_base}='${new_base}'"  >> "${CF_DOMAIN_MAP_FILE}"
+        grep -q "^CF_ACCOUNT_${bname}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || \
+            echo "CF_ACCOUNT_${bname}='${cf_root}'" >> "${CF_DOMAIN_MAP_FILE}"
+        grep -q "^CF_INI_${new_base}=" "${CF_DOMAIN_MAP_FILE}" 2>/dev/null || \
+            echo "CF_INI_${new_base}='${new_base}'"  >> "${CF_DOMAIN_MAP_FILE}"
 
         log_info "已将 cf_account_${bname}.ini 迁移为 ${new_base}.ini（旧文件保留）"
         (( migrated++ )) || true
@@ -1456,8 +1593,9 @@ run_cert() {
     echo "  3. 新增域名并申请证书（复用已有CF账号）"
     echo "  4. 仅补申请证书（域名已配置）"
     echo "  5. 检查/更新 Certbot 及 DNS 插件"
+    echo "  6. 刷新/修复域名协议分配"
     echo ""
-    read -rp "  请选择 [1-5，默认1]: " cert_choice
+    read -rp "  请选择 [1-6，默认1]: " cert_choice
     cert_choice="${cert_choice:-1}"
 
     case "$cert_choice" in
@@ -1483,6 +1621,14 @@ run_cert() {
             ;;
         5)
             update_certbot_deps
+            return
+            ;;
+        6)
+            refresh_domain_assignments
+            log_info "重新生成 Nginx 配置..."
+            do_conf_nginx 2>/dev/null || {
+                log_warn "Nginx 配置生成失败，请手动执行步骤 9"
+            }
             return
             ;;
         4)
