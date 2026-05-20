@@ -96,6 +96,19 @@ domain_is_registered() {
     [[ " ${registry} " == *" ${domain} "* ]]
 }
 
+merge_domain_protocols() {
+    local existing="${1:-}" added="${2:-}"
+    local result="" protocol
+
+    for protocol in ${existing//,/ } ${added//,/ }; do
+        [[ -z "$protocol" ]] && continue
+        [[ ",${result}," == *",${protocol},"* ]] && continue
+        result="${result:+$result,}$protocol"
+    done
+
+    echo "$result"
+}
+
 _save_state_verified() {
     local key="$1" value="$2" actual attempt
 
@@ -114,9 +127,14 @@ _save_state_verified() {
 
 register_domain() {
     local domain="$1" mode="$2" protocols="$3"
-    local suffix
+    local suffix existing_protocols
     suffix=$(_domain_state_suffix "$domain")
     [[ -z "$domain" ]] && return 1
+
+    existing_protocols=$(get_state "DOMAIN_PROTO_${suffix}" "")
+    if domain_is_registered "$domain" && [[ -n "$existing_protocols" ]]; then
+        protocols=$(merge_domain_protocols "$existing_protocols" "$protocols")
+    fi
 
     _save_state_verified "DOMAIN_MODE_${suffix}" "$mode"
     _save_state_verified "DOMAIN_PROTO_${suffix}" "$protocols"

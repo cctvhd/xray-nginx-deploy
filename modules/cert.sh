@@ -1125,14 +1125,20 @@ add_domain_and_cert() {
     while true; do
         echo ""
         local domain protocols mode root_domain cf_choice
+        local is_existing=false current_mode="" current_protos=""
 
         read -rp "请输入新域名（留空结束）: " domain
         domain="${domain,,}"
         [[ -z "$domain" ]] && break
 
         if domain_is_registered "$domain"; then
-            log_warn "域名 $domain 已存在，跳过"
-            continue
+            local suffix
+            suffix=$(echo "$domain" | tr '.' '_')
+            current_mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
+            current_protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+            is_existing=true
+            log_warn "域名 $domain 已存在，将追加协议"
+            log_info "当前配置: $domain [mode=$current_mode, proto=$current_protos]"
         fi
 
         # ── 多选协议 ──
@@ -1161,71 +1167,79 @@ add_domain_and_cert() {
 
         # ── 连接方式 ──
         local mode_r
-        read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
-        case "${mode_r:-d}" in
+        if [[ "$is_existing" == "true" ]]; then
+            read -rp "  连接方式 [d=直连, c=CDN，默认保持 ${current_mode}]: " mode_r
+        else
+            read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
+        fi
+        case "${mode_r:-${current_mode:-d}}" in
             c|C|cdn|CDN) mode="cdn" ;;
             *)           mode="direct" ;;
         esac
 
-        # ── 关联 CF 账号（自动匹域名 → 手动选）─────────────
-        root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-        local _ini_base _ini_file _matched_ini=() _auto_ini
-        _ini_base=$(domain_to_ini_name "$root_domain")
-        _ini_file="${CF_CONFIG_DIR}/${_ini_base}.ini"
-
-        if [[ -f "$_ini_file" ]]; then
-            # 精确匹配成功
-            _auto_ini="$_ini_file"
-            log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
+        if [[ "$is_existing" == "true" ]]; then
+            protocols=$(merge_domain_protocols "$current_protos" "$protocols")
         else
-            # 模糊匹配：扫描所有 ini（排除 domain_ 映射文件），找出包含根域的文件
-            for _f in "${CF_CONFIG_DIR}"/*.ini; do
-                [[ -f "$_f" ]] || continue
-                [[ "$(basename "$_f")" == domain_* ]] && continue
-                [[ "$(basename "$_f")" == *"${_ini_base}"* ]] && _matched_ini+=("$_f")
-            done
+            # ── 关联 CF 账号（自动匹域名 → 手动选）─────────────
+            root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+            local _ini_base _ini_file _matched_ini=() _auto_ini
+            _ini_base=$(domain_to_ini_name "$root_domain")
+            _ini_file="${CF_CONFIG_DIR}/${_ini_base}.ini"
 
-            if [[ ${#_matched_ini[@]} -eq 1 ]]; then
-                _auto_ini="${_matched_ini[0]}"
+            if [[ -f "$_ini_file" ]]; then
+                # 精确匹配成功
+                _auto_ini="$_ini_file"
                 log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
             else
-                # 匹配不到或有多于一个候选，展示列表让手动选择
-                echo ""
-                log_info "可用 CF 账号："
+                # 模糊匹配：扫描所有 ini（排除 domain_ 映射文件），找出包含根域的文件
                 for _f in "${CF_CONFIG_DIR}"/*.ini; do
                     [[ -f "$_f" ]] || continue
                     [[ "$(basename "$_f")" == domain_* ]] && continue
-                    local _lb _b
-                    _b=$(basename "$_f" .ini | sed 's/^cf_account_//')
-                    _lb=$(_cf_account_label "$_f")
-                    echo "  [${_b}] $(basename "$_f")  (token: ${_lb})"
+                    [[ "$(basename "$_f")" == *"${_ini_base}"* ]] && _matched_ini+=("$_f")
                 done
-                local cf_choice _src_ini
-                read -rp "输入方括号内标识选择 CF 账号: " cf_choice
-                [[ -z "$cf_choice" ]] && { log_error "未选择账号"; return 1; }
 
-                _src_ini="${CF_CONFIG_DIR}/${cf_choice}.ini"
-                [[ -f "$_src_ini" ]] || _src_ini="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
+                if [[ ${#_matched_ini[@]} -eq 1 ]]; then
+                    _auto_ini="${_matched_ini[0]}"
+                    log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
+                else
+                    # 匹配不到或有多于一个候选，展示列表让手动选择
+                    echo ""
+                    log_info "可用 CF 账号："
+                    for _f in "${CF_CONFIG_DIR}"/*.ini; do
+                        [[ -f "$_f" ]] || continue
+                        [[ "$(basename "$_f")" == domain_* ]] && continue
+                        local _lb _b
+                        _b=$(basename "$_f" .ini | sed 's/^cf_account_//')
+                        _lb=$(_cf_account_label "$_f")
+                        echo "  [${_b}] $(basename "$_f")  (token: ${_lb})"
+                    done
+                    local cf_choice _src_ini
+                    read -rp "输入方括号内标识选择 CF 账号: " cf_choice
+                    [[ -z "$cf_choice" ]] && { log_error "未选择账号"; return 1; }
 
-                [[ -f "$_src_ini" ]] || {
-                    log_error "CF 账号文件不存在: ${_src_ini}"
-                    return 1
-                }
-                _auto_ini="$_src_ini"
+                    _src_ini="${CF_CONFIG_DIR}/${cf_choice}.ini"
+                    [[ -f "$_src_ini" ]] || _src_ini="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
+
+                    [[ -f "$_src_ini" ]] || {
+                        log_error "CF 账号文件不存在: ${_src_ini}"
+                        return 1
+                    }
+                    _auto_ini="$_src_ini"
+                fi
             fi
-        fi
 
-        # 复制到 domain_ 映射文件以供后续证书申请使用
-        local _dom_ini_base
-        _dom_ini_base=$(domain_to_ini_name "$root_domain")
-        cp "$_auto_ini" "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
-        chmod 600 "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
-        sed -i '/^[[:space:]]*dns_cloudflare_email/d' "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
+            # 复制到 domain_ 映射文件以供后续证书申请使用
+            local _dom_ini_base
+            _dom_ini_base=$(domain_to_ini_name "$root_domain")
+            cp "$_auto_ini" "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
+            chmod 600 "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
+            sed -i '/^[[:space:]]*dns_cloudflare_email/d' "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
+        fi
 
         # 注册域名
         register_domain "$domain" "$mode" "$protocols"
-        new_domains+=("$domain")
-        log_info "已添加: $domain [mode=$mode, proto=$protocols]"
+        [[ "$is_existing" == "false" ]] && new_domains+=("$domain")
+        log_info "已更新: $domain [mode=$mode, proto=$protocols]"
 
         # ── 继续询问 ──
         local more
