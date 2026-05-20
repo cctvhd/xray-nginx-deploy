@@ -1363,10 +1363,14 @@ refresh_domain_assignments() {
                     local hy_suffix hy_mode
                     hy_suffix=$(echo "$hy_domain" | tr '.' '_')
                     hy_mode=$(get_state "DOMAIN_MODE_${hy_suffix}" "direct")
-                    register_domain "$hy_domain" "$hy_mode" "hysteria2"
-                    rebuild_protocol_domains
-                    load_domain_state
-                    log_info "已将 ${hy_domain} 分配给 Hysteria2"
+                    if register_domain "$hy_domain" "$hy_mode" "hysteria2"; then
+                        rebuild_protocol_domains
+                        load_domain_state
+                        log_info "已将 ${hy_domain} 分配给 Hysteria2"
+                    else
+                        log_error "Hysteria2 域名分配失败，请检查 ${STATE_FILE}"
+                        return 1
+                    fi
                 else
                     log_error "域名 ${hy_domain} 不在 DOMAIN_REGISTRY 中，请先添加域名"
                 fi
@@ -1625,10 +1629,6 @@ run_cert() {
             ;;
         6)
             refresh_domain_assignments
-            log_info "重新生成 Nginx 配置..."
-            do_conf_nginx 2>/dev/null || {
-                log_warn "Nginx 配置生成失败，请手动执行步骤 9"
-            }
             return
             ;;
         4)
