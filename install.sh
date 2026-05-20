@@ -54,8 +54,8 @@ get_state() {
     fi
 
     local value
-    value=$(grep -F "${key}=" "$STATE_FILE" 2>/dev/null | \
-        head -1 | cut -d= -f2- | sed "s/^['\"]//;s/['\"]$//" || true)
+    value=$(awk -F= -v k="$key" '$1 == k { v=substr($0, index($0, "=") + 1) } END { print v }' \
+        "$STATE_FILE" 2>/dev/null | sed "s/^['\"]//;s/['\"]$//" || true)
 
     if [[ -n "$value" ]]; then
         echo "$value"
@@ -136,14 +136,14 @@ register_domain() {
         protocols=$(merge_domain_protocols "$existing_protocols" "$protocols")
     fi
 
-    _save_state_verified "DOMAIN_MODE_${suffix}" "$mode"
-    _save_state_verified "DOMAIN_PROTO_${suffix}" "$protocols"
+    _save_state_verified "DOMAIN_MODE_${suffix}" "$mode" || return 1
+    _save_state_verified "DOMAIN_PROTO_${suffix}" "$protocols" || return 1
 
     local registry
     registry=$(get_state "DOMAIN_REGISTRY" "")
     if [[ " ${registry} " != *" ${domain} "* ]]; then
         registry="${registry:+$registry }$domain"
-        _save_state_verified "DOMAIN_REGISTRY" "$registry"
+        _save_state_verified "DOMAIN_REGISTRY" "$registry" || return 1
     fi
 }
 
