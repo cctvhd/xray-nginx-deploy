@@ -1282,17 +1282,6 @@ add_domain_and_cert() {
     # 自动配置续期
     setup_auto_renew
 
-    # 询问是否重新生成 Nginx 配置
-    echo ""
-    local redo_nginx
-    read -rp "是否立即重新生成 Nginx 配置？[y/N]: " redo_nginx
-    if [[ "${redo_nginx,,}" == "y" ]]; then
-        log_info "重新生成 Nginx 配置..."
-        do_conf_nginx 2>/dev/null || {
-            log_warn "Nginx 配置生成失败，请手动执行步骤 9"
-        }
-    fi
-
     log_info "域名添加完成: ${#new_domains[@]} 个"
 }
 
@@ -1463,12 +1452,19 @@ run_cert() {
             add_cf_account
             log_info "新增 CF 账号完成，继续添加域名..."
             add_domain_and_cert
+            log_info "重新生成 Nginx 配置..."
+            do_conf_nginx 2>/dev/null || {
+                log_warn "Nginx 配置生成失败，请手动执行步骤 9"
+            }
             return
             ;;
         3)
             install_certbot
             add_domain_and_cert
             log_info "========== 新增域名完成 =========="
+            do_conf_nginx 2>/dev/null || {
+                log_warn "Nginx 配置生成失败，请手动执行步骤 9"
+            }
             return
             ;;
         5)
