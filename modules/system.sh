@@ -11,14 +11,22 @@ GLOBAL_FILE_MAX=2097152
 GLOBAL_NOFILE_LIMIT=1048576
 GLOBAL_NPROC_LIMIT=65536
 
-# ── 日志函数（独立运行时使用，与主脚本配合时会被覆盖） ───────
-log_step() { echo -e "\e[36m[STEP]\e[0m $*"; }
-log_info()  { echo -e "\e[32m[INFO]\e[0m $*"; }
-log_warn()  { echo -e "\e[33m[WARN]\e[0m $*"; }
-log_error() { echo -e "\e[31m[ERROR]\e[0m $*"; }
-
-# save_state 空实现（与主脚本配合时会被覆盖）
-save_state() { :; }
+# ── 兼容独立运行：主脚本已定义时不要覆盖 ─────────────────────
+if ! declare -F log_step >/dev/null; then
+    log_step() { echo -e "\e[36m[STEP]\e[0m $*"; }
+fi
+if ! declare -F log_info >/dev/null; then
+    log_info()  { echo -e "\e[32m[INFO]\e[0m $*"; }
+fi
+if ! declare -F log_warn >/dev/null; then
+    log_warn()  { echo -e "\e[33m[WARN]\e[0m $*"; }
+fi
+if ! declare -F log_error >/dev/null; then
+    log_error() { echo -e "\e[31m[ERROR]\e[0m $*"; }
+fi
+if ! declare -F save_state >/dev/null; then
+    save_state() { :; }
+fi
 
 # ── 模块入口 ─────────────────────────────────────────────────
 run_system() {
