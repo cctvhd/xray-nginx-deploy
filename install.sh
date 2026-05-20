@@ -96,20 +96,36 @@ domain_is_registered() {
     [[ " ${registry} " == *" ${domain} "* ]]
 }
 
+_save_state_verified() {
+    local key="$1" value="$2" actual attempt
+
+    for attempt in 1 2 3; do
+        save_state "$key" "$value"
+        actual=$(get_state "$key" "")
+        [[ "$actual" == "$value" ]] && return 0
+
+        log_warn "${key} 写入验证失败，正在重试 (${attempt}/3)"
+        sleep 0.2
+    done
+
+    log_error "${key} 写入失败，请检查 ${STATE_FILE}"
+    return 1
+}
+
 register_domain() {
     local domain="$1" mode="$2" protocols="$3"
     local suffix
     suffix=$(_domain_state_suffix "$domain")
     [[ -z "$domain" ]] && return 1
 
-    save_state "DOMAIN_MODE_${suffix}" "$mode"
-    save_state "DOMAIN_PROTO_${suffix}" "$protocols"
+    _save_state_verified "DOMAIN_MODE_${suffix}" "$mode"
+    _save_state_verified "DOMAIN_PROTO_${suffix}" "$protocols"
 
     local registry
     registry=$(get_state "DOMAIN_REGISTRY" "")
     if [[ " ${registry} " != *" ${domain} "* ]]; then
         registry="${registry:+$registry }$domain"
-        save_state "DOMAIN_REGISTRY" "$registry"
+        _save_state_verified "DOMAIN_REGISTRY" "$registry"
     fi
 }
 
