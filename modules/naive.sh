@@ -243,40 +243,6 @@ SVC
     set +x  # DEBUG: 关闭追踪
 }
 
-# ── 辅助：从 nginx 配置探测 naive Caddy 端口 ──────────────
-# nginx stream: NAIVE_DOMAIN → 中间层端口 → proxy_pass → Caddy 端口
-_detect_naive_caddy_port() {
-    local nginx_conf="/etc/nginx/nginx.conf"
-    local domain="$1"
-    local mid_port caddy_port
-
-    if [[ ! -f "$nginx_conf" ]]; then
-        return 1
-    fi
-
-    # 在 stream map 块语义范围内查找域名 → 中间层端口 (如 18444)
-    mid_port=$(awk '
-        /^map\s+\$[a-zA-Z_]+\s+\$[a-zA-Z_]+/ { in_map=1 }
-        in_map { print }
-        in_map && /^\s*}/ { in_map=0 }
-    ' "$nginx_conf" 2>/dev/null \
-        | grep -v '^\s*#' \
-        | grep -F "${domain}" \
-        | grep -oP '127\.0\.0\.1:\K\d+' \
-        | head -1)
-    if [[ -z "$mid_port" ]]; then
-        return 1
-    fi
-
-    # 从 stream server 块找 中间层端口 → proxy_pass Caddy 端口 (如 8444)
-    caddy_port=$(awk "/listen.*${mid_port}.*proxy_protocol/,/}/" "$nginx_conf" \
-        | grep 'proxy_pass' | grep -oP '127\.0\.0\.1:\K\d+' | head -1)
-    if [[ -z "$caddy_port" ]]; then
-        return 1
-    fi
-
-    echo "$caddy_port"
-}
 
 configure_naive() {
     log_step "配置 NaiveProxy..."
@@ -312,16 +278,9 @@ configure_naive() {
     log_info "证书: ${NAIVE_CERT}"
     log_info "私钥: ${NAIVE_KEY}"
 
-    # ── 3. 探测 Caddy 端口（从 nginx stream 配置自动获取）──────
-    local NAIVE_PORT
-    NAIVE_PORT=$(_detect_naive_caddy_port "${NAIVE_DOMAIN}")
-    if [[ -n "${NAIVE_PORT}" ]]; then
-        log_info "从 nginx 配置探测到 Caddy 端口: ${NAIVE_PORT}"
-    else
-        read -rp "Caddy 监听端口 [默认: 8444]: " NAIVE_PORT
-        NAIVE_PORT="${NAIVE_PORT:-8444}"
-        log_info "使用端口: ${NAIVE_PORT}（未从 nginx 探测到）"
-    fi
+    # ── 3. 监听端口 ──────────────────────────────────────────
+    local NAIVE_PORT="8444"
+    log_info "后端监听端口: 127.0.0.1:${NAIVE_PORT}"
 
     # ── 4. 认证信息 ──────────────────────────────────────────
     local NAIVE_USER
@@ -369,7 +328,7 @@ configure_naive() {
     auto_https off
 }
 
-:${NAIVE_PORT} {
+127.0.0.1:${NAIVE_PORT} {
     tls /etc/caddy-naive/fullchain.pem /etc/caddy-naive/privkey.pem
 
     route {
