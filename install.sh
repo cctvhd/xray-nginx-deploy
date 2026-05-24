@@ -1151,7 +1151,7 @@ do_conf_naive() {
     load_os_info
     restore_domain_arrays
     load_module naive
-    configure_naive
+    configure_naive || return
 
     save_state "CONF_NAIVE" "1"
 
