@@ -288,7 +288,7 @@ configure_naive() {
     if [[ -z "${NAIVE_DOMAIN}" ]]; then
         log_error "NaiveProxy 域名未配置，请先执行步骤 4（SSL 证书）添加域名并分配协议"
         log_error "无法确定 NaiveProxy 域名，请先完成证书申请（步骤 4）"
-        exit 1
+        return 1
     fi
 
     save_state "NAIVE_DOMAIN" "${NAIVE_DOMAIN}"
@@ -389,8 +389,22 @@ EOF
     log_info "已写入 /etc/caddy-naive/Caddyfile"
 
     # ── 8. 证书复制 ──────────────────────────────────────────
-    cp "${NAIVE_CERT}" /etc/caddy-naive/fullchain.pem
-    cp "${NAIVE_KEY}" /etc/caddy-naive/privkey.pem
+    if [[ ! -f "${NAIVE_CERT}" ]]; then
+        log_error "证书源文件不存在: ${NAIVE_CERT}"
+        return 1
+    fi
+    if [[ ! -f "${NAIVE_KEY}" ]]; then
+        log_error "私钥源文件不存在: ${NAIVE_KEY}"
+        return 1
+    fi
+    if ! cp "${NAIVE_CERT}" /etc/caddy-naive/fullchain.pem; then
+        log_error "证书复制失败: ${NAIVE_CERT} -> /etc/caddy-naive/fullchain.pem"
+        return 1
+    fi
+    if ! cp "${NAIVE_KEY}" /etc/caddy-naive/privkey.pem; then
+        log_error "私钥复制失败: ${NAIVE_KEY} -> /etc/caddy-naive/privkey.pem"
+        return 1
+    fi
     chown -R caddy-naive:caddy-naive /etc/caddy-naive
     log_info "证书已复制到 /etc/caddy-naive/"
 
@@ -434,7 +448,7 @@ HOOK
     # ── 10. 启动前验证配置 ───────────────────────────────────
     if ! /usr/local/bin/caddy-naive validate --config /etc/caddy-naive/Caddyfile; then
         log_error "Caddyfile 配置验证失败，请检查配置"
-        exit 1
+        return 1
     fi
 
     # ── 11. 启动服务 ─────────────────────────────────────────
