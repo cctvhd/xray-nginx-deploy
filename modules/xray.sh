@@ -359,7 +359,7 @@ generate_xray_config() {
         ],
         "disableCache":    false,
         "disableFallback": true,
-        "queryStrategy":   "UseIPv4v6"
+        "queryStrategy":   "$(is_ipv6_preferred 2>/dev/null && echo "UseIPv6v4" || echo "UseIPv4v6")"
     },
 
     "routing": {

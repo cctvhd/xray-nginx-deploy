@@ -202,7 +202,8 @@ generate_singbox_config() {
       }
     ],
     "final":           "local_recursive",
-    "strategy":        "prefer_ipv4",
+    "strategy":        "$(is_ipv6_preferred 2>/dev/null && echo "prefer_ipv6" || echo "prefer_ipv4")",
+
     "reverse_mapping": true
   },
   "inbounds": [
