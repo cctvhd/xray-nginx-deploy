@@ -353,7 +353,13 @@ generate_main_config() {
 
     local do_ip6="yes"
     local iface_ipv6="    interface: ::"
+    local unbound_prefer_ip6
     [[ "$(get_stack_mode)" == "ipv4" ]] && do_ip6="no" && iface_ipv6="    # interface: ::  # IPv4-only"
+    if is_ipv6_preferred 2>/dev/null; then
+        unbound_prefer_ip6="yes"
+    else
+        unbound_prefer_ip6="no"
+    fi
 
     cat > /etc/unbound/unbound.conf << MAIN_EOF
 # ============================================================
@@ -394,7 +400,7 @@ ${iface_ipv6}
     so-sndbuf: 8m
 
     # === 安全加固 ===
-    prefer-ip6: $(is_ipv6_preferred 2>/dev/null && echo "yes" || echo "no")
+    prefer-ip6: ${unbound_prefer_ip6}
     deny-any: yes
     harden-glue: yes
     harden-referral-path: yes

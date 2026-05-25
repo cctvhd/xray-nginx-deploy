@@ -405,7 +405,14 @@ run_cf_ip_updater() {
 generate_ssl_conf() {
     log_step "生成 SSL 通用配置..."
 
-    cat > /etc/nginx/ssl/common.conf << 'CONF'
+    local ipv6_resolver
+    if is_ipv6_preferred 2>/dev/null; then
+        ipv6_resolver="ipv6=on"
+    else
+        ipv6_resolver="ipv6=off"
+    fi
+
+    cat > /etc/nginx/ssl/common.conf << CONF
 # ===================================================
 # /etc/nginx/ssl/common.conf
 # ===================================================
@@ -423,7 +430,7 @@ ssl_buffer_size 4k;
 ssl_stapling off;
 ssl_stapling_verify off;
 
-resolver 127.0.0.1:53 valid=300s $(is_ipv6_preferred 2>/dev/null && echo "ipv6=on" || echo "ipv6=off");
+resolver 127.0.0.1:53 valid=300s ${ipv6_resolver};
 resolver_timeout 5s;
 
 add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
