@@ -319,6 +319,13 @@ generate_xray_config() {
     local warp_outbound
     warp_outbound=$(_build_warp_outbound_json)
 
+    local xray_query_strategy
+    if is_ipv6_preferred 2>/dev/null; then
+        xray_query_strategy="UseIPv6v4"
+    else
+        xray_query_strategy="UseIPv4v6"
+    fi
+
     mkdir -p /usr/local/etc/xray
 
     cat > /usr/local/etc/xray/config.json << CONF
@@ -359,7 +366,7 @@ generate_xray_config() {
         ],
         "disableCache":    false,
         "disableFallback": true,
-        "queryStrategy":   "$(is_ipv6_preferred 2>/dev/null && echo "UseIPv6v4" || echo "UseIPv4v6")"
+        "queryStrategy":   "${xray_query_strategy}"
     },
 
     "routing": {

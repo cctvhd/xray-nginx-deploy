@@ -172,8 +172,13 @@ WGJSON
 generate_singbox_config() {
     log_step "生成 Sing-Box 配置文件..."
 
-    local warp_endpoint
+    local warp_endpoint dns_strategy
     warp_endpoint=$(_build_warp_endpoint_json_sb)
+    if is_ipv6_preferred 2>/dev/null; then
+        dns_strategy="prefer_ipv6"
+    else
+        dns_strategy="prefer_ipv4"
+    fi
 
     cat > /etc/sing-box/config.json << CONF
 {
@@ -202,7 +207,7 @@ generate_singbox_config() {
       }
     ],
     "final":           "local_recursive",
-    "strategy":        "$(is_ipv6_preferred 2>/dev/null && echo "prefer_ipv6" || echo "prefer_ipv4")",
+    "strategy":        "${dns_strategy}",
 
     "reverse_mapping": true
   },
