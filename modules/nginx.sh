@@ -423,7 +423,7 @@ ssl_buffer_size 4k;
 ssl_stapling off;
 ssl_stapling_verify off;
 
-resolver 127.0.0.1:53 valid=300s ipv6=on;
+resolver 127.0.0.1:53 valid=300s $(is_ipv6_preferred 2>/dev/null && echo "ipv6=on" || echo "ipv6=off");
 resolver_timeout 5s;
 
 add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;

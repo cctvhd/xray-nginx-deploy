@@ -86,10 +86,18 @@ collect_hardware_info() {
     fi
 
     # ── 自动检测双栈 ─────────────────────────────────────────
-    local dual_auto="ipv4-only"
-    if ip -6 addr show scope global 2>/dev/null | grep -q 'inet6'; then
+    local has_v4=0 has_v6=0 dual_auto
+    ip -o -4 addr show scope global 2>/dev/null | grep -q . && has_v4=1 || true
+    ip -o -6 addr show scope global 2>/dev/null | grep -v ' fe80:' | grep -q . && has_v6=1 || true
+
+    if [[ $has_v4 -eq 1 && $has_v6 -eq 1 ]]; then
         dual_auto="dual-stack"
+    elif [[ $has_v6 -eq 1 ]]; then
+        dual_auto="ipv6-only"
+    else
+        dual_auto="ipv4-only"
     fi
+
     if [[ -z "${HW_DUAL_STACK:-}" || "${HW_DUAL_STACK}" == "unknown" ]]; then
         HW_DUAL_STACK="$dual_auto"
     fi
@@ -165,13 +173,15 @@ collect_hardware_info() {
     echo "网络栈选项："
     echo "  1. ipv4-only"
     echo "  2. dual-stack（IPv4 + IPv6）"
-    echo "  3. 保持当前 (${HW_DUAL_STACK})"
+    echo "  3. ipv6-only"
+    echo "  4. 保持当前 (${HW_DUAL_STACK})"
     local stack_choice
-    read -rp "请选择 [1-3，默认3]: " stack_choice
-    case "${stack_choice:-3}" in
+    read -rp "请选择 [1-4，默认4]: " stack_choice
+    case "${stack_choice:-4}" in
         1) HW_DUAL_STACK="ipv4-only" ;;
         2) HW_DUAL_STACK="dual-stack" ;;
-        3) : ;;
+        3) HW_DUAL_STACK="ipv6-only" ;;
+        4) : ;;
     esac
     log_info "网络栈已设为: ${HW_DUAL_STACK}"
 
