@@ -286,9 +286,9 @@ configure_naive() {
     local NAIVE_USER
     NAIVE_USER=$(get_state "NAIVE_USER")
     if [[ -z "${NAIVE_USER}" ]]; then
-        NAIVE_USER="naive"
+        NAIVE_USER=$(tr -dc 'a-z0-9' </dev/urandom | head -c 12)
         save_state "NAIVE_USER" "${NAIVE_USER}"
-        log_info "默认用户名: ${NAIVE_USER}"
+        log_info "已生成随机用户名: ${NAIVE_USER}"
     else
         log_info "复用已有用户名: ${NAIVE_USER}"
     fi
@@ -296,7 +296,7 @@ configure_naive() {
     local NAIVE_PASS
     NAIVE_PASS=$(get_state "NAIVE_PASS")
     if [[ -z "${NAIVE_PASS}" ]]; then
-        NAIVE_PASS=$(openssl rand -base64 18)
+        NAIVE_PASS=$(tr -dc 'A-Za-z0-9#$@&' </dev/urandom | head -c 20)
         save_state "NAIVE_PASS" "${NAIVE_PASS}"
         log_info "已生成新密码"
     else
@@ -313,8 +313,24 @@ configure_naive() {
     local NAIVE_PROXY_TARGET
     NAIVE_PROXY_TARGET=$(get_state "NAIVE_PROXY_TARGET")
     if [[ -z "${NAIVE_PROXY_TARGET}" ]]; then
-        read -rp "伪装反代地址 [默认: https://news.ycombinator.com]: " NAIVE_PROXY_TARGET
-        NAIVE_PROXY_TARGET="${NAIVE_PROXY_TARGET:-https://news.ycombinator.com}"
+        local choice
+        while true; do
+            echo "伪装网站选择："
+            echo "1) https://www.cloudflare.com（默认）"
+            echo "2) https://www.apple.com"
+            echo "3) https://www.microsoft.com"
+            echo "4) https://www.bing.com"
+            echo "5) https://www.wikipedia.org"
+            read -rp "请选择伪装目标 [1-5, 默认 1]: " choice
+            case "$choice" in
+                ""|1) NAIVE_PROXY_TARGET="https://www.cloudflare.com"; break ;;
+                2) NAIVE_PROXY_TARGET="https://www.apple.com"; break ;;
+                3) NAIVE_PROXY_TARGET="https://www.microsoft.com"; break ;;
+                4) NAIVE_PROXY_TARGET="https://www.bing.com"; break ;;
+                5) NAIVE_PROXY_TARGET="https://www.wikipedia.org"; break ;;
+                *) echo "无效选择，请重新输入" ;;
+            esac
+        done
         save_state "NAIVE_PROXY_TARGET" "${NAIVE_PROXY_TARGET}"
     fi
     log_info "伪装反代: ${NAIVE_PROXY_TARGET}"
@@ -329,7 +345,11 @@ configure_naive() {
 }
 
 127.0.0.1:${NAIVE_PORT} {
-    tls /etc/caddy-naive/fullchain.pem /etc/caddy-naive/privkey.pem
+    bind 127.0.0.1
+    tls /etc/caddy-naive/fullchain.pem /etc/caddy-naive/privkey.pem {
+        protocols tls1.2 tls1.3
+        ciphers TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
+    }
 
     route {
         forward_proxy {
