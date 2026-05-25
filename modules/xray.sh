@@ -273,7 +273,7 @@ _build_warp_outbound_json() {
                     }
                 ],
                 "mtu":            1280,
-                "domainStrategy": "ForceIPv4v6"
+                "domainStrategy": "ForceIPv6v4"
             }
         }
 WGJSON
@@ -285,7 +285,7 @@ generate_xray_config() {
 
     local x_padding="${XRAY_PADDING:-}"
     case "${x_padding}" in
-        ""|"128-2048"|"128-1024"|"100-1000") x_padding="100-300" ;;
+        ""|"128-2048"|"128-1024") x_padding="100-1000" ;;
     esac
     XRAY_PADDING="${x_padding}"
     save_state "XHTTP_PADDING" "${x_padding}"
@@ -407,16 +407,17 @@ generate_xray_config() {
                     "path": "${XHTTP_PATH}",
                     "host": "${XHTTP_DOMAIN:-}",
                     "extra": {
-                        "enc":           "packet",
-                        "xPaddingBytes": "${x_padding}",
-                        "headers":       {"User-Agent": "chrome"},
+                        "enc":                    "packet",
+                        "xPaddingBytes":          "${x_padding}",
+                        "scStreamUpServerSecs":   "20-80",
+                        "headers":                {"User-Agent": "chrome"},
                         "xmux": {
-                            "maxConcurrency":   "8-16",
+                            "maxConcurrency":   "16-32",
                             "maxConnections":   0,
-                            "cMaxReuseTimes":   200,
-                            "hMaxRequestTimes": "200-400",
-                            "hMaxReusableSecs": "1800-3600",
-                            "hKeepAlivePeriod": 60
+                            "cMaxReuseTimes":   0,
+                            "hMaxRequestTimes": "600-900",
+                            "hMaxReusableSecs": "1800-3000",
+                            "hKeepAlivePeriod": 0
                         }
                     }
                 },
@@ -445,9 +446,11 @@ generate_xray_config() {
                 "security": "none",
                 "grpcSettings": {
                     "serviceName":          "grpc.Service",
-                    "multiMode":            false,
-                    "idle_timeout":         80,
-                    "health_check_timeout": 20
+                    "multiMode":            true,
+                    "idle_timeout":         60,
+                    "health_check_timeout": 20,
+                    "permit_without_stream": false,
+                    "initial_windows_size":  65536
                 }
             },
             "sniffing": {
@@ -503,7 +506,9 @@ generate_xray_config() {
                     "acceptProxyProtocol": true,
                     "tcpUserTimeout":       ${user_timeout},
                     "tcpKeepAliveIdle":     300,
-                    "tcpKeepAliveInterval": 30
+                    "tcpKeepAliveInterval": 30,
+                    "tcpMptcp":             true,
+                    "tcpNoDelay":           true
                 }
             },
             "sniffing": {
@@ -525,7 +530,11 @@ generate_xray_config() {
                 "sockopt": {
                     "tcpUserTimeout":       ${user_timeout},
                     "tcpKeepAliveIdle":     300,
-                    "tcpKeepAliveInterval": 30
+                    "tcpKeepAliveInterval": 30,
+                    "tcpFastOpen":          true,
+                    "tcpcongestion":        "bbr",
+                    "tcpMptcp":             true,
+                    "tcpNoDelay":           true
                 }
             }
         },
