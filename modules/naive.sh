@@ -344,7 +344,7 @@ configure_naive() {
     auto_https off
 }
 
-127.0.0.1:${NAIVE_PORT} {
+:${NAIVE_PORT} {
     bind 127.0.0.1
     tls /etc/caddy-naive/fullchain.pem /etc/caddy-naive/privkey.pem {
         protocols tls1.2 tls1.3
