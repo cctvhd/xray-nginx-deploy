@@ -340,7 +340,7 @@ generate_xray_config() {
         "servers": [
             {
                 "tag":      "local-dns",
-                "address":  "localhost",
+                "address":  "127.0.0.1",
                 "port":     53,
                 "domains":  [
                     "geosite:geolocation-!cn",
