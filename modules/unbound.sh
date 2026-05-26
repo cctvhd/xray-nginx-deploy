@@ -375,7 +375,7 @@ server:
     do-ip6: ${do_ip6}
     do-udp: yes
     do-tcp: yes
-    interface: 0.0.0.0
+    interface: 127.0.0.1
 ${iface_ipv6}
 
     # === 访问控制（仅本地）===
