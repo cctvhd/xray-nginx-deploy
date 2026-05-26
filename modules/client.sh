@@ -20,6 +20,7 @@ load_existing_params() {
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XHTTP_PADDING=$(get_state "XHTTP_PADDING")
+    REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     HYSTERIA2_PASSWORD=$(get_state "HYSTERIA2_PASSWORD")
     HYSTERIA2_PH_START=$(get_state "HYSTERIA2_PH_START")
@@ -43,6 +44,18 @@ load_existing_params() {
             XHTTP_DOMAIN=$(grep -oP '"host":\s*"\K[^"]+' "$xray_config" | head -1)
         REALITY_DEST=$(grep -oP '"dest":\s*"\K[^"]+' "$xray_config" | head -1 || true)
         XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1 || true)
+        XHTTP_EXTRA_JSON=$(python3 -c "
+import json
+with open('${xray_config}') as f:
+    c = json.load(f)
+for inb in c.get('inbounds', []):
+    xs = inb.get('streamSettings', {})
+    if xs.get('network') == 'xhttp':
+        xhs = xs.get('xhttpSettings', {})
+        extra = xhs.get('extra', {})
+        print(json.dumps(extra, indent=2, ensure_ascii=False) if extra else '')
+        break
+" 2>/dev/null || echo '')
 
         # 读取第一个非空 shortId
         [[ -n "${REALITY_SHORT_ID:-}" ]] || REALITY_SHORT_ID=$(python3 -c "
@@ -143,6 +156,8 @@ import urllib.parse
 print(urllib.parse.quote('${XHTTP_PATH}'))
 " 2>/dev/null || echo "${XHTTP_PATH}")
 
+    local _hn
+    _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_URL="vless://${XRAY_UUID}@${XHTTP_DOMAIN}:443?\
 encryption=none\
 &security=tls\
@@ -151,7 +166,7 @@ encryption=none\
 &type=xhttp\
 &path=${path_encoded}\
 &host=${XHTTP_DOMAIN}\
-#$(python3 -c "import urllib.parse; print(urllib.parse.quote('xhttp-CDN-${XHTTP_DOMAIN}'))" 2>/dev/null)"
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-${_hn}'))" 2>/dev/null)"
 }
 
 # ── 生成 gRPC CDN 节点链接 ───────────────────────────────────
@@ -160,6 +175,8 @@ gen_grpc_url() {
         return
     fi
 
+    local _hn
+    _hn=$(hostname -s 2>/dev/null || echo "server")
     GRPC_URL="vless://${XRAY_UUID}@${GRPC_DOMAIN}:443?\
 encryption=none\
 &security=tls\
@@ -168,7 +185,7 @@ encryption=none\
 &type=grpc\
 &serviceName=grpc.Service\
 &mode=gun\
-#$(python3 -c "import urllib.parse; print(urllib.parse.quote('gRPC-CDN-${GRPC_DOMAIN}'))" 2>/dev/null)"
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-${_hn}'))" 2>/dev/null)"
 }
 
 # ── 生成 Reality 直连节点链接 ────────────────────────────────
@@ -183,7 +200,10 @@ import urllib.parse
 print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
 " 2>/dev/null || echo "%2Fapi%2Fhealth")
 
-    REALITY_URL="vless://${XRAY_UUID}@${SERVER_IP}:443?\
+    local reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-$SERVER_IP}}"
+    local _hn
+    _hn=$(hostname -s 2>/dev/null || echo "server")
+    REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
 encryption=none\
 &security=reality\
 &sni=${REALITY_SNI}\
@@ -193,7 +213,7 @@ encryption=none\
 &flow=xtls-rprx-vision\
 &type=tcp\
 &spiderX=${spider_encoded}\
-#$(python3 -c "import urllib.parse; print(urllib.parse.quote('Reality-${SERVER_IP}'))" 2>/dev/null)"
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-${_hn}'))" 2>/dev/null)"
 }
 
 # ── 生成 AnyTLS 节点链接 ─────────────────────────────────────
@@ -212,12 +232,14 @@ import urllib.parse
 print(urllib.parse.quote('${SINGBOX_PASSWORD}', safe=''))
 " 2>/dev/null || echo "${SINGBOX_PASSWORD}")
 
+    local _hn
+    _hn=$(hostname -s 2>/dev/null || echo "server")
     ANYTLS_URL="anytls://${password_encoded}@${ANYTLS_DOMAIN}:443?\
 security=tls\
 &sni=${ANYTLS_DOMAIN}\
 &alpn=h2\
 &insecure=0\
-#$(python3 -c "import urllib.parse; print(urllib.parse.quote('AnyTLS-${ANYTLS_DOMAIN}'))" 2>/dev/null)"
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('anytls-${_hn}'))" 2>/dev/null)"
 }
 
 # ── 生成 Hysteria2 节点链接 ────────────────────────────────────
@@ -239,7 +261,9 @@ print(urllib.parse.quote('${HYSTERIA2_PASSWORD}', safe=''))
         [[ -n "${HYSTERIA2_UPLOAD:-}" ]] && extra_params+="&up=${HYSTERIA2_UPLOAD}"
         [[ -n "${HYSTERIA2_DOWNLOAD:-}" ]] && extra_params+="&down=${HYSTERIA2_DOWNLOAD}"
     fi
-    HYSTERIA2_URL="hysteria2://${password_encoded}@${HYSTERIA2_DOMAIN}:443?${extra_params}#Hysteria2"
+    local _hn
+    _hn=$(hostname -s 2>/dev/null || echo "server")
+    HYSTERIA2_URL="hysteria2://${password_encoded}@${HYSTERIA2_DOMAIN}:443?${extra_params}#$(python3 -c "import urllib.parse; print(urllib.parse.quote('hysteria2-${_hn}'))" 2>/dev/null || echo "hysteria2-${_hn}")"
 }
 
 # ── 生成 NaiveProxy 节点链接 ───────────────────────────────────
@@ -256,7 +280,9 @@ print(urllib.parse.quote('${NAIVE_PASS}', safe=''))
 
     local naive_params="padding=true"
     [[ -n "${NAIVE_PROBE_LINK:-}" ]] && naive_params+="&probe-resistance=${NAIVE_PROBE_LINK}.${NAIVE_DOMAIN}"
-    NAIVE_URL="naive+https://${NAIVE_USER}:${pass_encoded}@${NAIVE_DOMAIN}:443?${naive_params}#NaiveProxy"
+    local _hn
+    _hn=$(hostname -s 2>/dev/null || echo "server")
+    NAIVE_URL="naive+https://${NAIVE_USER}:${pass_encoded}@${NAIVE_DOMAIN}:443?${naive_params}#$(python3 -c "import urllib.parse; print(urllib.parse.quote('naive-${_hn}'))" 2>/dev/null || echo "naive-${_hn}")"
 }
 
 # ── 保存并展示所有链接 ───────────────────────────────────────
@@ -283,28 +309,15 @@ show_client_links() {
         echo -e "${GREEN}[xhttp CDN]${NC}"
         echo "$XHTTP_URL"
         echo ""
+        echo "XHTTP Extra:"
+        echo "$XHTTP_EXTRA_JSON"
+        echo ""
         {
             echo "# xhttp CDN"
             echo "$XHTTP_URL"
             echo ""
             echo "# xhttp Extra 参数（v2rayN XHTTP Extra 填入）"
-            cat << JSON
-{
-    "enc": "packet",
-    "xPaddingBytes": "${XHTTP_PADDING}",
-    "headers": {
-        "User-Agent": "chrome"
-    },
-    "xmux": {
-        "maxConcurrency": "8-16",
-        "maxConnections": 0,
-        "cMaxReuseTimes": 200,
-        "hMaxRequestTimes": "200-400",
-        "hMaxReusableSecs": "1800-3600",
-        "hKeepAlivePeriod": 60
-    }
-}
-JSON
+            echo "$XHTTP_EXTRA_JSON"
             echo ""
         } >> "$output_file"
     fi
