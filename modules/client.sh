@@ -166,7 +166,7 @@ encryption=none\
 &type=xhttp\
 &path=${path_encoded}\
 &host=${XHTTP_DOMAIN}\
-#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-${_hn}'))" 2>/dev/null)"
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-xhttp-${_hn}'))" 2>/dev/null)"
 }
 
 # ── 生成 gRPC CDN 节点链接 ───────────────────────────────────
@@ -185,7 +185,7 @@ encryption=none\
 &type=grpc\
 &serviceName=grpc.Service\
 &mode=gun\
-#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-${_hn}'))" 2>/dev/null)"
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-grpc-${_hn}'))" 2>/dev/null)"
 }
 
 # ── 生成 Reality 直连节点链接 ────────────────────────────────
@@ -213,7 +213,7 @@ encryption=none\
 &flow=xtls-rprx-vision\
 &type=tcp\
 &spiderX=${spider_encoded}\
-#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-${_hn}'))" 2>/dev/null)"
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-reality-${_hn}'))" 2>/dev/null)"
 }
 
 # ── 生成 AnyTLS 节点链接 ─────────────────────────────────────
