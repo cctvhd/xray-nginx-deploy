@@ -483,7 +483,7 @@ EOF
     acl_entries+=("reject(10.0.0.0/8)" "reject(172.16.0.0/12)" "reject(192.168.0.0/16)")
     acl_entries+=("reject(127.0.0.0/8)" "reject(fc00::/7)" "reject(::1/128)")
     acl_entries+=("reject(geosite:cn)" "reject(geosite:tld-cn)" "reject(geoip:cn)")
-    acl_entries+=("reject(all)")
+    acl_entries+=("direct(all)")
     {
         echo "acl:"
         echo "  geoip: /var/lib/hysteria/geoip.dat"
