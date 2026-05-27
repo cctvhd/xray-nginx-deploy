@@ -621,14 +621,15 @@ HOOK
     [[ "${portHoppingStatus}" == "true" ]] && log_info "端口跳跃： ${portHoppingStart}-${portHoppingEnd}"
 
     # 生成链接
+    local hy2_pass_encoded
+    hy2_pass_encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${HY2_PASS}', safe=''))" 2>/dev/null || echo "${HY2_PASS}")
+
     local hy2_url_extra="sni=${HY2_DOMAIN}&insecure=0"
     [[ "${portHoppingStatus}" == "true" ]] && hy2_url_extra+="&mport=${portHoppingStart}-${portHoppingEnd}"
-    [[ "${obfs_status}" == "true" ]] && hy2_url_extra+="&obfs=${obfs_type}"
+    [[ "${obfs_status}" == "true" ]] && hy2_url_extra+="&obfs=${obfs_type}&obfs-password=${hy2_pass_encoded}"
     [[ "${congestion_mode}" == "brutal" && -n "${upload:-}" ]] && hy2_url_extra+="&up=${upload}"
     [[ "${congestion_mode}" == "brutal" && -n "${download:-}" ]] && hy2_url_extra+="&down=${download}"
 
-    local hy2_pass_encoded
-    hy2_pass_encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${HY2_PASS}', safe=''))" 2>/dev/null || echo "${HY2_PASS}")
     log_info "链接：     hysteria2://${hy2_pass_encoded}@${HY2_DOMAIN}:443?${hy2_url_extra}#Hysteria2"
     echo ""
 }
