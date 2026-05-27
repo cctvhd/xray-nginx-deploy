@@ -1469,6 +1469,9 @@ do_reconf_xray() {
 	save_state "CONF_XRAY" "0"
 	log_info "Xray 配置清理完成，开始重新生成..."
 
+	rm -f "${LOCAL_MODULES_DIR}/xray.sh"
+	rm -f "${LOCAL_MODULES_DIR}/uninstall.sh"
+
 	do_conf_xray
 }
 
