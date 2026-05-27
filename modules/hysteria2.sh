@@ -597,13 +597,28 @@ HOOK
     # ── 15. 启动服务 ──────────────────────────────────────────
     systemctl daemon-reload
     systemctl enable hysteria-server.service
-    systemctl restart hysteria-server.service
-    sleep 2
-    if ! systemctl is-active --quiet hysteria-server.service; then
-        log_warn "Hysteria2 服务未能正常启动，请检查："
-        log_warn "  journalctl -u hysteria-server.service --no-pager -n 20"
+
+    # 先彻底停掉旧进程，避免 restart 静默失败
+    systemctl stop hysteria-server.service 2>/dev/null || true
+    sleep 1
+    # 等待端口释放（超时 10s）
+    local _wait=0
+    while ss -uln | grep -q ":${HY2_PORT}\b" && (( _wait < 10 )); do
+        sleep 1
+        (( _wait++ ))
+    done
+
+    if ! systemctl start hysteria-server.service; then
+        log_error "Hysteria2 启动命令失败"
+        journalctl -u hysteria-server.service --no-pager -n 20
     else
-        log_info "Hysteria2 服务已启动"
+        sleep 2
+        if systemctl is-active --quiet hysteria-server.service; then
+            log_info "Hysteria2 服务已启动"
+        else
+            log_warn "Hysteria2 服务未能正常启动，请检查："
+            log_warn "  journalctl -u hysteria-server.service --no-pager -n 20"
+        fi
     fi
 
     # ── 16. 客户端信息 ────────────────────────────────────────
