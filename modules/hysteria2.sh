@@ -186,20 +186,29 @@ configure_hysteria2() {
         log_info "QUIC 窗口: 由 Hysteria2 自行管理"
     fi
 
-    # ── 7. 混淆（salamander）（参考 hy2.sh: 1465-1478）─────────
-    local obfs_status obfs_pass
+    # ── 7. 混淆（salamander / gecko）（参考 hy2.sh: 1465-1481）─
+    local obfs_status obfs_type obfs_pass
     echo ""
-    echo "是否使用 salamander 流量混淆?"
-    echo "  1. 不使用 (默认，性能更好)"
-    echo "  2. 使用 (抗封锁更强，增加 CPU 负载)"
-    read -rp "输入序号 [1-2，默认 1]: " obfs_num
+    echo "是否使用流量混淆?"
+    echo "  1. 不使用 (默认，性能最好)"
+    echo "  2. salamander - 将数据包混淆为无特征随机字节"
+    echo "  3. gecko (实验性) - 在 salamander 基础上额外拆分 QUIC 握手包为随机分片，抗 DPI 检测更强"
+    read -rp "输入序号 [1-3，默认 1]: " obfs_num
     if [[ "${obfs_num}" == "2" ]]; then
         obfs_status="true"
+        obfs_type="salamander"
         obfs_pass="${HY2_PASS}"
         log_info "混淆: salamander (密码=认证口令)"
         save_state "HYSTERIA2_OBFS" "salamander"
+    elif [[ "${obfs_num}" == "3" ]]; then
+        obfs_status="true"
+        obfs_type="gecko"
+        obfs_pass="${HY2_PASS}"
+        log_info "混淆: gecko (实验性，密码=认证口令)"
+        save_state "HYSTERIA2_OBFS" "gecko"
     else
         obfs_status="false"
+        obfs_type=""
         log_info "混淆: 不使用"
         save_state "HYSTERIA2_OBFS" ""
     fi
@@ -382,12 +391,12 @@ EOF
         fi
     fi
 
-    # obfs（参考 hy2.sh: 1602-1607）
+    # obfs（参考 hy2.sh: 1608-1612）
     if [[ "${obfs_status}" == "true" ]]; then
         cat >> "$yaml" << EOF
 obfs:
-  type: salamander
-  salamander:
+  type: ${obfs_type}
+  ${obfs_type}:
     password: ${obfs_pass}
 EOF
     fi
@@ -608,13 +617,13 @@ HOOK
     log_info "TLS SNI：  ${HY2_DOMAIN}"
     log_info "跳过证书验证：否"
     [[ "${congestion_mode}" == "brutal" ]] && log_info "模式：     Brutal (上行 ${upload}mbps / 下行 ${download}mbps)"
-    [[ "${obfs_status}" == "true" ]] && log_info "混淆：     salamander"
+    [[ "${obfs_status}" == "true" ]] && log_info "混淆：     ${obfs_type}"
     [[ "${portHoppingStatus}" == "true" ]] && log_info "端口跳跃： ${portHoppingStart}-${portHoppingEnd}"
 
     # 生成链接
     local hy2_url_extra="sni=${HY2_DOMAIN}&insecure=0"
     [[ "${portHoppingStatus}" == "true" ]] && hy2_url_extra+="&mport=${portHoppingStart}-${portHoppingEnd}"
-    [[ "${obfs_status}" == "true" ]] && hy2_url_extra+="&obfs=salamander"
+    [[ "${obfs_status}" == "true" ]] && hy2_url_extra+="&obfs=${obfs_type}"
     [[ "${congestion_mode}" == "brutal" && -n "${upload:-}" ]] && hy2_url_extra+="&up=${upload}"
     [[ "${congestion_mode}" == "brutal" && -n "${download:-}" ]] && hy2_url_extra+="&down=${download}"
 

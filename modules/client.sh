@@ -256,7 +256,7 @@ print(urllib.parse.quote('${HYSTERIA2_PASSWORD}', safe=''))
 
     local extra_params="sni=${HYSTERIA2_DOMAIN}&insecure=0"
     [[ -n "${HYSTERIA2_PH_START:-}" && -n "${HYSTERIA2_PH_END:-}" ]] && extra_params+="&mport=${HYSTERIA2_PH_START}-${HYSTERIA2_PH_END}"
-    [[ -n "${HYSTERIA2_OBFS:-}" ]] && extra_params+="&obfs=${HYSTERIA2_OBFS}"
+    [[ -n "${HYSTERIA2_OBFS:-}" ]] && extra_params+="&obfs=${HYSTERIA2_OBFS}&obfs-password=${password_encoded}"
     if [[ "${HYSTERIA2_CONGESTION}" == "brutal" ]]; then
         [[ -n "${HYSTERIA2_UPLOAD:-}" ]] && extra_params+="&up=${HYSTERIA2_UPLOAD}"
         [[ -n "${HYSTERIA2_DOWNLOAD:-}" ]] && extra_params+="&down=${HYSTERIA2_DOWNLOAD}"
