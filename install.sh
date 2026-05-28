@@ -627,6 +627,10 @@ load_os_info() {
                 PKG_UPDATE="dnf makecache -y"
                 PKG_INSTALL="dnf install -y"
                 ;;
+            *)
+                log_error "不支持的系统: $OS_ID"
+                return 1
+                ;;
         esac
         return
     fi
@@ -1502,6 +1506,8 @@ start_upgrade_job() {
 
     cat > "$runner" << RUNNER
 #!/usr/bin/env bash
+# 此 set -euo pipefail 属于独立的后台 runner 子脚本（写入 \$runner），
+# 与本文件顶部第 2 行的 set -euo pipefail 是两个进程，互不影响。
 set -euo pipefail
 exec >>"$log_file" 2>&1
 finish() {

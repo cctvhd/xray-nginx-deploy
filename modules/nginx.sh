@@ -871,7 +871,8 @@ CONF
 generate_servers_conf() {
     log_step "生成 servers.conf..."
 
-    > /etc/nginx/conf.d/servers.conf
+    # 有意清空配置文件，后续以 >> 追加方式逐段写入
+    : > /etc/nginx/conf.d/servers.conf
 
     get_root_domain() {
         echo "$1" | awk -F. '{print $(NF-1)"."$NF}'

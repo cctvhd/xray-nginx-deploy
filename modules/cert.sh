@@ -969,7 +969,15 @@ domain_to_ini_name() {
 # ── 扫描所有 CF 账号文件 ─────────────────────────────────────
 # 兼容新旧两种格式：<root>.ini（新）+ cf_account_N.ini（旧）
 _scan_cf_account_files() {
-    ls "${CF_CONFIG_DIR}"/*.ini 2>/dev/null | grep -v 'domain_\|domain_map\|cert_request'
+    local f base
+    for f in "${CF_CONFIG_DIR}"/*.ini; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f")
+        case "$base" in
+            domain_*|domain_map*|cert_request*) ;;
+            *) echo "$f" ;;
+        esac
+    done
 }
 
 # ── 判断旧格式账号是否有对应的新格式文件（Token 相同则视为重复）──
