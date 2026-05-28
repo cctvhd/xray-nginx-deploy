@@ -746,8 +746,14 @@ upgrade_kernel() {
     grub2-set-default 0 2>/dev/null || true
 
     # 兼容 UEFI 和 BIOS 两种 grub 路径
-    local efi_dir
-    efi_dir=$(ls /boot/efi/EFI/ 2>/dev/null | grep -v '^BOOT$' | head -1)
+    local efi_dir="" d base
+    for d in /boot/efi/EFI/*/; do
+        [[ -d "$d" ]] || continue
+        base=$(basename "$d")
+        [[ "$base" == "BOOT" ]] && continue
+        efi_dir="$base"
+        break
+    done
     if [[ -n "$efi_dir" && -f "/boot/efi/EFI/${efi_dir}/grub.cfg" ]]; then
         grub2-mkconfig -o "/boot/efi/EFI/${efi_dir}/grub.cfg" >/dev/null 2>&1 || true
         log_info "UEFI grub 配置已更新 (/boot/efi/EFI/${efi_dir}/grub.cfg)"

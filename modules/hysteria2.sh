@@ -344,7 +344,8 @@ configure_hysteria2() {
     mkdir -p /etc/hysteria
 
     local yaml="/etc/hysteria/config.yaml"
-    > "$yaml"
+    # 有意清空配置文件，后续以 >> 追加方式逐段写入
+    : > "$yaml"
 
     # listen（参考 hy2.sh: 1574-1580）
     if [[ "${portHoppingStatus}" == "true" ]]; then

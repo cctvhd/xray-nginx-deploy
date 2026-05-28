@@ -89,12 +89,12 @@ generate_wgcf_profile() {
 
     mkdir -p "${WGCF_DIR}"
     chmod 700 "${WGCF_DIR}"
-    pushd "${WGCF_DIR}" >/dev/null
+    pushd "${WGCF_DIR}" >/dev/null || { log_error "无法进入 ${WGCF_DIR}"; return 1; }
 
     wgcf register --accept-tos
     wgcf generate
 
-    popd >/dev/null
+    popd >/dev/null || return 1
 
     chmod 600 "${WGCF_DIR}/wgcf-account.toml" 2>/dev/null || true
     chmod 600 "${WGCF_PROFILE}"               2>/dev/null || true
