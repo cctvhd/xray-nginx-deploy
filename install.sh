@@ -422,6 +422,7 @@ OS_ID=''
 OS_NAME=''
 PKG_MANAGER=''
 BBR_VERSION=''
+KERNEL_UPGRADED='0'
 
 HW_CPU_CORES=''
 HW_MEM_GB=''
@@ -465,6 +466,7 @@ WGCF_ENDPOINT=''
 WGCF_ENDPOINT_HOST=''
 WGCF_ENDPOINT_PORT=''
 
+INST_KERNEL='0'
 INST_SYSTEM='0'
 INST_UNBOUND='0'
 INST_NGINX='0'
@@ -489,6 +491,7 @@ ENV
     OS_ID=$(get_state "OS_ID")
     OS_NAME=$(get_state "OS_NAME")
     PKG_MANAGER=$(get_state "PKG_MANAGER")
+    KERNEL_UPGRADED=$(get_state "KERNEL_UPGRADED")
     HW_CPU_CORES=$(get_state "HW_CPU_CORES")
     HW_MEM_GB=$(get_state "HW_MEM_GB")
     HW_BANDWIDTH=$(get_state "HW_BANDWIDTH")
@@ -580,10 +583,14 @@ restore_domain_arrays() {
 
 
 show_status() {
-    local s_system s_unbound s_nginx s_cert s_xray s_singbox s_hysteria2 s_naive s_warp
+    local s_kernel s_system s_unbound s_nginx s_cert s_xray s_singbox s_hysteria2 s_naive s_warp
     local c_nginx c_xray c_singbox c_hysteria2 c_naive c_warp
     restore_domain_arrays 2>/dev/null || true
     local cf_ini_for_domain=""
+
+    { [[ "$(get_step INST_KERNEL)"  == "1" ]] || \
+      rpm -q kernel-ml >/dev/null 2>&1; } \
+      && s_kernel="OK"  || s_kernel="--"
 
     { [[ "$(get_step INST_SYSTEM)"  == "1" ]] || \
       sysctl net.ipv4.tcp_congestion_control 2>/dev/null | grep -q 'bbr'; } \
@@ -654,6 +661,7 @@ show_status() {
     echo ""
     echo -e "${BLUE}================ 当前状态 ================${NC}"
     echo "  [安装]"
+    printf "    %-20s %s\n" "Kernel"   "${s_kernel}"
     printf "    %-20s %s\n" "System"   "${s_system}"
     printf "    %-20s %s\n" "Unbound"  "${s_unbound}"
     printf "    %-20s %s\n" "Nginx"    "${s_nginx}"
@@ -746,21 +754,7 @@ done_return() {
     read -rp "按回车返回主菜单..." _
 }
 
-do_inst_system() {
-    load_module system
-    detect_os
-    detect_kernel
-    upgrade_kernel
-    collect_hardware_info
-    load_kernel_modules
-    install_base_tools
-    optimize_hardware_interrupts
-    optimize_sysctl
-    tune_system_limits
-    sync_time
-    setup_selinux_policy
-    print_optimization_summary
-
+save_system_optimization_state() {
     local mem_mb
     mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
     HW_MEM_GB=${HW_MEM_GB:-$(awk -v m="$mem_mb" 'BEGIN{printf "%.1f", m/1024}')}
@@ -781,6 +775,20 @@ do_inst_system() {
     save_state "HW_DISK_TYPE"  "${HW_DISK_TYPE}"
     save_state "XRAY_PADDING"  "${XRAY_PADDING:-128-2048}"
     save_state "INST_SYSTEM"   "1"
+}
+
+do_upgrade_kernel() {
+    load_module system
+    run_kernel_upgrade
+    save_state "INST_KERNEL" "1"
+
+    done_return
+}
+
+do_optimize_system() {
+    load_module system
+    run_system_optimize
+    save_system_optimization_state
 
     done_return
 }
@@ -792,7 +800,7 @@ do_inst_unbound() {
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
 
     if [[ -z "$(get_state "ALL_DOMAINS")" ]]; then
-        log_info "提示：尚未申请证书，域名解析配置将在步骤 4 完成后自动更新"
+        log_info "提示：尚未申请证书，域名解析配置将在步骤 5 完成后自动更新"
     fi
 
     run_unbound
@@ -876,7 +884,7 @@ do_inst_xray() {
     install_xray
     save_state "INST_XRAY" "1"
 
-    log_info "Xray 安装完成，请继续执行步骤 10"
+    log_info "Xray 安装完成，请继续执行步骤 11"
     done_return
 }
 
@@ -900,7 +908,7 @@ do_inst_singbox() {
     install_singbox
     save_state "INST_SINGBOX" "1"
 
-    log_info "Sing-Box 安装完成，请继续执行步骤 11"
+    log_info "Sing-Box 安装完成，请继续执行步骤 12"
     done_return
 }
 
@@ -954,7 +962,7 @@ do_inst_naive() {
 
 do_conf_nginx() {
     if [[ "$(get_step INST_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
-        log_warn "请先完成步骤 3（安装 Nginx）"
+        log_warn "请先完成步骤 4（安装 Nginx）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
@@ -967,7 +975,7 @@ do_conf_nginx() {
     find /etc/letsencrypt/live -name 'fullchain.pem' -quit 2>/dev/null | grep -q . && cert_ready=true
 
     if ! $cert_ready; then
-        log_warn "未检测到有效 SSL 证书，请先完成步骤 4（申请 SSL 证书）"
+        log_warn "未检测到有效 SSL 证书，请先完成步骤 5（申请 SSL 证书）"
         done_return
         return
     fi
@@ -1013,7 +1021,7 @@ refresh_nginx_after_xray() {
 
 do_conf_xray() {
     if [[ "$(get_step INST_XRAY)" != "1" ]] && ! command -v xray &>/dev/null; then
-        log_warn "请先完成步骤 5（安装 Xray）"
+        log_warn "请先完成步骤 6（安装 Xray）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
@@ -1022,7 +1030,7 @@ do_conf_xray() {
     fi
 
     if [[ "$(get_step CONF_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
-        log_warn "建议先完成步骤 9（配置 Nginx）"
+        log_warn "建议先完成步骤 10（配置 Nginx）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
@@ -1066,7 +1074,7 @@ do_conf_xray() {
 
 do_conf_singbox() {
     if [[ "$(get_step INST_SINGBOX)" != "1" ]] && ! command -v sing-box &>/dev/null; then
-        log_warn "请先完成步骤 6（安装 Sing-Box）"
+        log_warn "请先完成步骤 7（安装 Sing-Box）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
@@ -1075,13 +1083,13 @@ do_conf_singbox() {
     fi
 
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
-        log_warn "建议先完成步骤 4（申请 SSL 证书）"
+        log_warn "建议先完成步骤 5（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
 
     if [[ "$(get_step CONF_NGINX)" != "1" ]]; then
-        log_info "提示：Nginx 尚未配置（步骤 9），443 SNI 分流暂不可用；"
+        log_info "提示：Nginx 尚未配置（步骤 10），443 SNI 分流暂不可用；"
         log_info "      Sing-Box 本身可正常启动，待 Nginx 配置完成后流量即自动接通。"
     fi
 
@@ -1110,7 +1118,7 @@ do_conf_singbox() {
 
 do_conf_hysteria2() {
     if [[ "$(get_step INST_HYSTERIA2)" != "1" ]] && ! command -v hysteria &>/dev/null; then
-        log_warn "请先完成步骤 7（安装 Hysteria2）"
+        log_warn "请先完成步骤 8（安装 Hysteria2）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
@@ -1119,7 +1127,7 @@ do_conf_hysteria2() {
     fi
 
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
-        log_warn "建议先完成步骤 4（申请 SSL 证书）"
+        log_warn "建议先完成步骤 5（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
@@ -1150,7 +1158,7 @@ do_reconf_hysteria2() {
 
 do_conf_naive() {
     if [[ "$(get_step INST_NAIVE)" != "1" ]] && ! command -v caddy-naive &>/dev/null; then
-        log_warn "请先完成步骤 8（安装 NaiveProxy）"
+        log_warn "请先完成步骤 9（安装 NaiveProxy）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
@@ -1159,7 +1167,7 @@ do_conf_naive() {
     fi
 
     if [[ "$(get_step INST_CERT)" != "1" ]]; then
-        log_warn "建议先完成步骤 4（申请 SSL 证书）"
+        log_warn "建议先完成步骤 5（申请 SSL 证书）"
         read -rp "是否继续？[y/N]: " c
         [[ "${c,,}" != "y" ]] && return
     fi
@@ -1271,38 +1279,10 @@ run_full_install_flow() {
     echo ""
 
     load_module system
-    detect_os
-    detect_kernel
-    upgrade_kernel
-    collect_hardware_info
-    load_kernel_modules
-    install_base_tools
-    optimize_hardware_interrupts
-    optimize_sysctl
-    tune_system_limits
-    sync_time
-    setup_selinux_policy
-    print_optimization_summary
-
-    local mem_mb
-    mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
-    HW_MEM_GB=${HW_MEM_GB:-$(awk -v m="$mem_mb" 'BEGIN{printf "%.1f", m/1024}')}
-    HW_BANDWIDTH=${HW_BANDWIDTH:-unknown}
-    HW_DUAL_STACK=${HW_DUAL_STACK:-unknown}
-    HW_DISK_TYPE=${HW_DISK_TYPE:-unknown}
-    BBR_VERSION=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo "bbr")
-
-    save_state "OS_ID"         "$OS_ID"
-    save_state "OS_NAME"       "$OS_NAME"
-    save_state "PKG_MANAGER"   "$PKG_MANAGER"
-    save_state "BBR_VERSION"   "${BBR_VERSION}"
-    save_state "HW_CPU_CORES"  "${HW_CPU_CORES:-$(nproc)}"
-    save_state "HW_MEM_GB"     "${HW_MEM_GB}"
-    save_state "HW_BANDWIDTH"  "${HW_BANDWIDTH}"
-    save_state "HW_DUAL_STACK" "${HW_DUAL_STACK}"
-    save_state "HW_DISK_TYPE"  "${HW_DISK_TYPE}"
-    save_state "XRAY_PADDING"  "${XRAY_PADDING:-128-2048}"
-    save_state "INST_SYSTEM"   "1"
+    run_kernel_upgrade
+    save_state "INST_KERNEL" "1"
+    run_system_optimize
+    save_system_optimization_state
 
     load_module unbound
     restore_domain_arrays
@@ -1629,21 +1609,22 @@ main_menu_loop() {
         show_status
 
         echo "  === 安装 ==="
-        echo "  1. 系统初始化与优化"
-        echo "  2. 安装并配置 Unbound"
-        echo "  3. 安装 Nginx"
-        echo "  4. 申请 SSL 证书"
-        echo "  5. 安装 Xray"
-        echo "  6. 安装 Sing-Box"
-        echo "  7. 安装 Hysteria2"
-        echo "  8. 安装 NaiveProxy"
+        echo "  1. 升级内核"
+        echo "  2. 优化系统"
+        echo "  3. 安装并配置 Unbound"
+        echo "  4. 安装 Nginx"
+        echo "  5. 申请 SSL 证书"
+        echo "  6. 安装 Xray"
+        echo "  7. 安装 Sing-Box"
+        echo "  8. 安装 Hysteria2"
+        echo "  9. 安装 NaiveProxy"
         echo ""
         echo "  === 配置 ==="
-        echo "  9. 配置 Nginx"
-        echo "  10. 配置 Xray"
-        echo "  11. 配置 Sing-Box"
-        echo "  12. 配置 Hysteria2"
-        echo "  13. 配置 NaiveProxy"
+        echo "  10. 配置 Nginx"
+        echo "  11. 配置 Xray"
+        echo "  12. 配置 Sing-Box"
+        echo "  13. 配置 Hysteria2"
+        echo "  14. 配置 NaiveProxy"
         echo " n. 重新配置 Nginx（先清理再生成）"
         echo " x. 重新配置 Xray（先清理再生成）"
         echo " g. 重新配置 Sing-Box（先清理再生成）"
@@ -1654,11 +1635,11 @@ main_menu_loop() {
         echo "  a. 生成客户端链接"
         echo "  b. 查看当前状态"
         echo "  s. 同步/更新模块到本地缓存"
-        echo "  w. 配置 WARP WireGuard 凭证（步骤 10/11 的前置依赖）"
+        echo "  w. 配置 WARP WireGuard 凭证（步骤 11/12 的前置依赖）"
         echo "  u. 卸载 / 清理模块"
         echo "  p. SELinux 管理"
-        echo "  r. 全部重装（先清理再执行 1-9）"
-        echo "  0. 全流程一键安装（步骤 1-9）"
+        echo "  r. 全部重装（先清理再执行全流程）"
+        echo "  0. 全流程一键安装（含内核升级与系统优化）"
         echo "  q. 退出"
         echo ""
         echo -e "  再次运行: ${CYAN}bash <(curl -fsSL ${BASE_URL}/install.sh)${NC}"
@@ -1667,19 +1648,20 @@ main_menu_loop() {
         echo ""
 
         case "$choice" in
-            1) do_inst_system ;;
-            2) do_inst_unbound ;;
-            3) do_inst_nginx ;;
-            4) do_inst_cert ;;
-            5) do_inst_xray ;;
-            6) do_inst_singbox ;;
-            7) do_inst_hysteria2 ;;
-            8) do_inst_naive ;;
-            9) do_conf_nginx ;;
-           10) do_conf_xray ;;
-           11) do_conf_singbox ;;
-           12) do_conf_hysteria2 ;;
-           13) do_conf_naive ;;
+            1) do_upgrade_kernel ;;
+            2) do_optimize_system ;;
+            3) do_inst_unbound ;;
+            4) do_inst_nginx ;;
+            5) do_inst_cert ;;
+            6) do_inst_xray ;;
+            7) do_inst_singbox ;;
+            8) do_inst_hysteria2 ;;
+            9) do_inst_naive ;;
+           10) do_conf_nginx ;;
+           11) do_conf_xray ;;
+           12) do_conf_singbox ;;
+           13) do_conf_hysteria2 ;;
+           14) do_conf_naive ;;
           n|N) do_reconf_nginx ;;
           x|X) do_reconf_xray ;;
           g|G) do_reconf_singbox ;;
