@@ -28,7 +28,7 @@ STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-ALL_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync uninstall)
+ALL_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync uninstall upgrade)
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
