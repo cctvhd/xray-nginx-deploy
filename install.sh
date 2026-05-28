@@ -60,6 +60,16 @@ acquire_lock() {
     fi
 }
 
+acquire_upgrade_lock() {
+    local lock_file="${STATE_DIR}/upgrade.lock"
+    mkdir -p "$STATE_DIR" 2>/dev/null || lock_file="/tmp/xray-nginx-deploy-upgrade.lock"
+    exec {UPGRADE_LOCK_FD}>"$lock_file"
+    if ! flock -n "$UPGRADE_LOCK_FD" 2>/dev/null; then
+        log_error "另一个组件升级任务正在运行"
+        exit 1
+    fi
+}
+
 get_state() {
     local key="$1"
     local default="${2:-}"
@@ -1225,6 +1235,232 @@ do_warp() {
     done_return
 }
 
+upgrade_component_method() {
+    case "$1" in
+        nginx|singbox) echo "系统仓库安装" ;;
+        xray|hysteria2) echo "脚本安装" ;;
+        naive) echo "编译安装" ;;
+        *) echo "未知" ;;
+    esac
+}
+
+upgrade_component_label() {
+    case "$1" in
+        nginx) echo "Nginx" ;;
+        xray) echo "Xray" ;;
+        singbox) echo "Sing-Box" ;;
+        hysteria2) echo "Hysteria2" ;;
+        naive) echo "NaiveProxy" ;;
+        all) echo "全部组件" ;;
+        *) echo "$1" ;;
+    esac
+}
+
+upgrade_command_version() {
+    case "$1" in
+        nginx) nginx -v 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
+        xray) xray version 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
+        singbox) sing-box version 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
+        hysteria2) hysteria version 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
+        naive) caddy-naive version 2>&1 | head -1 || true ;;
+    esac
+}
+
+restart_service_if_configured() {
+    local service="$1"
+    local test_cmd="${2:-}"
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if [[ -n "$test_cmd" ]] && ! bash -c "$test_cmd"; then
+        log_warn "${service} 配置检查未通过，跳过重启"
+        return 0
+    fi
+
+    if systemctl list-unit-files 2>/dev/null | grep -q "^${service}"; then
+        systemctl restart "$service" || {
+            log_warn "${service} 重启失败，请查看: journalctl -u ${service} --no-pager -n 50"
+            return 0
+        }
+        log_info "${service} 已重启"
+    else
+        log_warn "未找到 ${service} systemd 单元，跳过重启"
+    fi
+}
+
+upgrade_repo_component() {
+    local component="$1"
+
+    load_os_info
+    case "$component" in
+        nginx)
+            load_module nginx
+            install_nginx
+            restart_service_if_configured "nginx.service" "nginx -t >/dev/null 2>&1"
+            save_state "INST_NGINX" "1"
+            ;;
+        singbox)
+            load_module singbox
+            install_singbox
+            restart_service_if_configured "sing-box.service" \
+                '[[ ! -f /etc/sing-box/config.json ]] || sing-box check -c /etc/sing-box/config.json >/dev/null 2>&1'
+            save_state "INST_SINGBOX" "1"
+            ;;
+    esac
+}
+
+upgrade_script_component() {
+    local component="$1"
+
+    load_os_info
+    case "$component" in
+        xray)
+            load_module xray
+            install_xray
+            configure_xray_service_limits
+            restart_service_if_configured "xray.service" \
+                '[[ ! -f /usr/local/etc/xray/config.json ]] || xray run -test -config /usr/local/etc/xray/config.json >/dev/null 2>&1'
+            save_state "INST_XRAY" "1"
+            ;;
+        hysteria2)
+            load_module hysteria2
+            install_hysteria2
+            restart_service_if_configured "hysteria-server.service"
+            save_state "INST_HYSTERIA2" "1"
+            ;;
+    esac
+}
+
+upgrade_compiled_component() {
+    local component="$1"
+
+    load_os_info
+    case "$component" in
+        naive)
+            load_module naive
+            install_naive
+            restart_service_if_configured "caddy-naive.service" \
+                '[[ ! -f /etc/caddy-naive/Caddyfile ]] || /usr/local/bin/caddy-naive validate --config /etc/caddy-naive/Caddyfile >/dev/null 2>&1'
+            save_state "INST_NAIVE" "1"
+            ;;
+    esac
+}
+
+run_upgrade_component() {
+    local component="$1"
+    local label method before after
+
+    case "$component" in
+        nginx|xray|singbox|hysteria2|naive|all) ;;
+        *)
+            log_error "不支持的升级组件: ${component:-<空>}"
+            exit 1
+            ;;
+    esac
+
+    if [[ "$component" == "all" ]]; then
+        for component in nginx xray singbox hysteria2 naive; do
+            run_upgrade_component "$component"
+        done
+        return 0
+    fi
+
+    label=$(upgrade_component_label "$component")
+    method=$(upgrade_component_method "$component")
+    before=$(upgrade_command_version "$component")
+
+    log_step "升级 ${label}（${method}）..."
+    [[ -n "$before" ]] && log_info "当前版本: ${before}"
+
+    case "$component" in
+        nginx|singbox) upgrade_repo_component "$component" ;;
+        xray|hysteria2) upgrade_script_component "$component" ;;
+        naive) upgrade_compiled_component "$component" ;;
+    esac
+
+    after=$(upgrade_command_version "$component")
+    [[ -n "$after" ]] && log_info "升级后版本: ${after}"
+    log_info "${label} 升级任务完成"
+}
+
+start_upgrade_job() {
+    local component="$1"
+    local label session log_file runner script_path runner_script
+
+    label=$(upgrade_component_label "$component")
+    session="xray-upgrade-${component}"
+    log_file="/var/log/xray-deploy/upgrade-${component}-$(date +%Y%m%d%H%M%S).log"
+    runner="/tmp/xray-deploy-upgrade-${component}-$$.sh"
+    script_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
+
+    mkdir -p /var/log/xray-deploy
+
+    if [[ -n "$script_path" && -f "$script_path" ]]; then
+        runner_script="bash '$script_path' --upgrade-component '$component'"
+    else
+        runner_script="bash <(curl -fsSL '${BASE_URL}/install.sh') --upgrade-component '$component'"
+    fi
+
+    cat > "$runner" << RUNNER
+#!/usr/bin/env bash
+set -euo pipefail
+exec >>"$log_file" 2>&1
+echo "[INFO] 升级任务启动: $label"
+echo "[INFO] 日志文件: $log_file"
+$runner_script
+echo "[INFO] 升级任务结束: $label"
+rm -f "$runner"
+RUNNER
+    chmod 700 "$runner"
+
+    if command -v screen >/dev/null 2>&1; then
+        screen -dmS "$session" bash "$runner"
+        log_info "已通过 screen 后台启动 ${label} 升级"
+        log_info "查看会话: screen -r ${session}"
+    else
+        nohup bash "$runner" >/dev/null 2>&1 &
+        log_info "未检测到 screen，已通过 nohup 后台启动 ${label} 升级"
+    fi
+    log_info "升级日志: ${log_file}"
+}
+
+do_upgrade_menu() {
+    clear
+    echo ""
+    echo -e "${BLUE}================ 升级组件 ================${NC}"
+    echo "  1. Nginx       ($(upgrade_component_method nginx))"
+    echo "  2. Xray        ($(upgrade_component_method xray))"
+    echo "  3. Sing-Box    ($(upgrade_component_method singbox))"
+    echo "  4. Hysteria2   ($(upgrade_component_method hysteria2))"
+    echo "  5. NaiveProxy  ($(upgrade_component_method naive))"
+    echo "  6. 全部升级"
+    echo "  q. 返回主菜单"
+    echo ""
+    echo "  升级会在 screen 或 nohup 后台运行，SSH 断开不影响任务。"
+    echo ""
+
+    local upgrade_choice component
+    read -rp "  请选择: " upgrade_choice
+    echo ""
+
+    case "$upgrade_choice" in
+        1) component="nginx" ;;
+        2) component="xray" ;;
+        3) component="singbox" ;;
+        4) component="hysteria2" ;;
+        5) component="naive" ;;
+        6) component="all" ;;
+        q|Q) return ;;
+        *)
+            log_error "无效选择"
+            sleep 1
+            return
+            ;;
+    esac
+
+    start_upgrade_job "$component"
+    done_return
+}
+
 do_uninstall_menu() {
     clear
     echo ""
@@ -1635,6 +1871,7 @@ main_menu_loop() {
         echo "  a. 生成客户端链接"
         echo "  b. 查看当前状态"
         echo "  s. 同步/更新模块到本地缓存"
+        echo "  v. 升级组件（后台运行）"
         echo "  w. 配置 WARP WireGuard 凭证（步骤 11/12 的前置依赖）"
         echo "  u. 卸载 / 清理模块"
         echo "  p. SELinux 管理"
@@ -1673,6 +1910,7 @@ main_menu_loop() {
                 read -rp "按回车返回主菜单..." _
                 ;;
             s|S) do_sync_modules ;;
+            v|V) do_upgrade_menu ;;
             w|W) do_warp ;;
             u|U) do_uninstall_menu ;;
             p|P) do_selinux_mgmt ;;
@@ -1686,6 +1924,14 @@ main_menu_loop() {
         esac
     done
 }
+
+if [[ "${1:-}" == "--upgrade-component" ]]; then
+    check_root
+    acquire_upgrade_lock
+    init_state
+    run_upgrade_component "${2:-}"
+    exit 0
+fi
 
 check_root
 acquire_lock
