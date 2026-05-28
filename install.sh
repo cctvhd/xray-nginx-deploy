@@ -1433,11 +1433,12 @@ run_upgrade_component() {
 
 start_upgrade_job() {
     local component="$1"
-    local label session log_file runner script_path runner_script
+    local label session log_file status_file runner script_path runner_script
 
     label=$(upgrade_component_label "$component")
     session="xray-upgrade-${component}"
     log_file="/var/log/xray-deploy/upgrade-${component}-$(date +%Y%m%d%H%M%S).log"
+    status_file="/var/log/xray-deploy/upgrade-${component}.status"
     runner="/tmp/xray-deploy-upgrade-${component}-$$.sh"
     script_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
@@ -1453,11 +1454,23 @@ start_upgrade_job() {
 #!/usr/bin/env bash
 set -euo pipefail
 exec >>"$log_file" 2>&1
+finish() {
+    local code="\$?"
+    if [[ "\$code" -eq 0 ]]; then
+        echo "SUCCESS $label \$(date '+%F %T') log=$log_file" > "$status_file"
+        echo "[INFO] 升级任务成功: $label"
+    else
+        echo "FAILED $label \$(date '+%F %T') code=\$code log=$log_file" > "$status_file"
+        echo "[ERROR] 升级任务失败: $label (exit=\$code)"
+    fi
+    rm -f "$runner"
+}
+trap finish EXIT
 echo "[INFO] 升级任务启动: $label"
 echo "[INFO] 日志文件: $log_file"
+echo "RUNNING $label \$(date '+%F %T') log=$log_file" > "$status_file"
 $runner_script
 echo "[INFO] 升级任务结束: $label"
-rm -f "$runner"
 RUNNER
     chmod 700 "$runner"
 
@@ -1470,6 +1483,33 @@ RUNNER
         log_info "未检测到 screen，已通过 nohup 后台启动 ${label} 升级"
     fi
     log_info "升级日志: ${log_file}"
+    log_info "状态文件: ${status_file}"
+}
+
+show_upgrade_status() {
+    local status_dir="/var/log/xray-deploy"
+    local status_file latest_log
+
+    echo ""
+    echo -e "${BLUE}================ 最近升级状态 ================${NC}"
+
+    if compgen -G "${status_dir}/upgrade-*.status" >/dev/null; then
+        for status_file in "${status_dir}"/upgrade-*.status; do
+            [[ -f "$status_file" ]] || continue
+            echo "  $(basename "$status_file" .status): $(cat "$status_file")"
+        done
+    else
+        echo "  暂无升级状态文件"
+    fi
+
+    latest_log=$(ls -t "${status_dir}"/upgrade-*.log 2>/dev/null | head -1 || true)
+    if [[ -n "$latest_log" ]]; then
+        echo ""
+        echo "  最新日志: ${latest_log}"
+        echo "  查看命令: tail -n 80 ${latest_log}"
+        echo ""
+        tail -n 30 "$latest_log" 2>/dev/null || true
+    fi
 }
 
 do_upgrade_menu() {
@@ -1482,6 +1522,7 @@ do_upgrade_menu() {
     echo "  4. Hysteria2   ($(upgrade_component_method hysteria2))"
     echo "  5. NaiveProxy  ($(upgrade_component_method naive))"
     echo "  6. 全部升级"
+    echo "  l. 查看最近升级状态/日志"
     echo "  q. 返回主菜单"
     echo ""
     echo "  升级会在 screen 或 nohup 后台运行，SSH 断开不影响任务。"
@@ -1498,6 +1539,11 @@ do_upgrade_menu() {
         4) component="hysteria2" ;;
         5) component="naive" ;;
         6) component="all" ;;
+        l|L)
+            show_upgrade_status
+            done_return
+            return
+            ;;
         q|Q) return ;;
         *)
             log_error "无效选择"
