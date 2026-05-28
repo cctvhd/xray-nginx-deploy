@@ -92,12 +92,19 @@ generate_xray_params() {
 
     local saved_short_ids
     saved_short_ids=$(get_state "REALITY_SHORT_IDS" "")
+    REALITY_SHORT_IDS=()
     if [[ -n "${saved_short_ids}" ]]; then
-        read -ra REALITY_SHORT_IDS <<< "$saved_short_ids"
-        log_info "复用已有 Short IDs (${#REALITY_SHORT_IDS[@]} 个)"
-    else
+        local _raw_ids _sid
+        read -ra _raw_ids <<< "$saved_short_ids"
+        for _sid in "${_raw_ids[@]}"; do
+            [[ -n "$_sid" ]] && REALITY_SHORT_IDS+=("$_sid")
+        done
+        if (( ${#REALITY_SHORT_IDS[@]} > 0 )); then
+            log_info "复用已有 Short IDs (${#REALITY_SHORT_IDS[@]} 个)"
+        fi
+    fi
+    if (( ${#REALITY_SHORT_IDS[@]} == 0 )); then
         REALITY_SHORT_IDS=(
-            ""
             "$(openssl rand -hex 4)"
             "$(openssl rand -hex 4)"
             "$(openssl rand -hex 4)"
@@ -292,21 +299,10 @@ generate_xray_config() {
 
     local user_timeout=30000
 
-    # 修复1：serverNames 必须包含自有域名 REALITY_DOMAIN，
-    # 否则 xray 在握手时找不到对应 serverName 会拒绝连接。
-    # REALITY_DOMAIN 放在首位，公共域名跟在后面。
     local sn_json=""
-    local sn_seen=""
-    # 先加自有域名
-    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        sn_json+="\"${REALITY_DOMAIN}\","
-        sn_seen+=" ${REALITY_DOMAIN}"
-    fi
     for sn in "${REALITY_SERVER_NAMES[@]}"; do
         [[ -n "$sn" ]] || continue
-        [[ " ${sn_seen} " == *" ${sn} "* ]] && continue
         sn_json+="\"${sn}\","
-        sn_seen+=" ${sn}"
     done
     sn_json="${sn_json%,}"
 
