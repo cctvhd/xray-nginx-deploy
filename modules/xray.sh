@@ -374,6 +374,12 @@ generate_xray_config() {
         "rules": [
             {
                 "type":        "field",
+                "ip":          ["127.0.0.1"],
+                "port":        53,
+                "outboundTag": "direct"
+            },
+            {
+                "type":        "field",
                 "ip":          ["geoip:private"],
                 "outboundTag": "block"
             },
