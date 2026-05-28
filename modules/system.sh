@@ -32,19 +32,35 @@ fi
 run_system() {
     log_step "========== 系统初始化 =========="
 
-    detect_virt_type
+    run_kernel_upgrade           # 升级到 ELRepo mainline（仅 RHEL 系）
+    run_system_optimize
+
+    log_info "========== 系统初始化完成 =========="
+}
+
+run_kernel_upgrade() {
+    log_step "========== 升级内核 =========="
+    detect_os
+    detect_kernel
+    upgrade_kernel
+    save_state "INST_KERNEL" "1"
+    log_info "========== 升级内核完成 =========="
+}
+
+run_system_optimize() {
+    log_step "========== 优化系统 =========="
+    detect_os
     collect_hardware_info
-    detect_kernel                # 检测当前内核版本
-    upgrade_kernel               # 升级到 ELRepo mainline（仅 RHEL 系）
     install_base_tools           # 先装工具，后续优化依赖 ethtool/tc
+    load_kernel_modules
     optimize_hardware_interrupts
     optimize_sysctl
     optimize_limits
     sync_time
     setup_selinux_policy
     print_optimization_summary
-
-    log_info "========== 系统初始化完成 =========="
+    save_state "INST_SYSTEM" "1"
+    log_info "========== 优化系统完成 =========="
 }
 
 # ── 硬件信息收集（自动检测 + 用户确认/覆盖）────────────────
@@ -741,6 +757,7 @@ upgrade_kernel() {
     fi
 
     log_warn "内核升级完成，需要重启后生效，重启命令: reboot"
+    KERNEL_UPGRADED=1
     save_state "KERNEL_UPGRADED" "1"
 }
 
