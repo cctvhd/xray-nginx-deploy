@@ -637,7 +637,7 @@ fi
 # ── 向后兼容别名 / 补全函数（install.sh 调用）────────────────
 
 detect_os() {
-    detect_virt_type "$@"
+    detect_virt_type
 
     local os_id os_name
     if [[ -f /etc/os-release ]]; then

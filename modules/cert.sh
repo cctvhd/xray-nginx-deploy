@@ -974,7 +974,7 @@ _scan_cf_account_files() {
         [[ -f "$f" ]] || continue
         base=$(basename "$f")
         case "$base" in
-            domain_*|domain_map*|cert_request*) ;;
+            domain_*|cert_request*) ;;
             *) echo "$f" ;;
         esac
     done
@@ -1210,7 +1210,7 @@ add_domain_and_cert() {
             if [[ -f "$_ini_file" ]]; then
                 # 精确匹配成功
                 _auto_ini="$_ini_file"
-                log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
+                log_info "已自动匹配 CF 账号: $(basename "$_auto_ini")"
             else
                 # 模糊匹配：扫描所有 ini（排除 domain_ 映射文件），找出包含根域的文件
                 for _f in "${CF_CONFIG_DIR}"/*.ini; do
@@ -1221,7 +1221,7 @@ add_domain_and_cert() {
 
                 if [[ ${#_matched_ini[@]} -eq 1 ]]; then
                     _auto_ini="${_matched_ini[0]}"
-                    log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
+                    log_info "已自动匹配 CF 账号: $(basename "$_auto_ini")"
                 else
                     # 匹配不到或有多于一个候选，展示列表让手动选择
                     echo ""

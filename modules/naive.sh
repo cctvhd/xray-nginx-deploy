@@ -133,6 +133,7 @@ install_naive() {
         rm -rf "$tmpdir"
 
         export PATH="/usr/local/go/bin:$PATH"
+        # shellcheck disable=SC2016  # 字面量 $PATH 写入 /etc/profile，由用户 shell 展开
         grep -q '/usr/local/go/bin' /etc/profile 2>/dev/null \
             || echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
         log_info "Go $(go version 2>&1 | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1) 安装完成"
@@ -148,6 +149,7 @@ install_naive() {
             exit 1
         fi
         export PATH="${HOME}/go/bin:$PATH"
+        # shellcheck disable=SC2016  # 字面量 ${HOME}/$PATH 写入 /etc/profile，由用户 shell 展开
         grep -q '/go/bin' /etc/profile 2>/dev/null \
             || echo 'export PATH=${HOME}/go/bin:$PATH' >> /etc/profile
     fi
