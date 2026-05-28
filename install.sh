@@ -813,6 +813,15 @@ done_return() {
     read -rp "按回车返回主菜单..." _
 }
 
+run_menu_action() {
+    local name="$1"
+    shift
+    "$@" || {
+        log_warn "${name} 执行失败或中断，已返回主菜单"
+        sleep 1
+    }
+}
+
 save_system_optimization_state() {
     local mem_mb
     mem_mb=$(awk '/MemTotal/{print int($2/1024)}' /proc/meminfo)
@@ -2089,37 +2098,37 @@ main_menu_loop() {
         echo ""
 
         case "$choice" in
-            1) do_upgrade_kernel ;;
-            2) do_optimize_system ;;
-            3) do_inst_unbound ;;
-            4) do_inst_nginx ;;
-            5) do_inst_cert ;;
-            6) do_inst_xray ;;
-            7) do_inst_singbox ;;
-            8) do_inst_hysteria2 ;;
-            9) do_inst_naive ;;
-           10) do_conf_nginx ;;
-           11) do_conf_xray ;;
-           12) do_conf_singbox ;;
-           13) do_conf_hysteria2 ;;
-           14) do_conf_naive ;;
-          n|N) do_reconf_nginx ;;
-          x|X) do_reconf_xray ;;
-          g|G) do_reconf_singbox ;;
-          h|H) do_reconf_hysteria2 ;;
-          i|I) do_reconf_naive ;;
-            a|A) do_client ;;
+            1) run_menu_action "内核升级"          do_upgrade_kernel ;;
+            2) run_menu_action "系统优化"          do_optimize_system ;;
+            3) run_menu_action "安装 Unbound"      do_inst_unbound ;;
+            4) run_menu_action "安装 Nginx"        do_inst_nginx ;;
+            5) run_menu_action "申请证书"          do_inst_cert ;;
+            6) run_menu_action "安装 Xray"         do_inst_xray ;;
+            7) run_menu_action "安装 Sing-Box"     do_inst_singbox ;;
+            8) run_menu_action "安装 Hysteria2"    do_inst_hysteria2 ;;
+            9) run_menu_action "安装 NaiveProxy"   do_inst_naive ;;
+           10) run_menu_action "配置 Nginx"        do_conf_nginx ;;
+           11) run_menu_action "配置 Xray"         do_conf_xray ;;
+           12) run_menu_action "配置 Sing-Box"     do_conf_singbox ;;
+           13) run_menu_action "配置 Hysteria2"    do_conf_hysteria2 ;;
+           14) run_menu_action "配置 NaiveProxy"   do_conf_naive ;;
+          n|N) run_menu_action "重新配置 Nginx"      do_reconf_nginx ;;
+          x|X) run_menu_action "重新配置 Xray"       do_reconf_xray ;;
+          g|G) run_menu_action "重新配置 Sing-Box"   do_reconf_singbox ;;
+          h|H) run_menu_action "重新配置 Hysteria2"  do_reconf_hysteria2 ;;
+          i|I) run_menu_action "重新配置 NaiveProxy" do_reconf_naive ;;
+            a|A) run_menu_action "生成客户端链接"   do_client ;;
             b|B)
-                show_status
+                run_menu_action "查看状态" show_status
                 read -rp "按回车返回主菜单..." _
                 ;;
-            s|S) do_sync_modules ;;
-            v|V) do_upgrade_menu ;;
-            w|W) do_warp ;;
-            u|U) do_uninstall_menu ;;
-            p|P) do_selinux_mgmt ;;
-            r|R) do_reinstall_all ;;
-            0) run_full_install_flow ;;
+            s|S) run_menu_action "同步模块"        do_sync_modules ;;
+            v|V) run_menu_action "升级组件"        do_upgrade_menu ;;
+            w|W) run_menu_action "配置 WARP"       do_warp ;;
+            u|U) run_menu_action "卸载/清理"       do_uninstall_menu ;;
+            p|P) run_menu_action "SELinux 管理"    do_selinux_mgmt ;;
+            r|R) run_menu_action "全部重装"        do_reinstall_all ;;
+            0) run_menu_action "一键安装"          run_full_install_flow ;;
             q|Q) exit 0 ;;
             *)
                 log_error "无效选择"
