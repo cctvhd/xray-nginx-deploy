@@ -79,7 +79,7 @@ generate_xray_params() {
         XHTTP_PATH="${saved_path}"
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     else
-        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        XHTTP_PATH="/$(tr -d '-' < /proc/sys/kernel/random/uuid)"
         # ── BUG FIX：生成新路径后立即写入 config.env ──────────
         # 原代码只赋值给 shell 变量，install.sh 在步骤8结束后才
         # save_state，如果步骤7（nginx）在步骤8之前执行，nginx

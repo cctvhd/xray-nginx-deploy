@@ -106,7 +106,7 @@ collect_singbox_params() {
     log_step "配置 AnyTLS 参数"
     echo ""
 
-    if ! [[ -n "${ANYTLS_DOMAIN:-}" ]]; then
+    if [[ -z "${ANYTLS_DOMAIN:-}" ]]; then
         log_error "AnyTLS 域名未配置，请先执行步骤 4（SSL 证书）添加域名并分配协议"
         exit 1
     fi

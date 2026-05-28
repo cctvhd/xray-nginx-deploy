@@ -1057,7 +1057,7 @@ do_conf_nginx() {
 
     XHTTP_PATH=$(get_state "XHTTP_PATH")
     if [[ -z "${XHTTP_PATH}" ]]; then
-        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        XHTTP_PATH="/$(tr -d '-' < /proc/sys/kernel/random/uuid)"
         save_state "XHTTP_PATH" "${XHTTP_PATH}"
         log_info "生成 XHTTP_PATH: ${XHTTP_PATH}"
     else
@@ -1774,7 +1774,7 @@ run_full_install_flow() {
     restore_domain_arrays
     XHTTP_PATH=$(get_state "XHTTP_PATH")
     if [[ -z "${XHTTP_PATH}" ]]; then
-        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        XHTTP_PATH="/$(tr -d '-' < /proc/sys/kernel/random/uuid)"
         save_state "XHTTP_PATH" "${XHTTP_PATH}"
         log_info "生成 XHTTP_PATH: ${XHTTP_PATH}"
     else
