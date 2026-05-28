@@ -46,6 +46,10 @@ load_existing_params() {
         XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1 || true)
         XHTTP_EXTRA_JSON=$(python3 -c "
 import json
+# 仅导出客户端有意义的字段：enc / xPaddingBytes / xmux
+# 服务端 extra 中的 scStreamUpServerSecs（上行流时长）与 headers（响应头）
+# 仅服务端使用；新版 Xray-core 客户端默认动态 Chrome UA，无需 headers
+CLIENT_KEYS = ('enc', 'xPaddingBytes', 'xmux')
 with open('${xray_config}') as f:
     c = json.load(f)
 for inb in c.get('inbounds', []):
@@ -53,7 +57,8 @@ for inb in c.get('inbounds', []):
     if xs.get('network') == 'xhttp':
         xhs = xs.get('xhttpSettings', {})
         extra = xhs.get('extra', {})
-        print(json.dumps(extra, indent=2, ensure_ascii=False) if extra else '')
+        client_extra = {k: extra[k] for k in CLIENT_KEYS if k in extra}
+        print(json.dumps(client_extra, indent=2, ensure_ascii=False) if client_extra else '')
         break
 " 2>/dev/null || echo '')
 
