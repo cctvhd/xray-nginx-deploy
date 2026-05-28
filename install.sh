@@ -1311,8 +1311,49 @@ upgrade_command_version() {
         xray) xray version 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
         singbox) sing-box version 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
         hysteria2) hysteria version 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
-        naive) caddy-naive version 2>&1 | head -1 || true ;;
+        naive) caddy-naive version 2>&1 | grep -oP 'v?[0-9]+(\.[0-9]+)+' | head -1 | sed 's/^v//' || true ;;
     esac
+}
+
+upgrade_github_latest() {
+    local repo="$1"
+    curl -fsSL --max-time 5 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name"\s*:\s*"\K[^"]+' \
+        | head -1 \
+        | sed 's/^v//'
+}
+
+upgrade_apt_candidate() {
+    local pkg="$1"
+    timeout 5 apt-cache policy "$pkg" 2>/dev/null \
+        | awk '/Candidate:/ {print $2}' \
+        | grep -oP '[0-9]+(\.[0-9]+)+' \
+        | head -1
+}
+
+upgrade_remote_version() {
+    case "$1" in
+        nginx)     upgrade_apt_candidate nginx ;;
+        singbox)   upgrade_apt_candidate sing-box ;;
+        xray)      upgrade_github_latest XTLS/Xray-core ;;
+        hysteria2) upgrade_github_latest apernet/hysteria ;;
+        naive)     upgrade_github_latest klzgrad/naiveproxy ;;
+    esac
+}
+
+upgrade_collect_remote_versions() {
+    local tmp_dir comp pids=()
+    tmp_dir=$(mktemp -d)
+    declare -gA UPGRADE_REMOTE_VERSIONS=()
+    for comp in nginx xray singbox hysteria2 naive; do
+        ( upgrade_remote_version "$comp" > "${tmp_dir}/${comp}" ) &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+    for comp in nginx xray singbox hysteria2 naive; do
+        UPGRADE_REMOTE_VERSIONS[$comp]=$(cat "${tmp_dir}/${comp}" 2>/dev/null || true)
+    done
+    rm -rf "$tmp_dir"
 }
 
 restart_service_if_configured() {
@@ -1512,16 +1553,44 @@ show_upgrade_status() {
     fi
 }
 
+upgrade_status_label() {
+    local current="$1" remote="$2"
+    if [[ -z "$remote" ]]; then
+        echo "远程未知"
+    elif [[ -z "$current" ]]; then
+        echo "未安装"
+    elif [[ "$current" == "$remote" ]]; then
+        echo "已最新"
+    else
+        echo "可升级"
+    fi
+}
+
+upgrade_menu_line() {
+    local idx="$1" label="$2" component="$3"
+    local current remote status
+    current=$(upgrade_command_version "$component")
+    remote="${UPGRADE_REMOTE_VERSIONS[$component]:-}"
+    status=$(upgrade_status_label "$current" "$remote")
+    printf "  %s. %-11s 当前: %-10s 最新: %-10s [%s]\n" \
+        "$idx" "$label" "${current:-未安装}" "${remote:-未知}" "$status"
+}
+
 do_upgrade_menu() {
     clear
     echo ""
     echo -e "${BLUE}================ 升级组件 ================${NC}"
-    echo "  1. Nginx       ($(upgrade_component_method nginx))"
-    echo "  2. Xray        ($(upgrade_component_method xray))"
-    echo "  3. Sing-Box    ($(upgrade_component_method singbox))"
-    echo "  4. Hysteria2   ($(upgrade_component_method hysteria2))"
-    echo "  5. NaiveProxy  ($(upgrade_component_method naive))"
-    echo "  6. 全部升级"
+    echo "  正在查询远程版本（5s 超时）..."
+    upgrade_collect_remote_versions
+    clear
+    echo ""
+    echo -e "${BLUE}================ 升级组件 ================${NC}"
+    upgrade_menu_line 1 "Nginx"      nginx
+    upgrade_menu_line 2 "Xray"       xray
+    upgrade_menu_line 3 "Sing-Box"   singbox
+    upgrade_menu_line 4 "Hysteria2"  hysteria2
+    upgrade_menu_line 5 "NaiveProxy" naive
+    echo "  6. 全部升级（仅升级有更新的组件）"
     echo "  l. 查看最近升级状态/日志"
     echo "  q. 返回主菜单"
     echo ""
@@ -1551,6 +1620,46 @@ do_upgrade_menu() {
             return
             ;;
     esac
+
+    if [[ "$component" == "all" ]]; then
+        local pending=() c cur rem
+        for c in nginx xray singbox hysteria2 naive; do
+            cur=$(upgrade_command_version "$c")
+            rem="${UPGRADE_REMOTE_VERSIONS[$c]:-}"
+            if [[ -n "$rem" && -n "$cur" && "$cur" != "$rem" ]]; then
+                pending+=("$c")
+            fi
+        done
+        if [[ ${#pending[@]} -eq 0 ]]; then
+            log_info "所有组件均已是最新版本"
+            done_return
+            return
+        fi
+        log_info "待升级: ${pending[*]}"
+        local confirm
+        read -rp "  确认升级以上组件？[y/N]: " confirm
+        if [[ "${confirm,,}" != "y" ]]; then
+            done_return
+            return
+        fi
+        for c in "${pending[@]}"; do
+            start_upgrade_job "$c"
+        done
+        done_return
+        return
+    fi
+
+    local current remote
+    current=$(upgrade_command_version "$component")
+    remote="${UPGRADE_REMOTE_VERSIONS[$component]:-}"
+    if [[ -n "$remote" && -n "$current" && "$current" == "$remote" ]]; then
+        local force
+        read -rp "  ${component} 已是最新（${current}），强制重装？[y/N]: " force
+        if [[ "${force,,}" != "y" ]]; then
+            done_return
+            return
+        fi
+    fi
 
     start_upgrade_job "$component"
     done_return
