@@ -28,7 +28,50 @@ STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-ALL_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync uninstall upgrade)
+DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync uninstall upgrade)
+ALL_MODULES=()
+
+init_module_list() {
+    local module_name manifest
+    ALL_MODULES=()
+
+    if [[ -d "$MODULES_DIR" ]]; then
+        while IFS= read -r module_name; do
+            [[ -n "$module_name" ]] && ALL_MODULES+=("$module_name")
+        done < <(find "$MODULES_DIR" -maxdepth 1 -type f -name '*.sh' -printf '%f\n' 2>/dev/null \
+            | sed 's/\.sh$//' \
+            | sort)
+    fi
+
+    if (( ${#ALL_MODULES[@]} > 0 )); then
+        return
+    fi
+
+    manifest="${LOCAL_MODULES_DIR}/modules.list"
+    if [[ -f "$manifest" ]]; then
+        while IFS= read -r module_name; do
+            [[ -z "$module_name" || "$module_name" == \#* ]] && continue
+            ALL_MODULES+=("$module_name")
+        done < "$manifest"
+    fi
+
+    if (( ${#ALL_MODULES[@]} > 0 )); then
+        return
+    fi
+
+    if command -v curl >/dev/null 2>&1; then
+        while IFS= read -r module_name; do
+            [[ -z "$module_name" || "$module_name" == \#* ]] && continue
+            ALL_MODULES+=("$module_name")
+        done < <(curl -fsSL "${BASE_URL}/modules/modules.list" 2>/dev/null || true)
+    fi
+
+    if (( ${#ALL_MODULES[@]} == 0 )); then
+        ALL_MODULES=("${DEFAULT_MODULES[@]}")
+    fi
+}
+
+init_module_list
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -325,6 +368,12 @@ sync_modules() {
     log_step "同步模块到本地缓存 (${LOCAL_MODULES_DIR})..."
     mkdir -p "$LOCAL_MODULES_DIR"
     chmod 700 "$LOCAL_MODULES_DIR"
+
+    if curl -fsSL "${BASE_URL}/modules/modules.list" -o "${LOCAL_MODULES_DIR}/modules.list" 2>/dev/null; then
+        chmod 600 "${LOCAL_MODULES_DIR}/modules.list"
+        init_module_list
+        log_info "模块清单已更新: ${LOCAL_MODULES_DIR}/modules.list"
+    fi
 
     local ok=0 fail=0
     for module in "${ALL_MODULES[@]}"; do
