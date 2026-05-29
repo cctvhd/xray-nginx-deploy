@@ -585,8 +585,9 @@ _preflight_check_state_consistency() {
 
     # 5d: DOMAIN_PRIMARY_* 指向已注册域名
     local -a primary_keys=(
-        "DOMAIN_PRIMARY_XRAY_CDN"
-        "DOMAIN_PRIMARY_XRAY_DIRECT"
+        "DOMAIN_PRIMARY_XRAY_XHTTP"
+        "DOMAIN_PRIMARY_XRAY_GRPC"
+        "DOMAIN_PRIMARY_XRAY_REALITY"
         "DOMAIN_PRIMARY_SINGBOX"
         "DOMAIN_PRIMARY_HYSTERIA2"
         "DOMAIN_PRIMARY_NAIVEPROXY"
@@ -655,10 +656,77 @@ preflight_config_check() {
     return 0
 }
 
+# ── 数据迁移 v1 → v2：旧 "xray" 协议标签拆分为 sub-protocol ─
+# 旧格式: DOMAIN_PROTO_<suffix>="xray" + DOMAIN_MODE=cdn/direct
+# 新格式: DOMAIN_PROTO_<suffix>="xray-xhttp" / "xray-grpc" / "xray-reality"
+#         mode 字段保留（用户语义、UI 显示），但协议消费方按 sub-protocol 区分
+# 幂等：第二次起空跑（无 "xray" 裸标签 → 无操作）
+_migrate_xray_proto_v1_to_v2() {
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+    [[ -z "$registry" ]] && return 0
+
+    local migrated_count=0
+    local d suffix protos mode
+    for d in $registry; do
+        suffix=$(_domain_state_suffix "$d")
+        protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+        # 老格式：协议列表中包含裸 "xray"
+        case ",${protos}," in
+            *,xray,*) ;;
+            *) continue ;;
+        esac
+        mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
+
+        local -a old_arr=()
+        IFS=',' read -ra old_arr <<< "$protos"
+        local new_list="" item
+        for item in "${old_arr[@]}"; do
+            if [[ "$item" == "xray" ]]; then
+                if [[ "$mode" == "cdn" ]]; then
+                    # CDN 模式：保守迁移为同时支持 xhttp + grpc（保留原有歧义）
+                    # 用户后续在域名编辑器里可裁剪为单一 sub-protocol
+                    new_list="${new_list:+$new_list,}xray-xhttp,xray-grpc"
+                else
+                    new_list="${new_list:+$new_list,}xray-reality"
+                fi
+            else
+                new_list="${new_list:+$new_list,}$item"
+            fi
+        done
+        save_state "DOMAIN_PROTO_${suffix}" "$new_list"
+        migrated_count=$((migrated_count + 1))
+    done
+
+    # 槽位主域名键迁移
+    local old_cdn old_direct
+    old_cdn=$(get_state "DOMAIN_PRIMARY_XRAY_CDN" "")
+    old_direct=$(get_state "DOMAIN_PRIMARY_XRAY_DIRECT" "")
+    if [[ -n "$old_cdn" ]]; then
+        # 不覆盖用户已显式设置的新键
+        [[ -z "$(get_state "DOMAIN_PRIMARY_XRAY_XHTTP" "")" ]] && save_state "DOMAIN_PRIMARY_XRAY_XHTTP" "$old_cdn"
+        [[ -z "$(get_state "DOMAIN_PRIMARY_XRAY_GRPC" "")" ]] && save_state "DOMAIN_PRIMARY_XRAY_GRPC"  "$old_cdn"
+        save_state "DOMAIN_PRIMARY_XRAY_CDN" ""
+        migrated_count=$((migrated_count + 1))
+    fi
+    if [[ -n "$old_direct" ]]; then
+        [[ -z "$(get_state "DOMAIN_PRIMARY_XRAY_REALITY" "")" ]] && save_state "DOMAIN_PRIMARY_XRAY_REALITY" "$old_direct"
+        save_state "DOMAIN_PRIMARY_XRAY_DIRECT" ""
+        migrated_count=$((migrated_count + 1))
+    fi
+
+    if (( migrated_count > 0 )); then
+        log_info "[迁移] xray 协议标签 v1→v2 拆分: ${migrated_count} 项更新（xray → xray-xhttp/xray-grpc/xray-reality）"
+    fi
+}
+
 rebuild_protocol_domains() {
+    # 启动时先做幂等迁移，确保下游按新 sub-protocol 标签运行
+    _migrate_xray_proto_v1_to_v2
+
     local registry
     local all_d="" cdn_d="" direct_d=""
-    local -a xray_cdn_cands=() xray_direct_cands=()
+    local -a xhttp_cands=() grpc_cands=() reality_cands=()
     local -a singbox_cands=() hyst_cands=() naive_cands=()
 
     registry=$(get_state "DOMAIN_REGISTRY" "")
@@ -677,25 +745,22 @@ rebuild_protocol_domains() {
             direct_d="${direct_d:+$direct_d }$domain"
         fi
 
-        if [[ "$protocols" == *"xray"* ]]; then
-            if [[ "$mode" == "cdn" ]]; then
-                xray_cdn_cands+=("$domain")
-            else
-                xray_direct_cands+=("$domain")
-            fi
-        fi
-        [[ "$protocols" == *"singbox"*   ]] && singbox_cands+=("$domain")
-        [[ "$protocols" == *"hysteria2"* ]] && hyst_cands+=("$domain")
-        [[ "$protocols" == *"naiveproxy"* ]] && naive_cands+=("$domain")
+        # 按 sub-protocol 精确匹配（逗号分隔列表）
+        case ",${protocols}," in *,xray-xhttp,*)   xhttp_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,xray-grpc,*)    grpc_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,xray-reality,*) reality_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,singbox,*)      singbox_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,hysteria2,*)    hyst_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,naiveproxy,*)   naive_cands+=("$domain") ;; esac
     done
 
     local xhttp_domain grpc_domain reality_domain anytls_domain hyst_domain naive_domain
-    xhttp_domain=$(_resolve_protocol_primary "XRAY_CDN"    "${xray_cdn_cands[@]}")
-    grpc_domain="$xhttp_domain"   # 同槽位
-    reality_domain=$(_resolve_protocol_primary "XRAY_DIRECT" "${xray_direct_cands[@]}")
-    anytls_domain=$(_resolve_protocol_primary "SINGBOX"      "${singbox_cands[@]}")
-    hyst_domain=$(_resolve_protocol_primary   "HYSTERIA2"    "${hyst_cands[@]}")
-    naive_domain=$(_resolve_protocol_primary  "NAIVEPROXY"   "${naive_cands[@]}")
+    xhttp_domain=$(_resolve_protocol_primary   "XRAY_XHTTP"   "${xhttp_cands[@]}")
+    grpc_domain=$(_resolve_protocol_primary    "XRAY_GRPC"    "${grpc_cands[@]}")
+    reality_domain=$(_resolve_protocol_primary "XRAY_REALITY" "${reality_cands[@]}")
+    anytls_domain=$(_resolve_protocol_primary  "SINGBOX"      "${singbox_cands[@]}")
+    hyst_domain=$(_resolve_protocol_primary    "HYSTERIA2"    "${hyst_cands[@]}")
+    naive_domain=$(_resolve_protocol_primary   "NAIVEPROXY"   "${naive_cands[@]}")
 
     save_state "ALL_DOMAINS"    "$all_d"
     save_state "CDN_DOMAINS"    "$cdn_d"
