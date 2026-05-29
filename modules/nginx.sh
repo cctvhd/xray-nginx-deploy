@@ -727,12 +727,16 @@ generate_sni_map() {
 
     if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
-        echo "        # -- xhttp CDN 回源 -----------------------------------"
+        if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" == "${XHTTP_DOMAIN}" ]]; then
+            echo "        # -- xhttp + gRPC CDN 回源（同域名合并到 20443，按 path 分流）--"
+        else
+            echo "        # -- xhttp CDN 回源 -----------------------------------"
+        fi
         echo "        ${XHTTP_DOMAIN}        127.0.0.1:20443;"
         had_output=1
     fi
 
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
+    if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- gRPC CDN 回源 ------------------------------------"
         echo "        ${GRPC_DOMAIN}         127.0.0.1:20445;"
@@ -884,6 +888,43 @@ generate_servers_conf() {
         xhttp_root=$(get_root_domain "${XHTTP_DOMAIN}")
         local cert_path="/etc/letsencrypt/live/${xhttp_root}"
 
+        # 同域名合并：xhttp 与 gRPC 共用同一域名时，gRPC location 并入此 server 块
+        local grpc_merged_location=""
+        if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" == "${XHTTP_DOMAIN}" ]]; then
+            grpc_merged_location=$(cat << CONF
+
+    # 同域名合并：gRPC location 并入 xhttp server 块（按 path 分流）
+    location /grpc.Service {
+        gzip       off;
+        access_log off;
+        limit_req  zone=websocket burst=100 nodelay;
+        limit_conn conn_limit 200;
+
+        grpc_pass             grpc://vless_grpc_backend;
+        grpc_set_header       Host \$host;
+        grpc_set_header       X-Real-IP \$final_real_ip;
+        grpc_set_header       X-Forwarded-For \$final_real_ip;
+        grpc_set_header       X-Forwarded-Proto \$scheme;
+        grpc_set_header       Te "trailers";
+        grpc_set_header       Content-Type "application/grpc";
+
+        grpc_connect_timeout  15s;
+        grpc_send_timeout     120s;
+        grpc_read_timeout     120s;
+        grpc_socket_keepalive on;
+        grpc_next_upstream    off;
+        # CF 免费版硬限制约 100s，这里按 120s 管理 CDN 侧连接
+        grpc_buffer_size      128k;
+        keepalive_timeout     120s;
+
+        client_max_body_size  0;
+        client_body_timeout   120s;
+        send_timeout          120s;
+    }
+CONF
+)
+        fi
+
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
 # ===================================================================
@@ -965,6 +1006,7 @@ server {
         keepalive_timeout           7200s;
         keepalive_requests          5000;
     }
+${grpc_merged_location}
 
     location = /health {
         limit_req  zone=health burst=5 nodelay;
@@ -1020,7 +1062,8 @@ CONF
     fi
 
     # gRPC CDN server 块
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
+    # 同域名时已合并进 xhttp server 块（20443），跳过独立 gRPC 块以避免端口/SNI 冲突
+    if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]]; then
         local grpc_root
         grpc_root=$(get_root_domain "${GRPC_DOMAIN}")
         local cert_path="/etc/letsencrypt/live/${grpc_root}"
