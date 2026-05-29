@@ -884,63 +884,58 @@ _collect_domain_cf() {
 }
 
 # ── 协议槽位冲突检测 ────────────────────────────────────────
-# 用法: _check_protocol_slot_conflict <new_domain> <protocols> <mode>
-# 扫 DOMAIN_REGISTRY 看新域名的 (协议+mode) 是否会和已有域名抢同一槽位
+# 用法: _check_protocol_slot_conflict <new_domain> <protocols>
+# 协议标签即槽位 ID，逐个标签检测是否与现有域名抢同一槽位
 # - 无冲突 → 返回 0
-# - 有冲突 → 列出当前占用域名，提示 [y/N]；y 返回 0（允许覆盖），N 返回 1（取消）
+# - 有冲突 → 列出当前占用域名，提示 [y/N]；y 返回 0（覆盖），N 返回 1（取消）
+#
+# 注：mode 不再参与槽位判定 —— X1 改良版协议拆分后，xray-xhttp / xray-grpc /
+# xray-reality 是独立标签，每个标签的 mode 由协议本身决定（xhttp/grpc=cdn,
+# reality=direct），不再需要外部 mode 与协议组合作为槽位 key。
 _check_protocol_slot_conflict() {
-    local new_domain="$1" new_protocols="$2" new_mode="$3"
+    local new_domain="$1" new_protocols="$2"
 
-    # slot_id : slot_label : 匹配协议 : 匹配 mode（* = 任意）
-    local -a slots=()
-    if [[ "$new_protocols" == *"xray"* ]]; then
-        if [[ "$new_mode" == "cdn" ]]; then
-            slots+=("XRAY_CDN|xray+cdn (XHTTP/gRPC)|xray|cdn")
-        else
-            slots+=("XRAY_DIRECT|xray+direct (Reality)|xray|direct")
-        fi
-    fi
-    [[ "$new_protocols" == *"singbox"*   ]] && slots+=("SINGBOX|singbox (AnyTLS)|singbox|*")
-    [[ "$new_protocols" == *"hysteria2"* ]] && slots+=("HYSTERIA2|hysteria2|hysteria2|*")
-    [[ "$new_protocols" == *"naiveproxy"* ]] && slots+=("NAIVEPROXY|naiveproxy|naiveproxy|*")
+    # 协议标签 → 槽位（一一对应）
+    local -A slot_label_map=(
+        ["xray-xhttp"]="VLESS XHTTP (CDN)"
+        ["xray-grpc"]="VLESS gRPC (CDN)"
+        ["xray-reality"]="VLESS Reality (Direct)"
+        ["singbox"]="AnyTLS (Direct)"
+        ["hysteria2"]="Hysteria2 (Direct)"
+        ["naiveproxy"]="NaiveProxy (Direct)"
+    )
+    # nginx 独立站点不参与 SNI 路由槽位竞争，跳过
+
+    local -a check_tags=()
+    local tag
+    for tag in "${!slot_label_map[@]}"; do
+        case ",${new_protocols}," in
+            *,${tag},*) check_tags+=("$tag") ;;
+        esac
+    done
 
     local registry
     registry=$(get_state "DOMAIN_REGISTRY")
 
-    local entry slot_id slot_label slot_proto slot_mode
-    local d suffix d_mode d_protos
-    for entry in "${slots[@]}"; do
-        IFS='|' read -r slot_id slot_label slot_proto slot_mode <<< "$entry"
-
+    local d suffix d_protos
+    for tag in "${check_tags[@]}"; do
         local -a occupants=()
         for d in $registry; do
             [[ "$d" == "$new_domain" ]] && continue
             suffix=$(echo "$d" | tr '.' '_')
-            d_mode=$(get_state "DOMAIN_MODE_${suffix}")
             d_protos=$(get_state "DOMAIN_PROTO_${suffix}")
             [[ -z "$d_protos" ]] && continue
-
-            # 是否占用该槽位
-            local occupies=false
-            case "$slot_proto" in
-                xray)
-                    if [[ "$d_protos" == *"xray"* ]]; then
-                        if [[ "$slot_mode" == "cdn" && "$d_mode" == "cdn" ]] || \
-                           [[ "$slot_mode" == "direct" && "$d_mode" != "cdn" ]]; then
-                            occupies=true
-                        fi
-                    fi
-                    ;;
-                singbox)    [[ "$d_protos" == *"singbox"*    ]] && occupies=true ;;
-                hysteria2)  [[ "$d_protos" == *"hysteria2"*  ]] && occupies=true ;;
-                naiveproxy) [[ "$d_protos" == *"naiveproxy"* ]] && occupies=true ;;
+            case ",${d_protos}," in
+                *,${tag},*) occupants+=("$d") ;;
             esac
-            $occupies && occupants+=("$d")
         done
 
         [[ ${#occupants[@]} -eq 0 ]] && continue
 
-        log_warn "协议槽位冲突: ${slot_label}"
+        local slot_id_upper="${tag^^}"
+        slot_id_upper="${slot_id_upper//-/_}"
+
+        log_warn "协议槽位冲突: ${slot_label_map[$tag]} [${tag}]"
         log_warn "  当前占用: ${occupants[*]}"
         log_warn "  本架构每槽位仅一个域名能生效，新增 ${new_domain} 后只能其一作为主域名"
         local confirm
@@ -950,9 +945,58 @@ _check_protocol_slot_conflict() {
             return 1
         fi
         # 用户确认 → 显式设 PRIMARY，覆盖"取最后"的回退行为
-        save_state "DOMAIN_PRIMARY_${slot_id}" "$new_domain"
+        save_state "DOMAIN_PRIMARY_${slot_id_upper}" "$new_domain"
     done
     return 0
+}
+
+# ── 协议菜单 + mode 自动推导 ────────────────────────────────
+# X1 改良版：协议拆分到 sub-protocol，mode 由协议决定
+_print_protocol_menu() {
+    echo "    1. xray-xhttp    - VLESS XHTTP（CDN）"
+    echo "    2. xray-grpc     - VLESS gRPC（CDN）"
+    echo "    3. xray-reality  - VLESS Reality（直连）"
+    echo "    4. singbox       - AnyTLS（直连）"
+    echo "    5. hysteria2     - Hysteria2（直连）"
+    echo "    6. naiveproxy    - NaiveProxy（直连）"
+    echo "    7. nginx         - 独立站点（开发中）"
+}
+
+# 协议序号 → 标签（stdout 输出标签，无效返回 1）
+_proto_choice_to_tag() {
+    case "$1" in
+        1) echo "xray-xhttp" ;;
+        2) echo "xray-grpc" ;;
+        3) echo "xray-reality" ;;
+        4) echo "singbox" ;;
+        5) echo "hysteria2" ;;
+        6) echo "naiveproxy" ;;
+        7) echo "nginx" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 多选序号 → 逗号分隔协议列表
+_collect_protocols_from_choices() {
+    local choices="$1"
+    local out="" choice tag
+    for choice in $choices; do
+        if tag=$(_proto_choice_to_tag "$choice"); then
+            out="${out:+$out,}$tag"
+        else
+            log_warn "无效选项: $choice"
+        fi
+    done
+    echo "$out"
+}
+
+# 由协议列表自动推导 mode（CDN 当且仅当包含 xhttp 或 grpc）
+_derive_mode_from_protocols() {
+    local protos="$1"
+    case ",${protos}," in
+        *,xray-xhttp,*|*,xray-grpc,*) echo "cdn" ;;
+        *) echo "direct" ;;
+    esac
 }
 
 # ════════════════════════════════════════════════════════════
@@ -973,30 +1017,15 @@ _editor_add_domain() {
     fi
 
     echo "  请选择协议（多选，空格分隔）："
-    echo "    1. xray       2. singbox       3. hysteria2"
-    echo "    4. naiveproxy 5. nginx"
-    read -rp "  输入序号如 1 3 5: " choices
-    protocols=""
-    for choice in $choices; do
-        case "$choice" in
-            1) protocols="${protocols:+$protocols,}xray" ;;
-            2) protocols="${protocols:+$protocols,}singbox" ;;
-            3) protocols="${protocols:+$protocols,}hysteria2" ;;
-            4) protocols="${protocols:+$protocols,}naiveproxy" ;;
-            5) protocols="${protocols:+$protocols,}nginx" ;;
-            *) log_warn "无效选项: $choice" ;;
-        esac
-    done
+    _print_protocol_menu
+    read -rp "  输入序号如 1 4: " choices
+    protocols=$(_collect_protocols_from_choices "$choices")
     [[ -z "$protocols" ]] && { log_warn "未选择协议，已取消"; return 0; }
 
-    local mode_r
-    read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
-    case "${mode_r:-d}" in
-        c|C|cdn|CDN) mode="cdn" ;;
-        *)           mode="direct" ;;
-    esac
+    mode=$(_derive_mode_from_protocols "$protocols")
+    log_info "推导连接方式: ${mode}（含 xhttp/grpc → cdn，其它 → direct）"
 
-    if ! _check_protocol_slot_conflict "$domain" "$protocols" "$mode"; then
+    if ! _check_protocol_slot_conflict "$domain" "$protocols"; then
         return 0
     fi
 
@@ -1015,33 +1044,19 @@ _editor_modify_domain() {
 
     echo "  当前: $domain [mode=$mode, proto=$protos]"
     echo "  重新选择协议（留空保持原值）："
-    echo "    1. xray       2. singbox       3. hysteria2"
-    echo "    4. naiveproxy 5. nginx"
-    local choices choice new_protos=""
-    read -rp "  输入序号如 1 3 5（留空保持）: " choices
+    _print_protocol_menu
+    local choices new_protos=""
+    read -rp "  输入序号如 1 4（留空保持）: " choices
     if [[ -n "$choices" ]]; then
-        for choice in $choices; do
-            case "$choice" in
-                1) new_protos="${new_protos:+$new_protos,}xray" ;;
-                2) new_protos="${new_protos:+$new_protos,}singbox" ;;
-                3) new_protos="${new_protos:+$new_protos,}hysteria2" ;;
-                4) new_protos="${new_protos:+$new_protos,}naiveproxy" ;;
-                5) new_protos="${new_protos:+$new_protos,}nginx" ;;
-                *) log_warn "无效选项: $choice" ;;
-            esac
-        done
+        new_protos=$(_collect_protocols_from_choices "$choices")
     fi
     [[ -z "$new_protos" ]] && new_protos="$protos"
 
-    local mode_r new_mode
-    read -rp "  连接方式 [d=直连, c=CDN，留空保持 ${mode}]: " mode_r
-    case "${mode_r,,}" in
-        c|cdn) new_mode="cdn" ;;
-        d|direct) new_mode="direct" ;;
-        *) new_mode="$mode" ;;
-    esac
+    local new_mode
+    new_mode=$(_derive_mode_from_protocols "$new_protos")
+    log_info "推导连接方式: ${new_mode}"
 
-    if ! _check_protocol_slot_conflict "$domain" "$new_protos" "$new_mode"; then
+    if ! _check_protocol_slot_conflict "$domain" "$new_protos"; then
         return 0
     fi
 
@@ -1327,22 +1342,26 @@ collect_domains() {
     rm -f "${CF_CONFIG_DIR}"/domain_*.ini 2>/dev/null || true
     save_state "DOMAIN_REGISTRY" ""
     # 清空协议槽位主域名，避免旧值污染冲突检测
-    save_state "DOMAIN_PRIMARY_XRAY_CDN"    ""
-    save_state "DOMAIN_PRIMARY_XRAY_DIRECT" ""
-    save_state "DOMAIN_PRIMARY_SINGBOX"     ""
-    save_state "DOMAIN_PRIMARY_HYSTERIA2"   ""
-    save_state "DOMAIN_PRIMARY_NAIVEPROXY"  ""
+    save_state "DOMAIN_PRIMARY_XRAY_XHTTP"   ""
+    save_state "DOMAIN_PRIMARY_XRAY_GRPC"    ""
+    save_state "DOMAIN_PRIMARY_XRAY_REALITY" ""
+    save_state "DOMAIN_PRIMARY_SINGBOX"      ""
+    save_state "DOMAIN_PRIMARY_HYSTERIA2"    ""
+    save_state "DOMAIN_PRIMARY_NAIVEPROXY"   ""
+    # 清理 v1 遗留键（迁移函数也会清，这里再保险一次）
+    save_state "DOMAIN_PRIMARY_XRAY_CDN"     ""
+    save_state "DOMAIN_PRIMARY_XRAY_DIRECT"  ""
 
-    echo "  协议说明："
-    echo "    xray      - VLESS 相关 (XHTTP/gRPC via CDN, Reality via Direct)"
-    echo "    singbox   - Sing-Box AnyTLS"
-    echo "    hysteria2 - Hysteria2"
-    echo "    naiveproxy- NaiveProxy"
-    echo "    nginx     - 独立 Nginx 站点"
+    echo "  协议说明（X1 改良版：sub-protocol 拆分）："
+    echo "    xray-xhttp   - VLESS XHTTP（CDN）"
+    echo "    xray-grpc    - VLESS gRPC （CDN）"
+    echo "    xray-reality - VLESS Reality（直连）"
+    echo "    singbox      - Sing-Box AnyTLS（直连）"
+    echo "    hysteria2    - Hysteria2（直连）"
+    echo "    naiveproxy   - NaiveProxy（直连）"
+    echo "    nginx        - 独立 Nginx 站点（开发中）"
     echo ""
-    echo "  连接方式："
-    echo "    cdn    - 经 Cloudflare CDN 中转（橙云）"
-    echo "    direct - 直连（关闭 CF 代理 / 灰云）"
+    echo "  连接方式由协议自动推导（含 xhttp/grpc → CDN，其余 → 直连）"
     echo ""
 
     while true; do
@@ -1360,36 +1379,18 @@ collect_domains() {
         # ── 多选协议 ──
         echo ""
         echo "  请为 $domain 选择协议（多选，空格分隔序号）："
-        echo "    1. xray       - VLESS 系列 (XHTTP/gRPC + Reality)"
-        echo "    2. singbox    - AnyTLS"
-        echo "    3. hysteria2  - Hysteria2"
-        echo "    4. naiveproxy - NaiveProxy"
-        echo "    5. nginx      - 独立 Nginx 站点"
+        _print_protocol_menu
         local choices
-        read -rp "  输入序号如: 1 3 5: " choices
+        read -rp "  输入序号如: 1 4: " choices
 
-        protocols=""
-        for choice in $choices; do
-            case "$choice" in
-                1) protocols="${protocols:+$protocols,}xray" ;;
-                2) protocols="${protocols:+$protocols,}singbox" ;;
-                3) protocols="${protocols:+$protocols,}hysteria2" ;;
-                4) protocols="${protocols:+$protocols,}naiveproxy" ;;
-                5) protocols="${protocols:+$protocols,}nginx" ;;
-                *) log_warn "无效选项: $choice"; ;;
-            esac
-        done
+        protocols=$(_collect_protocols_from_choices "$choices")
         [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
 
-        # ── 连接方式 ──
-        local mode_r
-        read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
-        case "${mode_r:-d}" in
-            c|C|cdn|CDN) mode="cdn" ;;
-            *)           mode="direct" ;;
-        esac
+        # ── 连接方式自动推导 ──
+        mode=$(_derive_mode_from_protocols "$protocols")
+        log_info "推导连接方式: ${mode}"
 
-        if ! _check_protocol_slot_conflict "$domain" "$protocols" "$mode"; then
+        if ! _check_protocol_slot_conflict "$domain" "$protocols"; then
             continue
         fi
 
@@ -1978,44 +1979,26 @@ add_domain_and_cert() {
         # ── 多选协议 ──
         echo ""
         echo "  请为 $domain 选择协议（多选，空格分隔序号）："
-        echo "    1. xray       - VLESS 系列"
-        echo "    2. singbox    - AnyTLS"
-        echo "    3. hysteria2  - Hysteria2"
-        echo "    4. naiveproxy - NaiveProxy"
-        echo "    5. nginx      - 独立 Nginx 站点"
+        _print_protocol_menu
         local choices
-        read -rp "  输入序号如: 1 3 5: " choices
+        read -rp "  输入序号如: 1 4: " choices
 
-        protocols=""
-        for choice in $choices; do
-            case "$choice" in
-                1) protocols="${protocols:+$protocols,}xray" ;;
-                2) protocols="${protocols:+$protocols,}singbox" ;;
-                3) protocols="${protocols:+$protocols,}hysteria2" ;;
-                4) protocols="${protocols:+$protocols,}naiveproxy" ;;
-                5) protocols="${protocols:+$protocols,}nginx" ;;
-                *) log_warn "无效选项: $choice"; ;;
-            esac
-        done
+        protocols=$(_collect_protocols_from_choices "$choices")
         [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
-
-        # ── 连接方式 ──
-        local mode_r
-        if [[ "$is_existing" == "true" ]]; then
-            read -rp "  连接方式 [d=直连, c=CDN，默认保持 ${current_mode}]: " mode_r
-        else
-            read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
-        fi
-        case "${mode_r:-${current_mode:-d}}" in
-            c|C|cdn|CDN) mode="cdn" ;;
-            *)           mode="direct" ;;
-        esac
 
         if [[ "$is_existing" == "true" ]]; then
             protocols=$(merge_domain_protocols "$current_protos" "$protocols")
         fi
 
-        if ! _check_protocol_slot_conflict "$domain" "$protocols" "$mode"; then
+        # ── 连接方式自动推导（编辑场景同样按当前协议列表推导，不再询问）──
+        mode=$(_derive_mode_from_protocols "$protocols")
+        if [[ "$is_existing" == "true" && "$mode" != "$current_mode" ]]; then
+            log_info "连接方式由 ${current_mode} → ${mode}（按协议自动推导）"
+        else
+            log_info "推导连接方式: ${mode}"
+        fi
+
+        if ! _check_protocol_slot_conflict "$domain" "$protocols"; then
             continue
         fi
 
@@ -2163,9 +2146,9 @@ refresh_domain_assignments() {
         [[ -n "$protocols" ]] && register_domain "$domain" "$mode" "$protocols"
     done
 
-    [[ -n "${XHTTP_DOMAIN:-}" ]] && register_domain "$XHTTP_DOMAIN" "cdn" "xray"
-    [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]] && register_domain "$GRPC_DOMAIN" "cdn" "xray"
-    [[ -n "${REALITY_DOMAIN:-}" ]] && register_domain "$REALITY_DOMAIN" "direct" "xray"
+    [[ -n "${XHTTP_DOMAIN:-}" ]] && register_domain "$XHTTP_DOMAIN" "cdn" "xray-xhttp"
+    [[ -n "${GRPC_DOMAIN:-}" ]] && register_domain "$GRPC_DOMAIN" "cdn" "xray-grpc"
+    [[ -n "${REALITY_DOMAIN:-}" ]] && register_domain "$REALITY_DOMAIN" "direct" "xray-reality"
     [[ -n "${ANYTLS_DOMAIN:-}" ]] && register_domain "$ANYTLS_DOMAIN" "direct" "singbox"
     [[ -n "${NAIVE_DOMAIN:-}" ]] && register_domain "$NAIVE_DOMAIN" "direct" "naiveproxy"
     [[ -n "${HYSTERIA2_DOMAIN:-}" ]] && register_domain "$HYSTERIA2_DOMAIN" "direct" "hysteria2"
