@@ -883,6 +883,218 @@ _collect_domain_cf() {
     link_domain_to_cf_account "$root_domain" "$cf_idx"
 }
 
+# ════════════════════════════════════════════════════════════
+# 域名配置交互式编辑器（collect_domains 的 b 分支使用）
+# ════════════════════════════════════════════════════════════
+
+# ── 编辑器：添加单个域名 ─────────────────────────────────────
+_editor_add_domain() {
+    local domain protocols mode choices choice
+
+    read -rp "请输入要添加的域名: " domain
+    domain="${domain,,}"
+    [[ -z "$domain" ]] && return 0
+
+    if domain_is_registered "$domain"; then
+        log_warn "域名 $domain 已存在，请用 e 编辑或先 d 删除"
+        return 0
+    fi
+
+    echo "  请选择协议（多选，空格分隔）："
+    echo "    1. xray       2. singbox       3. hysteria2"
+    echo "    4. naiveproxy 5. nginx"
+    read -rp "  输入序号如 1 3 5: " choices
+    protocols=""
+    for choice in $choices; do
+        case "$choice" in
+            1) protocols="${protocols:+$protocols,}xray" ;;
+            2) protocols="${protocols:+$protocols,}singbox" ;;
+            3) protocols="${protocols:+$protocols,}hysteria2" ;;
+            4) protocols="${protocols:+$protocols,}naiveproxy" ;;
+            5) protocols="${protocols:+$protocols,}nginx" ;;
+            *) log_warn "无效选项: $choice" ;;
+        esac
+    done
+    [[ -z "$protocols" ]] && { log_warn "未选择协议，已取消"; return 0; }
+
+    local mode_r
+    read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
+    case "${mode_r:-d}" in
+        c|C|cdn|CDN) mode="cdn" ;;
+        *)           mode="direct" ;;
+    esac
+
+    register_domain "$domain" "$mode" "$protocols"
+    _collect_domain_cf "$domain"
+    log_info "已添加: $domain [mode=$mode, proto=$protocols]"
+}
+
+# ── 编辑器：修改已存在域名的协议 / mode ─────────────────────
+_editor_modify_domain() {
+    local domain="$1"
+    local suffix mode protos
+    suffix=$(echo "$domain" | tr '.' '_')
+    mode=$(get_state "DOMAIN_MODE_${suffix}")
+    protos=$(get_state "DOMAIN_PROTO_${suffix}")
+
+    echo "  当前: $domain [mode=$mode, proto=$protos]"
+    echo "  重新选择协议（留空保持原值）："
+    echo "    1. xray       2. singbox       3. hysteria2"
+    echo "    4. naiveproxy 5. nginx"
+    local choices choice new_protos=""
+    read -rp "  输入序号如 1 3 5（留空保持）: " choices
+    if [[ -n "$choices" ]]; then
+        for choice in $choices; do
+            case "$choice" in
+                1) new_protos="${new_protos:+$new_protos,}xray" ;;
+                2) new_protos="${new_protos:+$new_protos,}singbox" ;;
+                3) new_protos="${new_protos:+$new_protos,}hysteria2" ;;
+                4) new_protos="${new_protos:+$new_protos,}naiveproxy" ;;
+                5) new_protos="${new_protos:+$new_protos,}nginx" ;;
+                *) log_warn "无效选项: $choice" ;;
+            esac
+        done
+    fi
+    [[ -z "$new_protos" ]] && new_protos="$protos"
+
+    local mode_r new_mode
+    read -rp "  连接方式 [d=直连, c=CDN，留空保持 ${mode}]: " mode_r
+    case "${mode_r,,}" in
+        c|cdn) new_mode="cdn" ;;
+        d|direct) new_mode="direct" ;;
+        *) new_mode="$mode" ;;
+    esac
+
+    # 直接覆盖（编辑语义 = 替换；register_domain 是 merge 协议，这里要 replace）
+    save_state "DOMAIN_MODE_${suffix}"  "$new_mode"
+    save_state "DOMAIN_PROTO_${suffix}" "$new_protos"
+    log_info "已修改: $domain [mode=$new_mode, proto=$new_protos]"
+}
+
+# ── 编辑器：删除域名 ────────────────────────────────────────
+_editor_delete_domain() {
+    local domain="$1"
+    local confirm
+    read -rp "确认删除 $domain？[y/N]: " confirm
+    [[ "${confirm,,}" != "y" ]] && { log_info "已取消"; return 0; }
+
+    local suffix
+    suffix=$(echo "$domain" | tr '.' '_')
+
+    # 从 DOMAIN_REGISTRY 移除
+    local registry new_reg="" d
+    registry=$(get_state "DOMAIN_REGISTRY")
+    for d in $registry; do
+        [[ "$d" == "$domain" ]] && continue
+        new_reg="${new_reg:+$new_reg }$d"
+    done
+    save_state "DOMAIN_REGISTRY" "$new_reg"
+    save_state "DOMAIN_MODE_${suffix}"  ""
+    save_state "DOMAIN_PROTO_${suffix}" ""
+    log_info "已删除: $domain"
+
+    # 同根子域名还在 → 保留 ini 与证书；只有当本根域名彻底没人用了才询问
+    local root_domain still_used=false rd
+    root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+    for d in $new_reg; do
+        rd=$(echo "$d" | awk -F. '{print $(NF-1)"."$NF}')
+        if [[ "$rd" == "$root_domain" ]]; then
+            still_used=true
+            break
+        fi
+    done
+    $still_used && return 0
+
+    local filebase
+    filebase=$(domain_to_ini_name "$root_domain")
+
+    local rm_ini
+    read -rp "  根域名 ${root_domain} 已无子域使用，是否删除 domain_${filebase}.ini 关联？[y/N]: " rm_ini
+    if [[ "${rm_ini,,}" == "y" ]]; then
+        rm -f "${CF_CONFIG_DIR}/domain_${filebase}.ini"
+        log_info "已删除 domain_${filebase}.ini"
+    fi
+
+    local rm_cert
+    read -rp "  是否删除 Let's Encrypt 证书 /etc/letsencrypt/live/${root_domain}？[y/N]: " rm_cert
+    if [[ "${rm_cert,,}" == "y" ]]; then
+        if command -v certbot >/dev/null 2>&1; then
+            certbot delete --cert-name "$root_domain" --non-interactive >/dev/null 2>&1 || \
+                rm -rf "/etc/letsencrypt/live/${root_domain}" \
+                       "/etc/letsencrypt/archive/${root_domain}" \
+                       "/etc/letsencrypt/renewal/${root_domain}.conf"
+        else
+            rm -rf "/etc/letsencrypt/live/${root_domain}" \
+                   "/etc/letsencrypt/archive/${root_domain}" \
+                   "/etc/letsencrypt/renewal/${root_domain}.conf"
+        fi
+        log_info "已删除证书 ${root_domain}"
+    fi
+}
+
+# ── 编辑器主循环：展示列表 + a/e/d/s/q 操作 ─────────────────
+# 返回值：0 = 用户选择保存（s），1 = 用户选择放弃（q）
+_domain_editor_loop() {
+    local cmd extra
+    while true; do
+        echo ""
+        echo "── 当前域名列表 ────────────────────────────────────"
+        local registry domains_arr=() idx=1
+        registry=$(get_state "DOMAIN_REGISTRY")
+        if [[ -z "$registry" ]]; then
+            echo "  （暂无）"
+        else
+            local d
+            for d in $registry; do
+                local suffix mode protos
+                suffix=$(echo "$d" | tr '.' '_')
+                mode=$(get_state "DOMAIN_MODE_${suffix}")
+                protos=$(get_state "DOMAIN_PROTO_${suffix}")
+                # 跳过被 _editor_delete_domain 清空过的残留键
+                [[ -z "$mode" && -z "$protos" ]] && continue
+                printf "  %d. %-32s [%s / %s]\n" "$idx" "$d" "$mode" "$protos"
+                domains_arr+=("$d")
+                idx=$((idx + 1))
+            done
+        fi
+        echo "────────────────────────────────────────────────────"
+        echo "操作:  a 添加  |  e <N> 编辑  |  d <N> 删除  |  s 保存退出  |  q 放弃退出"
+        echo ""
+        read -rp "  请选择: " cmd extra
+
+        case "${cmd,,}" in
+            a)
+                _editor_add_domain
+                ;;
+            e)
+                if ! [[ "$extra" =~ ^[0-9]+$ ]] || (( extra < 1 || extra > ${#domains_arr[@]} )); then
+                    log_warn "用法: e <编号>（1-${#domains_arr[@]}）"
+                    continue
+                fi
+                _editor_modify_domain "${domains_arr[$((extra - 1))]}"
+                ;;
+            d)
+                if ! [[ "$extra" =~ ^[0-9]+$ ]] || (( extra < 1 || extra > ${#domains_arr[@]} )); then
+                    log_warn "用法: d <编号>（1-${#domains_arr[@]}）"
+                    continue
+                fi
+                _editor_delete_domain "${domains_arr[$((extra - 1))]}"
+                ;;
+            s)
+                return 0
+                ;;
+            q)
+                return 1
+                ;;
+            "")
+                ;;
+            *)
+                log_warn "无效操作: $cmd"
+                ;;
+        esac
+    done
+}
+
 collect_domains() {
     echo ""
     log_step "配置域名信息"
@@ -909,36 +1121,98 @@ collect_domains() {
         done
 
         echo ""
-        read -rp "是否直接复用已有域名配置？[Y/n]: " reuse_domains
-        if [[ "${reuse_domains,,}" != "n" ]]; then
-            normalize_domain_arrays
+        echo "请选择操作："
+        echo "  a. 复用现有配置不修改（默认）"
+        echo "  b. 在现有基础上 增 / 改 / 删（交互式编辑）"
+        echo "  c. 全部清空重新填写"
+        echo ""
+        local domain_action
+        read -rp "  请选择 [a/b/c]: " domain_action
+        domain_action="${domain_action:-a}"
 
-            local missing_ini=()
-            for domain in "${ALL_DOMAINS[@]}"; do
-                local root_domain
-                root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-                if ! has_domain_ini "$root_domain"; then
-                    local already=false
-                    for m in "${missing_ini[@]}"; do
-                        [[ "$m" == "$root_domain" ]] && already=true && break
-                    done
-                    $already || missing_ini+=("$root_domain")
-                fi
-            done
+        case "${domain_action,,}" in
+            a)
+                normalize_domain_arrays
 
-            if [[ ${#missing_ini[@]} -gt 0 ]]; then
-                log_warn "以下根域名缺少账号映射文件，需要重新关联："
-                for rd in "${missing_ini[@]}"; do
-                    echo "  *.${rd}"
+                local missing_ini=()
+                for domain in "${ALL_DOMAINS[@]}"; do
+                    local root_domain
+                    root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+                    if ! has_domain_ini "$root_domain"; then
+                        local already=false
+                        for m in "${missing_ini[@]}"; do
+                            [[ "$m" == "$root_domain" ]] && already=true && break
+                        done
+                        $already || missing_ini+=("$root_domain")
+                    fi
                 done
-                echo ""
-                _prompt_link_domains "${missing_ini[@]}"
-            fi
 
-            log_info "复用已有域名配置"
-            cert_txn_commit
-            return
-        fi
+                if [[ ${#missing_ini[@]} -gt 0 ]]; then
+                    log_warn "以下根域名缺少账号映射文件，需要重新关联："
+                    for rd in "${missing_ini[@]}"; do
+                        echo "  *.${rd}"
+                    done
+                    echo ""
+                    _prompt_link_domains "${missing_ini[@]}"
+                fi
+
+                log_info "复用已有域名配置"
+                cert_txn_commit
+                return
+                ;;
+            b)
+                if ! _domain_editor_loop; then
+                    log_warn "用户放弃编辑，正在回滚到事务开始前的状态..."
+                    _cert_txn_rollback 0
+                    return 1
+                fi
+                rebuild_protocol_domains
+                load_domain_state
+
+                # 补齐编辑后可能缺失的 CF 账号关联
+                normalize_domain_arrays
+                local missing_ini=()
+                for domain in "${ALL_DOMAINS[@]}"; do
+                    local root_domain
+                    root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+                    if ! has_domain_ini "$root_domain"; then
+                        local already=false
+                        for m in "${missing_ini[@]}"; do
+                            [[ "$m" == "$root_domain" ]] && already=true && break
+                        done
+                        $already || missing_ini+=("$root_domain")
+                    fi
+                done
+                if [[ ${#missing_ini[@]} -gt 0 ]]; then
+                    log_warn "编辑后以下根域名缺少账号映射，请关联："
+                    _prompt_link_domains "${missing_ini[@]}"
+                fi
+
+                echo ""
+                log_info "编辑后的域名配置："
+                local d
+                for d in "${ALL_DOMAINS[@]}"; do
+                    local suffix m p
+                    suffix=$(echo "$d" | tr '.' '_')
+                    m=$(get_state "DOMAIN_MODE_${suffix}")
+                    p=$(get_state "DOMAIN_PROTO_${suffix}")
+                    echo "  $d  [${m} / ${p}]"
+                done
+
+                save_domain_config
+                cert_txn_commit
+                return
+                ;;
+            c)
+                # fall through 到下方的"全新填写"分支
+                ;;
+            *)
+                log_warn "无效选择，按默认（复用）处理"
+                normalize_domain_arrays
+                cert_txn_commit
+                return
+                ;;
+        esac
     fi
 
     # ── 全新填写域名 ──────────────────────────────────────────
