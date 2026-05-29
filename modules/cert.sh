@@ -883,6 +883,78 @@ _collect_domain_cf() {
     link_domain_to_cf_account "$root_domain" "$cf_idx"
 }
 
+# ── 协议槽位冲突检测 ────────────────────────────────────────
+# 用法: _check_protocol_slot_conflict <new_domain> <protocols> <mode>
+# 扫 DOMAIN_REGISTRY 看新域名的 (协议+mode) 是否会和已有域名抢同一槽位
+# - 无冲突 → 返回 0
+# - 有冲突 → 列出当前占用域名，提示 [y/N]；y 返回 0（允许覆盖），N 返回 1（取消）
+_check_protocol_slot_conflict() {
+    local new_domain="$1" new_protocols="$2" new_mode="$3"
+
+    # slot_id : slot_label : 匹配协议 : 匹配 mode（* = 任意）
+    local -a slots=()
+    if [[ "$new_protocols" == *"xray"* ]]; then
+        if [[ "$new_mode" == "cdn" ]]; then
+            slots+=("XRAY_CDN|xray+cdn (XHTTP/gRPC)|xray|cdn")
+        else
+            slots+=("XRAY_DIRECT|xray+direct (Reality)|xray|direct")
+        fi
+    fi
+    [[ "$new_protocols" == *"singbox"*   ]] && slots+=("SINGBOX|singbox (AnyTLS)|singbox|*")
+    [[ "$new_protocols" == *"hysteria2"* ]] && slots+=("HYSTERIA2|hysteria2|hysteria2|*")
+    [[ "$new_protocols" == *"naiveproxy"* ]] && slots+=("NAIVEPROXY|naiveproxy|naiveproxy|*")
+
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY")
+
+    local entry slot_id slot_label slot_proto slot_mode
+    local d suffix d_mode d_protos
+    for entry in "${slots[@]}"; do
+        IFS='|' read -r slot_id slot_label slot_proto slot_mode <<< "$entry"
+
+        local -a occupants=()
+        for d in $registry; do
+            [[ "$d" == "$new_domain" ]] && continue
+            suffix=$(echo "$d" | tr '.' '_')
+            d_mode=$(get_state "DOMAIN_MODE_${suffix}")
+            d_protos=$(get_state "DOMAIN_PROTO_${suffix}")
+            [[ -z "$d_protos" ]] && continue
+
+            # 是否占用该槽位
+            local occupies=false
+            case "$slot_proto" in
+                xray)
+                    if [[ "$d_protos" == *"xray"* ]]; then
+                        if [[ "$slot_mode" == "cdn" && "$d_mode" == "cdn" ]] || \
+                           [[ "$slot_mode" == "direct" && "$d_mode" != "cdn" ]]; then
+                            occupies=true
+                        fi
+                    fi
+                    ;;
+                singbox)    [[ "$d_protos" == *"singbox"*    ]] && occupies=true ;;
+                hysteria2)  [[ "$d_protos" == *"hysteria2"*  ]] && occupies=true ;;
+                naiveproxy) [[ "$d_protos" == *"naiveproxy"* ]] && occupies=true ;;
+            esac
+            $occupies && occupants+=("$d")
+        done
+
+        [[ ${#occupants[@]} -eq 0 ]] && continue
+
+        log_warn "协议槽位冲突: ${slot_label}"
+        log_warn "  当前占用: ${occupants[*]}"
+        log_warn "  本架构每槽位仅一个域名能生效，新增 ${new_domain} 后只能其一作为主域名"
+        local confirm
+        read -rp "  是否继续，让 ${new_domain} 成为该槽位的新主域名？[y/N]: " confirm
+        if [[ "${confirm,,}" != "y" ]]; then
+            log_info "已取消"
+            return 1
+        fi
+        # 用户确认 → 显式设 PRIMARY，覆盖"取最后"的回退行为
+        save_state "DOMAIN_PRIMARY_${slot_id}" "$new_domain"
+    done
+    return 0
+}
+
 # ════════════════════════════════════════════════════════════
 # 域名配置交互式编辑器（collect_domains 的 b 分支使用）
 # ════════════════════════════════════════════════════════════
@@ -924,6 +996,10 @@ _editor_add_domain() {
         *)           mode="direct" ;;
     esac
 
+    if ! _check_protocol_slot_conflict "$domain" "$protocols" "$mode"; then
+        return 0
+    fi
+
     register_domain "$domain" "$mode" "$protocols"
     _collect_domain_cf "$domain"
     log_info "已添加: $domain [mode=$mode, proto=$protocols]"
@@ -964,6 +1040,10 @@ _editor_modify_domain() {
         d|direct) new_mode="direct" ;;
         *) new_mode="$mode" ;;
     esac
+
+    if ! _check_protocol_slot_conflict "$domain" "$new_protos" "$new_mode"; then
+        return 0
+    fi
 
     # 直接覆盖（编辑语义 = 替换；register_domain 是 merge 协议，这里要 replace）
     save_state "DOMAIN_MODE_${suffix}"  "$new_mode"
@@ -1228,6 +1308,12 @@ collect_domains() {
 
     rm -f "${CF_CONFIG_DIR}"/domain_*.ini 2>/dev/null || true
     save_state "DOMAIN_REGISTRY" ""
+    # 清空协议槽位主域名，避免旧值污染冲突检测
+    save_state "DOMAIN_PRIMARY_XRAY_CDN"    ""
+    save_state "DOMAIN_PRIMARY_XRAY_DIRECT" ""
+    save_state "DOMAIN_PRIMARY_SINGBOX"     ""
+    save_state "DOMAIN_PRIMARY_HYSTERIA2"   ""
+    save_state "DOMAIN_PRIMARY_NAIVEPROXY"  ""
 
     echo "  协议说明："
     echo "    xray      - VLESS 相关 (XHTTP/gRPC via CDN, Reality via Direct)"
@@ -1284,6 +1370,10 @@ collect_domains() {
             c|C|cdn|CDN) mode="cdn" ;;
             *)           mode="direct" ;;
         esac
+
+        if ! _check_protocol_slot_conflict "$domain" "$protocols" "$mode"; then
+            continue
+        fi
 
         # ── 注册 & 关联 ──
         register_domain "$domain" "$mode" "$protocols"
@@ -1905,7 +1995,13 @@ add_domain_and_cert() {
 
         if [[ "$is_existing" == "true" ]]; then
             protocols=$(merge_domain_protocols "$current_protos" "$protocols")
-        else
+        fi
+
+        if ! _check_protocol_slot_conflict "$domain" "$protocols" "$mode"; then
+            continue
+        fi
+
+        if [[ "$is_existing" != "true" ]]; then
             # ── 关联 CF 账号（自动匹域名 → 手动选）─────────────
             root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
             local _ini_base _ini_file _matched_ini=() _auto_ini
