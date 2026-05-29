@@ -136,6 +136,14 @@ sync_refresh_nginx_routes() {
 
     log_step "同步 Nginx 与 ${source} 关联路由参数..."
     sync_restore_domain_arrays
+
+    if declare -F preflight_config_check &>/dev/null; then
+        if ! preflight_config_check "sync_refresh_nginx_routes(${source})"; then
+            log_error "Nginx 路由同步已阻止"
+            return 1
+        fi
+    fi
+
     load_module nginx
     create_nginx_dirs
     generate_fake_site "/var/www/html" "Welcome"

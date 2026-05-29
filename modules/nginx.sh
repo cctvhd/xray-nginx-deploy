@@ -875,6 +875,14 @@ CONF
 generate_servers_conf() {
     log_step "生成 servers.conf..."
 
+    # Preflight 互锁：servers.conf 是 SNI 路由的最终落地，写入前最后一道闸
+    if declare -F preflight_config_check &>/dev/null; then
+        if ! preflight_config_check "generate_servers_conf"; then
+            log_error "servers.conf 生成已阻止"
+            return 1
+        fi
+    fi
+
     # 有意清空配置文件，后续以 >> 追加方式逐段写入
     : > /etc/nginx/conf.d/servers.conf
 
