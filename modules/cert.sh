@@ -166,6 +166,166 @@ rebuild_cf_ini_files() {
     done
 }
 
+# ════════════════════════════════════════════════════════════
+# 配置事务：cert_txn_begin / cert_txn_commit / _cert_txn_rollback
+#
+# 目标：collect_domains / setup_cf_accounts / add_domain_and_cert
+# 中途被打断时，把 /etc/cloudflare/ 和 /etc/xray-deploy/config.env
+# 完整恢复到事务开始前的状态。
+#
+# 用法：
+#   cert_txn_begin "<label>"   # 入口处
+#   ... 业务逻辑 ...
+#   cert_txn_commit            # 出口处（成功）
+#
+# trap 在 begin 时安装到 EXIT，自动处理 Ctrl+C / 异常退出 / return-with-error。
+# 嵌套调用（外层 → 内层）共用一个 snapshot：内层 begin 仅递增引用计数，
+# 内层 commit 仅递减，最外层 commit 才真正归档 snapshot 并卸 trap。
+# ════════════════════════════════════════════════════════════
+
+CERT_TXN_DEPTH=0
+CERT_TXN_BACKUP_DIR=""
+CERT_TXN_LABEL=""
+CERT_TXN_COMMITTED=0
+CERT_TXN_ARCHIVE_DIR="/etc/cloudflare/.txn-archive"
+CERT_TXN_ARCHIVE_KEEP=5
+
+cert_txn_begin() {
+    local label="${1:-cert-txn}"
+
+    # 嵌套：已在事务中只递增深度
+    if [[ $CERT_TXN_DEPTH -gt 0 ]]; then
+        CERT_TXN_DEPTH=$((CERT_TXN_DEPTH + 1))
+        return 0
+    fi
+
+    mkdir -p "$CF_CONFIG_DIR" 2>/dev/null || true
+    chmod 700 "$CF_CONFIG_DIR" 2>/dev/null || true
+
+    CERT_TXN_LABEL="$label"
+    CERT_TXN_COMMITTED=0
+    CERT_TXN_BACKUP_DIR="${CF_CONFIG_DIR}/.txn-$(date +%s)-$$"
+
+    if ! mkdir -p "$CERT_TXN_BACKUP_DIR"; then
+        log_warn "无法创建事务备份目录 ${CERT_TXN_BACKUP_DIR}，事务保护已禁用"
+        CERT_TXN_BACKUP_DIR=""
+        return 0
+    fi
+    chmod 700 "$CERT_TXN_BACKUP_DIR" 2>/dev/null || true
+
+    # 备份 /etc/cloudflare/ 下所有文件（排除自己 .txn-* / .txn-archive）
+    local f base
+    for f in "${CF_CONFIG_DIR}"/* "${CF_CONFIG_DIR}"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        case "$base" in
+            .txn-*|.txn-archive) continue ;;
+        esac
+        cp -a "$f" "${CERT_TXN_BACKUP_DIR}/" 2>/dev/null || true
+    done
+
+    # 备份 config.env
+    if [[ -f "$STATE_FILE" ]]; then
+        cp -a "$STATE_FILE" "${CERT_TXN_BACKUP_DIR}/__state_config.env" 2>/dev/null || true
+    fi
+
+    CERT_TXN_DEPTH=1
+    # 安装 trap：INT/TERM 抓 Ctrl+C 与 kill；EXIT 兜底脚本异常退出
+    # 业务层 return 1 时需要显式调用 _cert_txn_rollback（trap 不会因 return 触发）
+    trap '_cert_txn_rollback $?; exit 130' INT
+    trap '_cert_txn_rollback $?; exit 143' TERM
+    trap '_cert_txn_rollback $?' EXIT
+    log_info "事务已开启：${CERT_TXN_LABEL}（backup: $(basename "$CERT_TXN_BACKUP_DIR")）"
+}
+
+cert_txn_commit() {
+    if [[ $CERT_TXN_DEPTH -le 0 ]]; then
+        return 0
+    fi
+    CERT_TXN_DEPTH=$((CERT_TXN_DEPTH - 1))
+    [[ $CERT_TXN_DEPTH -gt 0 ]] && return 0
+
+    CERT_TXN_COMMITTED=1
+    trap - EXIT INT TERM
+
+    if [[ -n "$CERT_TXN_BACKUP_DIR" && -d "$CERT_TXN_BACKUP_DIR" ]]; then
+        mkdir -p "$CERT_TXN_ARCHIVE_DIR" 2>/dev/null || true
+        chmod 700 "$CERT_TXN_ARCHIVE_DIR" 2>/dev/null || true
+
+        if mv "$CERT_TXN_BACKUP_DIR" "${CERT_TXN_ARCHIVE_DIR}/" 2>/dev/null; then
+            # 仅保留最近 N 份
+            local archives count
+            mapfile -t archives < <(ls -1dt "${CERT_TXN_ARCHIVE_DIR}"/.txn-* 2>/dev/null || true)
+            count=${#archives[@]}
+            if (( count > CERT_TXN_ARCHIVE_KEEP )); then
+                local i
+                for ((i = CERT_TXN_ARCHIVE_KEEP; i < count; i++)); do
+                    rm -rf "${archives[$i]}"
+                done
+            fi
+        else
+            # 归档失败就直接删除（不影响业务）
+            rm -rf "$CERT_TXN_BACKUP_DIR"
+        fi
+    fi
+
+    log_info "事务已提交：${CERT_TXN_LABEL}"
+    CERT_TXN_BACKUP_DIR=""
+    CERT_TXN_LABEL=""
+}
+
+_cert_txn_rollback() {
+    local exit_code="${1:-0}"
+
+    # 已 commit 不回滚
+    if [[ "$CERT_TXN_COMMITTED" == "1" ]]; then
+        return 0
+    fi
+
+    # 没有有效 snapshot 也不回滚
+    if [[ -z "$CERT_TXN_BACKUP_DIR" || ! -d "$CERT_TXN_BACKUP_DIR" ]]; then
+        CERT_TXN_DEPTH=0
+        return 0
+    fi
+
+    log_warn "事务回滚：${CERT_TXN_LABEL}（exit=${exit_code}）→ 还原 ${CF_CONFIG_DIR}"
+
+    # 1. 删除事务开始后新增的文件
+    local f base
+    for f in "${CF_CONFIG_DIR}"/* "${CF_CONFIG_DIR}"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        case "$base" in
+            .txn-*|.txn-archive) continue ;;
+        esac
+        if [[ ! -e "${CERT_TXN_BACKUP_DIR}/${base}" ]]; then
+            rm -rf "$f"
+        fi
+    done
+
+    # 2. 还原 backup 中的文件到原位
+    for f in "${CERT_TXN_BACKUP_DIR}"/* "${CERT_TXN_BACKUP_DIR}"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        [[ "$base" == "__state_config.env" ]] && continue
+        cp -a "$f" "${CF_CONFIG_DIR}/" 2>/dev/null || true
+    done
+
+    # 3. 还原 config.env
+    if [[ -f "${CERT_TXN_BACKUP_DIR}/__state_config.env" ]]; then
+        cp -a "${CERT_TXN_BACKUP_DIR}/__state_config.env" "$STATE_FILE" 2>/dev/null || true
+        chmod 600 "$STATE_FILE" 2>/dev/null || true
+    fi
+
+    log_info "回滚完成（snapshot 保留在 ${CERT_TXN_BACKUP_DIR}）"
+
+    # snapshot 留作事后审计，不删
+    CERT_TXN_DEPTH=0
+    CERT_TXN_BACKUP_DIR=""
+    CERT_TXN_LABEL=""
+    trap - EXIT INT TERM
+}
+
 # ── CF Token 验证（调用 Cloudflare API） ────────────────────
 # 用法: verify_cf_token <token> [<root_domain>]
 # 返回码:
@@ -448,7 +608,12 @@ setup_cf_accounts() {
                 echo "上次失败涉及账号: ${failed_account_indexes[*]}"
                 read -rp "是否只重新配置失败账号？[Y/n]: " reconf_failed
                 if [[ "${reconf_failed,,}" != "n" ]]; then
-                    reconfigure_cf_accounts "${failed_account_indexes[@]}"
+                    cert_txn_begin "setup_cf_accounts(failed)"
+                    if ! reconfigure_cf_accounts "${failed_account_indexes[@]}"; then
+                        _cert_txn_rollback 0
+                        return 1
+                    fi
+                    cert_txn_commit
                     log_info "其余 CF 账号配置保持不变"
                     return
                 fi
@@ -465,9 +630,14 @@ setup_cf_accounts() {
     read -rp "你有几个 Cloudflare 账号？[默认1]: " CF_ACCOUNT_COUNT
     CF_ACCOUNT_COUNT=${CF_ACCOUNT_COUNT:-1}
 
+    cert_txn_begin "setup_cf_accounts(all)"
     rm -f "${CF_CONFIG_DIR}"/cf_account_*.ini 2>/dev/null || true
     # shellcheck disable=SC2046
-    reconfigure_cf_accounts $(seq 1 "$CF_ACCOUNT_COUNT")
+    if ! reconfigure_cf_accounts $(seq 1 "$CF_ACCOUNT_COUNT"); then
+        _cert_txn_rollback 0
+        return 1
+    fi
+    cert_txn_commit
 }
 
 # ════════════════════════════════════════════════════════════
@@ -718,6 +888,8 @@ collect_domains() {
     log_step "配置域名信息"
     echo ""
 
+    cert_txn_begin "collect_domains"
+
     if load_domain_config; then
         log_info "发现已有域名配置："
         local _all _cdn _direct
@@ -764,6 +936,7 @@ collect_domains() {
             fi
 
             log_info "复用已有域名配置"
+            cert_txn_commit
             return
         fi
     fi
@@ -866,14 +1039,14 @@ collect_domains() {
 
     read -rp "确认以上配置？[Y/n]: " confirm
     if [[ "${confirm,,}" == "n" ]]; then
-        rm -f "${CF_CONFIG_DIR}"/domain_*.ini 2>/dev/null || true
-        save_state "DOMAIN_REGISTRY" ""
-        log_warn "重新配置域名..."
-        collect_domains
-        return
+        # 用户主动放弃 → 显式回滚还原干净后退出
+        log_warn "用户取消，正在回滚到事务开始前的状态..."
+        _cert_txn_rollback 0
+        return 1
     fi
 
     save_domain_config
+    cert_txn_commit
 }
 
 # ── 补充关联：为指定根域名列表重新选择 CF 账号 ──────────────
@@ -1370,6 +1543,8 @@ get_cf_account_by_domain() {
 add_domain_and_cert() {
     log_step "新增域名并申请证书"
 
+    cert_txn_begin "add_domain_and_cert"
+
     load_domain_state
     load_domain_config >/dev/null 2>&1 || true
 
@@ -1492,13 +1667,14 @@ add_domain_and_cert() {
                     done
                     local cf_choice _src_ini
                     read -rp "输入方括号内标识选择 CF 账号: " cf_choice
-                    [[ -z "$cf_choice" ]] && { log_error "未选择账号"; return 1; }
+                    [[ -z "$cf_choice" ]] && { log_error "未选择账号"; _cert_txn_rollback 0; return 1; }
 
                     _src_ini="${CF_CONFIG_DIR}/${cf_choice}.ini"
                     [[ -f "$_src_ini" ]] || _src_ini="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
 
                     [[ -f "$_src_ini" ]] || {
                         log_error "CF 账号文件不存在: ${_src_ini}"
+                        _cert_txn_rollback 0
                         return 1
                     }
                     _auto_ini="$_src_ini"
@@ -1529,6 +1705,10 @@ add_domain_and_cert() {
     rebuild_protocol_domains
     load_domain_state
     save_domain_config
+
+    # 域名/账号配置已落盘 → 提交事务
+    # 证书申请失败不应回滚已配置的域名（可后续单独重申）
+    cert_txn_commit
 
     # ── 为所有新域名申请证书 ────────────────────────────────
     for domain in "${new_domains[@]}"; do
