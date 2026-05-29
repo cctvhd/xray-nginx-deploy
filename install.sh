@@ -1026,6 +1026,7 @@ do_inst_naive() {
     fi
 
     install_naive
+    naive_record_forwardproxy_commit
     save_state "INST_NAIVE" "1"
 
     log_info "NaiveProxy 安装完成"
@@ -1312,7 +1313,7 @@ upgrade_component_label() {
         xray) echo "Xray" ;;
         singbox) echo "Sing-Box" ;;
         hysteria2) echo "Hysteria2" ;;
-        naive) echo "NaiveProxy" ;;
+        naive) echo "NaiveProxy(Caddy)" ;;
         all) echo "全部组件" ;;
         *) echo "$1" ;;
     esac
@@ -1350,7 +1351,7 @@ upgrade_remote_version() {
         singbox)   upgrade_apt_candidate sing-box ;;
         xray)      upgrade_github_latest XTLS/Xray-core ;;
         hysteria2) upgrade_github_latest apernet/hysteria ;;
-        naive)     upgrade_github_latest klzgrad/naiveproxy ;;
+        naive)     upgrade_github_latest caddyserver/caddy ;;
     esac
 }
 
@@ -1439,13 +1440,53 @@ upgrade_compiled_component() {
     load_os_info
     case "$component" in
         naive)
+            if naive_upgrade_up_to_date; then
+                log_info "Caddy 与 forwardproxy@naive 均为最新，跳过重新编译"
+                save_state "INST_NAIVE" "1"
+                return 0
+            fi
             load_module naive
             install_naive
+            naive_record_forwardproxy_commit
             restart_service_if_configured "caddy-naive.service" \
                 '[[ ! -f /etc/caddy-naive/Caddyfile ]] || /usr/local/bin/caddy-naive validate --config /etc/caddy-naive/Caddyfile >/dev/null 2>&1'
             save_state "INST_NAIVE" "1"
             ;;
     esac
+}
+
+# ── NaiveProxy(Caddy) 升级辅助：判定是否真的需要重新编译 ──
+# 两个上游：caddyserver/caddy（latest release tag）+ klzgrad/forwardproxy@naive（HEAD commit）
+# 任一变化即返回 1（需升级）；都未变返回 0（跳过）；网络失败时返回 1（保守触发编译）
+naive_upgrade_up_to_date() {
+    local current_caddy latest_caddy current_fp_commit latest_fp_commit
+    current_caddy=$(upgrade_command_version naive 2>/dev/null || true)
+    latest_caddy=$(upgrade_github_latest caddyserver/caddy 2>/dev/null || true)
+    current_fp_commit=$(get_state "FORWARDPROXY_NAIVE_COMMIT" "")
+    latest_fp_commit=$(curl -fsSL --max-time 5 \
+        "https://api.github.com/repos/klzgrad/forwardproxy/commits/naive" 2>/dev/null \
+        | grep -oP '"sha"\s*:\s*"\K[^"]+' | head -1 || true)
+
+    local cur_fp_short="${current_fp_commit:0:12}" lat_fp_short="${latest_fp_commit:0:12}"
+    log_info "Caddy: 当前=${current_caddy:-未知} 最新=${latest_caddy:-未知}"
+    log_info "forwardproxy@naive: 当前=${cur_fp_short:-未知} 最新=${lat_fp_short:-未知}"
+
+    [[ -z "$current_caddy" || -z "$latest_caddy" || -z "$latest_fp_commit" ]] && return 1
+    [[ "$current_caddy" != "$latest_caddy" ]] && return 1
+    [[ "$current_fp_commit" != "$latest_fp_commit" ]] && return 1
+    return 0
+}
+
+# 编译成功后记录 forwardproxy@naive 的 HEAD commit，作为下次比对的基线
+naive_record_forwardproxy_commit() {
+    local sha
+    sha=$(curl -fsSL --max-time 5 \
+        "https://api.github.com/repos/klzgrad/forwardproxy/commits/naive" 2>/dev/null \
+        | grep -oP '"sha"\s*:\s*"\K[^"]+' | head -1 || true)
+    if [[ -n "$sha" ]]; then
+        save_state "FORWARDPROXY_NAIVE_COMMIT" "$sha"
+        log_info "已记录 forwardproxy@naive commit: ${sha:0:12}"
+    fi
 }
 
 run_upgrade_component() {
