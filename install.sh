@@ -254,9 +254,57 @@ register_domain() {
     fi
 }
 
+# ── 解析协议槽位的主域名 ────────────────────────────────────
+# 用法: _resolve_protocol_primary <slot> <候选1> [<候选2> ...]
+# 0 候选 → 清空 + 输出空
+# 1 候选 → 用之 + 设 DOMAIN_PRIMARY_<slot>
+# 2+ 候选 → 优先用现有 DOMAIN_PRIMARY_<slot>（如仍在候选里），
+#           否则用最后一个（最新注册），log_warn 提示用户
+# 注意: 所有日志写 stderr，stdout 仅输出选中的域名
+_resolve_protocol_primary() {
+    local slot="$1"; shift
+    local -a cands=("$@")
+    local primary_key="DOMAIN_PRIMARY_${slot}"
+    local current chosen
+
+    if [[ ${#cands[@]} -eq 0 ]]; then
+        save_state "$primary_key" ""
+        echo ""
+        return
+    fi
+
+    if [[ ${#cands[@]} -eq 1 ]]; then
+        save_state "$primary_key" "${cands[0]}"
+        echo "${cands[0]}"
+        return
+    fi
+
+    # 多候选：先看是否已显式指定 PRIMARY 且仍在候选里
+    current=$(get_state "$primary_key" "")
+    if [[ -n "$current" ]]; then
+        local c
+        for c in "${cands[@]}"; do
+            if [[ "$c" == "$current" ]]; then
+                echo "$current"
+                return
+            fi
+        done
+    fi
+
+    # 退回到最后一个候选（最新注册）
+    chosen="${cands[-1]}"
+    log_warn "协议槽位 ${slot} 有多个候选: ${cands[*]}" >&2
+    log_warn "  未指定 DOMAIN_PRIMARY_${slot} 或已失效，自动选择最新: ${chosen}" >&2
+    log_warn "  如需改主域名，可在编辑器或重配置时显式指定" >&2
+    save_state "$primary_key" "$chosen"
+    echo "$chosen"
+}
+
 rebuild_protocol_domains() {
-    local registry xhttp_domain="" grpc_domain="" reality_domain="" anytls_domain="" hyst_domain="" naive_domain=""
+    local registry
     local all_d="" cdn_d="" direct_d=""
+    local -a xray_cdn_cands=() xray_direct_cands=()
+    local -a singbox_cands=() hyst_cands=() naive_cands=()
 
     registry=$(get_state "DOMAIN_REGISTRY" "")
 
@@ -276,32 +324,33 @@ rebuild_protocol_domains() {
 
         if [[ "$protocols" == *"xray"* ]]; then
             if [[ "$mode" == "cdn" ]]; then
-                xhttp_domain="${domain}"
-                [[ -z "$grpc_domain" ]] && grpc_domain="${domain}"
+                xray_cdn_cands+=("$domain")
             else
-                reality_domain="${domain}"
+                xray_direct_cands+=("$domain")
             fi
         fi
-        if [[ "$protocols" == *"singbox"* ]]; then
-            anytls_domain="${domain}"
-        fi
-        if [[ "$protocols" == *"hysteria2"* ]]; then
-            hyst_domain="${domain}"
-        fi
-        if [[ "$protocols" == *"naiveproxy"* ]]; then
-            naive_domain="${domain}"
-        fi
+        [[ "$protocols" == *"singbox"*   ]] && singbox_cands+=("$domain")
+        [[ "$protocols" == *"hysteria2"* ]] && hyst_cands+=("$domain")
+        [[ "$protocols" == *"naiveproxy"* ]] && naive_cands+=("$domain")
     done
 
-    save_state "ALL_DOMAINS" "$all_d"
-    save_state "CDN_DOMAINS" "$cdn_d"
+    local xhttp_domain grpc_domain reality_domain anytls_domain hyst_domain naive_domain
+    xhttp_domain=$(_resolve_protocol_primary "XRAY_CDN"    "${xray_cdn_cands[@]}")
+    grpc_domain="$xhttp_domain"   # 同槽位
+    reality_domain=$(_resolve_protocol_primary "XRAY_DIRECT" "${xray_direct_cands[@]}")
+    anytls_domain=$(_resolve_protocol_primary "SINGBOX"      "${singbox_cands[@]}")
+    hyst_domain=$(_resolve_protocol_primary   "HYSTERIA2"    "${hyst_cands[@]}")
+    naive_domain=$(_resolve_protocol_primary  "NAIVEPROXY"   "${naive_cands[@]}")
+
+    save_state "ALL_DOMAINS"    "$all_d"
+    save_state "CDN_DOMAINS"    "$cdn_d"
     save_state "DIRECT_DOMAINS" "$direct_d"
-    save_state "XHTTP_DOMAIN" "$xhttp_domain"
-    save_state "GRPC_DOMAIN" "$grpc_domain"
-    save_state "REALITY_DOMAIN" "$reality_domain"
-    save_state "ANYTLS_DOMAIN" "$anytls_domain"
+    save_state "XHTTP_DOMAIN"     "$xhttp_domain"
+    save_state "GRPC_DOMAIN"      "$grpc_domain"
+    save_state "REALITY_DOMAIN"   "$reality_domain"
+    save_state "ANYTLS_DOMAIN"    "$anytls_domain"
     save_state "HYSTERIA2_DOMAIN" "$hyst_domain"
-    save_state "NAIVE_DOMAIN" "$naive_domain"
+    save_state "NAIVE_DOMAIN"     "$naive_domain"
 }
 
 load_domain_state() {
