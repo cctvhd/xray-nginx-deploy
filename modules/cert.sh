@@ -1161,6 +1161,24 @@ _domain_editor_loop() {
                 _editor_delete_domain "${domains_arr[$((extra - 1))]}"
                 ;;
             s)
+                # Preflight 互锁：保存前提前发现冲突，避免 do_conf_* 阶段才被挡
+                # rebuild_protocol_domains 还未在编辑器内运行，这里先用 state 现状跑一遍
+                local _editor_save_force="no"
+                if declare -F preflight_config_check &>/dev/null; then
+                    sync_restore_domain_arrays 2>/dev/null || true
+                    if ! preflight_config_check "domain_editor"; then
+                        echo ""
+                        log_warn "保存前预检失败。选项："
+                        echo "  f - 强制保存（state 会写入冲突状态，后续 do_conf_* 仍会被预检挡下）"
+                        echo "  c - 继续编辑（推荐：先修复冲突再保存）"
+                        local _force_ans
+                        read -rp "  选择 [f/c]: " _force_ans
+                        case "${_force_ans,,}" in
+                            f) _editor_save_force="yes" ;;
+                            *) continue ;;
+                        esac
+                    fi
+                fi
                 return 0
                 ;;
             q)

@@ -300,6 +300,361 @@ _resolve_protocol_primary() {
     echo "$chosen"
 }
 
+# ════════════════════════════════════════════════════════════
+# Preflight 配置健康互锁（5 项检查 + 软警告）
+# ════════════════════════════════════════════════════════════
+# 纯函数：只读 state，stderr 输出诊断，stdout 不污染
+# 返回: 0 = 全过；非 0 = 至少一项硬失败
+# 用法: preflight_config_check [<context>]
+#       <context> 仅用于错误信息标注调用阶段（do_conf_nginx 等）
+#
+# 设计原则：
+# - 任何 *_DOMAIN 为空时跳过对应槽位（首次安装/未启用不应阻塞）
+# - Check 1 / 2 / 3 / 4a / 4c / 5b/c/d → 硬失败
+# - Check 5a (domain_map.conf 漂移) → 软警告
+
+_PREFLIGHT_FAIL_COUNT=0
+_PREFLIGHT_WARN_COUNT=0
+
+_preflight_fail() {
+    # args: title, detail, impact, fix
+    echo "" >&2
+    echo -e "${RED}[PREFLIGHT FAIL]${NC} $1" >&2
+    echo "  $2" >&2
+    echo "  影响：$3" >&2
+    echo "  修复：$4" >&2
+    _PREFLIGHT_FAIL_COUNT=$((_PREFLIGHT_FAIL_COUNT + 1))
+}
+
+_preflight_warn() {
+    echo "" >&2
+    echo -e "${YELLOW}[PREFLIGHT WARN]${NC} $1" >&2
+    echo "  $2" >&2
+    echo "  影响：$3" >&2
+    echo "  建议：$4" >&2
+    _PREFLIGHT_WARN_COUNT=$((_PREFLIGHT_WARN_COUNT + 1))
+}
+
+# Check 1: nginx stream map SNI 唯一性（数据驱动）
+# stream_slots 表列出所有进入 ssl_preread 路由表的槽位
+# compatible_pairs 表列出允许同 SNI 的槽位对（架构上能合并的）
+_preflight_check_sni_uniqueness() {
+    local -a stream_slots=(
+        "xray-xhttp:XHTTP_DOMAIN"
+        "xray-grpc:GRPC_DOMAIN"
+        "anytls:ANYTLS_DOMAIN"
+        "naive:NAIVE_DOMAIN"
+    )
+    # 同 SNI 允许的槽位对（双向）—— 当前架构会合并到同一 server 块
+    local -a compatible_pairs=(
+        "xray-xhttp:xray-grpc"
+    )
+
+    declare -A _compat=()
+    local pair a b
+    for pair in "${compatible_pairs[@]}"; do
+        a="${pair%:*}"; b="${pair#*:}"
+        _compat["${a}|${b}"]=1
+        _compat["${b}|${a}"]=1
+    done
+
+    declare -A _dom_slots=()
+    local entry slot var domain
+    for entry in "${stream_slots[@]}"; do
+        slot="${entry%:*}"; var="${entry#*:}"
+        domain="${!var:-}"
+        domain="${domain,,}"
+        [[ -z "$domain" ]] && continue
+        _dom_slots["$domain"]+="${slot} "
+    done
+
+    local d slots_str
+    for d in "${!_dom_slots[@]}"; do
+        slots_str="${_dom_slots[$d]}"
+        local -a slots_arr
+        read -ra slots_arr <<< "$slots_str"
+        (( ${#slots_arr[@]} < 2 )) && continue
+
+        local i j ok=true
+        for ((i=0; i<${#slots_arr[@]}; i++)); do
+            for ((j=i+1; j<${#slots_arr[@]}; j++)); do
+                if [[ -z "${_compat["${slots_arr[i]}|${slots_arr[j]}"]:-}" ]]; then
+                    ok=false; break 2
+                fi
+            done
+        done
+        if ! $ok; then
+            _preflight_fail \
+                "Check 1: SNI 唯一性冲突" \
+                "域名 ${d} 同时分配给槽位: ${slots_arr[*]}" \
+                "nginx stream map 同 key 多目标，nginx -t 失败" \
+                "去域名编辑器，让冲突槽位指向不同域名"
+        fi
+    done
+}
+
+# Check 2: Reality SNI 污染
+# REALITY_DOMAIN + REALITY_SERVER_NAMES[*] 全部会被 nginx stream map 路由到 9443
+# 不能与四个业务域名重合
+_preflight_check_reality_pollution() {
+    local -a own_domains=(
+        "${XHTTP_DOMAIN:-}"
+        "${GRPC_DOMAIN:-}"
+        "${ANYTLS_DOMAIN:-}"
+        "${NAIVE_DOMAIN:-}"
+    )
+    local -a reality_snis=()
+    [[ -n "${REALITY_DOMAIN:-}" ]] && reality_snis+=("${REALITY_DOMAIN}")
+
+    if declare -p REALITY_SERVER_NAMES &>/dev/null; then
+        local sn
+        for sn in "${REALITY_SERVER_NAMES[@]:-}"; do
+            [[ -n "$sn" ]] && reality_snis+=("$sn")
+        done
+    fi
+    (( ${#reality_snis[@]} == 0 )) && return 0
+
+    local r d r_lc d_lc
+    for r in "${reality_snis[@]}"; do
+        r_lc="${r,,}"
+        for d in "${own_domains[@]}"; do
+            [[ -z "$d" ]] && continue
+            d_lc="${d,,}"
+            if [[ "$r_lc" == "$d_lc" ]]; then
+                _preflight_fail \
+                    "Check 2: Reality SNI 污染" \
+                    "${d} 既是 Reality SNI（serverNames/REALITY_DOMAIN），又是用户业务域名" \
+                    "nginx stream map 同 SNI 双值（既路由到 9443 又路由到 CDN/直连后端）" \
+                    "重配 Reality 选不同的公共 SNI；或在域名编辑器移走该业务域名"
+                break    # 同一个 reality SNI 只报一次，避免 XHTTP==GRPC 时重复
+            fi
+        done
+    done
+}
+
+# Check 3: XHTTP_PATH 与 gRPC location 冲突
+_preflight_check_xhttp_path() {
+    [[ -z "${XHTTP_PATH:-}" ]] && return 0
+
+    if [[ "${XHTTP_PATH}" != /* ]]; then
+        _preflight_fail \
+            "Check 3: XHTTP_PATH 格式错误" \
+            "XHTTP_PATH=${XHTTP_PATH} 必须以 / 开头" \
+            "nginx location 解析失败，xhttp 入口不可用" \
+            "删除 state 中 XHTTP_PATH 后重跑配置 Xray，会自动重新生成"
+    fi
+    if [[ "${XHTTP_PATH}" == "/" ]]; then
+        _preflight_fail \
+            "Check 3: XHTTP_PATH 太宽" \
+            "XHTTP_PATH=/ 会拦截所有路径" \
+            "fallback 站点和 _fake 路径都被吞掉，业务异常" \
+            "删除 state 中 XHTTP_PATH 后重跑配置 Xray"
+    fi
+    if [[ "${XHTTP_PATH}" == /grpc.Service* ]]; then
+        _preflight_fail \
+            "Check 3: XHTTP_PATH 与 gRPC 路径冲突" \
+            "XHTTP_PATH=${XHTTP_PATH} 以 /grpc.Service 开头" \
+            "同域名场景下 nginx 最长前缀匹配会让 location /grpc.Service 抢走 xhttp 流量" \
+            "删除 state 中 XHTTP_PATH 后重跑配置 Xray"
+    fi
+    if (( ${#XHTTP_PATH} < 8 )); then
+        _preflight_warn \
+            "Check 3: XHTTP_PATH 长度可疑" \
+            "XHTTP_PATH=${XHTTP_PATH}（长度 ${#XHTTP_PATH}）" \
+            "正常自动生成的 UUID 路径长度 ≥ 33；过短可能是手动改动" \
+            "如需重置，删除 state 中 XHTTP_PATH 后重跑配置 Xray"
+    fi
+}
+
+# Check 4a: 内部端口常量两两不同（防御性）
+# 关联数组 key 重复会被 bash 静默覆盖，count 偏离 11 即异常
+_preflight_check_internal_ports() {
+    declare -A _internal_ports=(
+        [8001]="xray vless-xhttp-cdn"
+        [8002]="xray vless-grpc-cdn"
+        [8443]="sing-box anytls"
+        [8444]="caddy-naive"
+        [9443]="xray reality-direct"
+        [10080]="nginx fallback"
+        [18443]="nginx middle->anytls"
+        [18444]="nginx middle->naive"
+        [20443]="nginx xhttp ssl"
+        [20445]="nginx grpc ssl"
+        [20880]="nginx SNI trap"
+    )
+    if (( ${#_internal_ports[@]} != 11 )); then
+        _preflight_fail \
+            "Check 4a: 内部端口表数量异常" \
+            "期望 11 个端口，实际 ${#_internal_ports[@]} 个 —— 可能某两个常量被改成同值" \
+            "nginx upstream / proxy_pass 会指向错误后端，整个栈不可用" \
+            "检查 modules/{nginx,xray,singbox,naive}.sh 中的端口常量"
+    fi
+}
+
+# Check 4c: 用户可配置端口（HYSTERIA2_PORT + 端口跳跃区间）冲突
+# 注：Hysteria2 使用 UDP，与本工具内部的 TCP 端口（8001/8002/8443/8444 等）
+# 协议不同，不构成端口冲突，因此不检测端口跳跃区间是否覆盖内部端口。
+_preflight_check_user_ports() {
+    [[ -z "${HYSTERIA2_PORT:-}" ]] && return 0
+
+    # 端口越界硬失败；特权端口 (<1024) 仅软警告（Hysteria 以 root 运行可绑定）
+    if ! [[ "${HYSTERIA2_PORT}" =~ ^[0-9]+$ ]] || (( HYSTERIA2_PORT < 1 || HYSTERIA2_PORT > 65535 )); then
+        _preflight_fail \
+            "Check 4c: HYSTERIA2_PORT 越界" \
+            "HYSTERIA2_PORT=${HYSTERIA2_PORT}，期望范围 1-65535" \
+            "Hysteria2 无法绑定该端口" \
+            "重配 Hysteria2 选 1-65535 范围内的端口"
+    elif (( HYSTERIA2_PORT < 1024 )); then
+        _preflight_warn \
+            "Check 4c: HYSTERIA2_PORT 为特权端口" \
+            "HYSTERIA2_PORT=${HYSTERIA2_PORT} (<1024)" \
+            "需要 root 权限；如以非特权用户运行会绑定失败。默认 443 属此类，systemd 服务以 root 启动正常" \
+            "若以非 root 运行，改用 ≥1024 的端口"
+    fi
+
+    # Hysteria2 是 UDP，与本工具内部 TCP 端口不构成协议层冲突，不检测内部端口区间
+
+    if [[ -n "${HYSTERIA2_PH_START:-}" && -n "${HYSTERIA2_PH_END:-}" ]]; then
+        local s="${HYSTERIA2_PH_START}" e="${HYSTERIA2_PH_END}"
+        if ! [[ "$s" =~ ^[0-9]+$ ]] || ! [[ "$e" =~ ^[0-9]+$ ]]; then
+            _preflight_fail \
+                "Check 4c: HYSTERIA2 端口跳跃区间格式错误" \
+                "HYSTERIA2_PH_START=${s} HYSTERIA2_PH_END=${e}（非数字）" \
+                "Hysteria2 配置生成失败" \
+                "重配 Hysteria2 端口跳跃，输入数字端口"
+        else
+            if (( s >= e )); then
+                _preflight_fail \
+                    "Check 4c: HYSTERIA2 端口跳跃区间无效" \
+                    "HYSTERIA2_PH_START=${s} 应小于 HYSTERIA2_PH_END=${e}" \
+                    "Hysteria2 服务无法启动" \
+                    "重配 Hysteria2 端口跳跃，确保 START < END"
+            fi
+            if (( s < 1 || e > 65535 )); then
+                _preflight_fail \
+                    "Check 4c: HYSTERIA2 端口跳跃区间越界" \
+                    "端口跳跃区间 ${s}-${e} 超出 1-65535" \
+                    "Hysteria2 无法绑定越界端口" \
+                    "调整端口跳跃区间到 1-65535"
+            fi
+            # 主端口落在跳跃区间内会导致 listen 重复绑定
+            if (( HYSTERIA2_PORT >= s && HYSTERIA2_PORT <= e )); then
+                _preflight_fail \
+                    "Check 4c: HYSTERIA2_PORT 落在跳跃区间内" \
+                    "HYSTERIA2_PORT=${HYSTERIA2_PORT} 在端口跳跃区间 ${s}-${e} 内" \
+                    "Hysteria2 listen 配置会重复绑定同一端口，启动失败" \
+                    "主端口应在跳跃区间之外"
+            fi
+        fi
+    fi
+}
+
+# Check 5b/c/d: state 内部一致性
+_preflight_check_state_consistency() {
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+
+    # 5b: 注册表里每个域名都有非空 DOMAIN_PROTO_<suffix>
+    local d suffix proto
+    for d in $registry; do
+        suffix=$(_domain_state_suffix "$d")
+        proto=$(get_state "DOMAIN_PROTO_${suffix}" "")
+        if [[ -z "$proto" ]]; then
+            _preflight_fail \
+                "Check 5b: 域名注册表悬空" \
+                "DOMAIN_REGISTRY 含 ${d}，但 DOMAIN_PROTO_${suffix} 为空" \
+                "rebuild_protocol_domains 会跳过该域名，下游协议变量异常" \
+                "在域名编辑器删除并重新添加 ${d}"
+        fi
+    done
+
+    # 5c: 每个非空 *_DOMAIN 都在 DOMAIN_REGISTRY 里
+    local -a expected=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN)
+    local var dom
+    for var in "${expected[@]}"; do
+        dom="${!var:-}"
+        [[ -z "$dom" ]] && continue
+        if ! echo " $registry " | grep -qF " $dom "; then
+            _preflight_fail \
+                "Check 5c: 协议域名未注册" \
+                "${var}=${dom}，但 ${dom} 不在 DOMAIN_REGISTRY 中" \
+                "下次 rebuild_protocol_domains 会清空该协议域名" \
+                "在域名编辑器添加 ${dom} 并指定协议"
+        fi
+    done
+
+    # 5d: DOMAIN_PRIMARY_* 指向已注册域名
+    local -a primary_keys=(
+        "DOMAIN_PRIMARY_XRAY_CDN"
+        "DOMAIN_PRIMARY_XRAY_DIRECT"
+        "DOMAIN_PRIMARY_SINGBOX"
+        "DOMAIN_PRIMARY_HYSTERIA2"
+        "DOMAIN_PRIMARY_NAIVEPROXY"
+    )
+    local key val
+    for key in "${primary_keys[@]}"; do
+        val=$(get_state "$key" "")
+        [[ -z "$val" ]] && continue
+        if ! echo " $registry " | grep -qF " $val "; then
+            _preflight_fail \
+                "Check 5d: 协议主域名指向已注销域名" \
+                "${key}=${val}，但不在 DOMAIN_REGISTRY 中" \
+                "_resolve_protocol_primary 会回退到最新候选或清空，造成意外切换" \
+                "在域名编辑器重新指定该槽位的主域名"
+        fi
+    done
+}
+
+# Check 5a: domain_map.conf 漂移（软警告）
+_preflight_check_domain_map_drift() {
+    local map_file="/etc/cloudflare/domain_map.conf"
+    [[ -f "$map_file" ]] || return 0
+
+    local -a vars=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN)
+    local var state_val map_val drifted=""
+    for var in "${vars[@]}"; do
+        state_val="${!var:-}"
+        map_val=$(grep "^${var}=" "$map_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'\"")
+        if [[ "$state_val" != "$map_val" ]]; then
+            drifted+=" ${var}(state='${state_val}' map='${map_val}')"
+        fi
+    done
+    if [[ -n "$drifted" ]]; then
+        _preflight_warn \
+            "Check 5a: domain_map.conf 漂移" \
+            "STATE 与 ${map_file} 不一致：${drifted}" \
+            "运行时使用 STATE，domain_map.conf 仅作恢复镜像；漂移不影响当前运行" \
+            "如需同步，重跑 SSL 证书申请，或重新走域名编辑器保存"
+    fi
+}
+
+preflight_config_check() {
+    local context="${1:-}"
+    _PREFLIGHT_FAIL_COUNT=0
+    _PREFLIGHT_WARN_COUNT=0
+
+    _preflight_check_sni_uniqueness
+    _preflight_check_reality_pollution
+    _preflight_check_xhttp_path
+    _preflight_check_internal_ports
+    _preflight_check_user_ports
+    _preflight_check_state_consistency
+    _preflight_check_domain_map_drift
+
+    echo "" >&2
+    if (( _PREFLIGHT_FAIL_COUNT > 0 )); then
+        echo -e "${RED}[PREFLIGHT]${NC} ${_PREFLIGHT_FAIL_COUNT} 项硬失败${context:+（${context} 阶段）}，已阻止配置生成" >&2
+        echo -e "${RED}[PREFLIGHT]${NC} 修复入口：菜单 → 申请 SSL 证书 → 编辑域名" >&2
+        return 1
+    fi
+    if (( _PREFLIGHT_WARN_COUNT > 0 )); then
+        echo -e "${YELLOW}[PREFLIGHT]${NC} ${_PREFLIGHT_WARN_COUNT} 项软警告${context:+（${context} 阶段）}，配置已继续生成" >&2
+    else
+        echo -e "${GREEN:-}[PREFLIGHT]${NC:-} 全部检查通过${context:+（${context} 阶段）}" >&2
+    fi
+    return 0
+}
+
 rebuild_protocol_domains() {
     local registry
     local all_d="" cdn_d="" direct_d=""
@@ -351,6 +706,16 @@ rebuild_protocol_domains() {
     save_state "ANYTLS_DOMAIN"    "$anytls_domain"
     save_state "HYSTERIA2_DOMAIN" "$hyst_domain"
     save_state "NAIVE_DOMAIN"     "$naive_domain"
+
+    # 派生完成后将本地变量同步到当前 shell，preflight 才能看到最新值
+    XHTTP_DOMAIN="$xhttp_domain"
+    GRPC_DOMAIN="$grpc_domain"
+    REALITY_DOMAIN="$reality_domain"
+    ANYTLS_DOMAIN="$anytls_domain"
+    HYSTERIA2_DOMAIN="$hyst_domain"
+    NAIVE_DOMAIN="$naive_domain"
+    # 软诊断：rebuild 不阻塞调用方（修复流程可能正处中间状态），仅打印
+    preflight_config_check "rebuild_protocol_domains" || true
 }
 
 load_domain_state() {
@@ -1122,6 +1487,11 @@ do_conf_nginx() {
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
+    if ! preflight_config_check "do_conf_nginx"; then
+        done_return
+        return
+    fi
+
     load_module nginx
     create_nginx_dirs
     generate_fake_site "/var/www/html" "Welcome"
@@ -1179,6 +1549,11 @@ do_conf_xray() {
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
+    if ! preflight_config_check "do_conf_xray"; then
+        done_return
+        return
+    fi
+
     generate_xray_params
     collect_reality_params
     generate_xray_config
@@ -1229,6 +1604,11 @@ do_conf_singbox() {
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
 
+    if ! preflight_config_check "do_conf_singbox"; then
+        done_return
+        return
+    fi
+
     _ensure_wgcf
 
     load_module singbox
@@ -1264,6 +1644,12 @@ do_conf_hysteria2() {
 
     load_os_info
     restore_domain_arrays
+
+    if ! preflight_config_check "do_conf_hysteria2"; then
+        done_return
+        return
+    fi
+
     load_module hysteria2
     configure_hysteria2
 
@@ -1304,6 +1690,12 @@ do_conf_naive() {
 
     load_os_info
     restore_domain_arrays
+
+    if ! preflight_config_check "do_conf_naive"; then
+        done_return
+        return
+    fi
+
     load_module naive
     configure_naive || return
 
@@ -1328,6 +1720,21 @@ do_reconf_naive() {
     log_info "NaiveProxy 配置清理完成，开始重新生成..."
 
     do_conf_naive
+}
+
+do_preflight_report() {
+    load_os_info
+    restore_domain_arrays 2>/dev/null || true
+    echo ""
+    log_step "配置健康检查（preflight）"
+    if preflight_config_check "manual_report"; then
+        echo ""
+        log_info "结果：通过"
+    else
+        echo ""
+        log_warn "结果：有硬失败项，请按上述提示修复后再运行 do_conf_*"
+    fi
+    done_return
 }
 
 do_client() {
@@ -2281,6 +2688,7 @@ main_menu_loop() {
         echo "  === 其他 ==="
         echo "  a. 生成客户端链接"
         echo "  b. 查看当前状态"
+        echo "  c. 检查配置健康（preflight）"
         echo "  s. 同步/更新模块到本地缓存"
         echo "  v. 升级组件（后台运行）"
         echo "  w. 配置 WARP WireGuard 凭证（步骤 11/12 的前置依赖）"
@@ -2320,6 +2728,7 @@ main_menu_loop() {
                 run_menu_action "查看状态" show_status
                 read -rp "按回车返回主菜单..." _
                 ;;
+            c|C) run_menu_action "配置健康检查"   do_preflight_report ;;
             s|S) run_menu_action "同步模块"        do_sync_modules ;;
             v|V) run_menu_action "升级组件"        do_upgrade_menu ;;
             w|W) run_menu_action "配置 WARP"       do_warp ;;
