@@ -1528,12 +1528,13 @@ run_upgrade_component() {
 
 start_upgrade_job() {
     local component="$1"
-    local label session log_file status_file runner script_path runner_script
+    local label session log_file status_file pid_file runner script_path runner_script
 
     label=$(upgrade_component_label "$component")
     session="xray-upgrade-${component}"
     log_file="/var/log/xray-deploy/upgrade-${component}-$(date +%Y%m%d%H%M%S).log"
     status_file="/var/log/xray-deploy/upgrade-${component}.status"
+    pid_file="/var/log/xray-deploy/upgrade-${component}.pid"
     runner="/tmp/xray-deploy-upgrade-${component}-$$.sh"
     script_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
@@ -1550,6 +1551,7 @@ start_upgrade_job() {
 # 此 set -euo pipefail 属于独立的后台 runner 子脚本（写入 \$runner），
 # 与本文件顶部第 2 行的 set -euo pipefail 是两个进程，互不影响。
 set -euo pipefail
+echo \$\$ > "$pid_file"
 exec >>"$log_file" 2>&1
 finish() {
     local code="\$?"
@@ -1560,12 +1562,12 @@ finish() {
         echo "FAILED $label \$(date '+%F %T') code=\$code log=$log_file" > "$status_file"
         echo "[ERROR] 升级任务失败: $label (exit=\$code)"
     fi
-    rm -f "$runner"
+    rm -f "$pid_file" "$runner"
 }
 trap finish EXIT
-echo "[INFO] 升级任务启动: $label"
+echo "[INFO] 升级任务启动: $label (PID=\$\$)"
 echo "[INFO] 日志文件: $log_file"
-echo "RUNNING $label \$(date '+%F %T') log=$log_file" > "$status_file"
+echo "RUNNING $label \$(date '+%F %T') log=$log_file pid=\$\$" > "$status_file"
 $runner_script
 echo "[INFO] 升级任务结束: $label"
 RUNNER
@@ -1581,6 +1583,92 @@ RUNNER
     fi
     log_info "升级日志: ${log_file}"
     log_info "状态文件: ${status_file}"
+
+    upgrade_job_initial_feedback "$component" "$label" "$log_file" "$status_file" "$pid_file"
+}
+
+upgrade_job_is_alive() {
+    local pid_file="$1"
+    [[ -f "$pid_file" ]] || return 1
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+upgrade_job_initial_feedback() {
+    local component="$1" label="$2" log_file="$3" status_file="$4" pid_file="$5"
+    local i=0
+    # 等待 runner 写入 PID 与首行日志（最多 5 秒）
+    while [[ $i -lt 10 ]]; do
+        [[ -f "$pid_file" && -f "$log_file" ]] && break
+        sleep 0.5
+        i=$((i+1))
+    done
+
+    echo ""
+    echo -e "${BLUE}================ ${label} 任务启动反馈 ================${NC}"
+    if upgrade_job_is_alive "$pid_file"; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null || echo "?")
+        echo -e "  运行状态: ${GREEN}RUNNING${NC} (PID=${pid})"
+    elif [[ -f "$status_file" ]]; then
+        echo "  运行状态: $(cat "$status_file")"
+    else
+        echo -e "  运行状态: ${YELLOW}尚未写入 PID/状态，可能仍在初始化${NC}"
+    fi
+    echo ""
+    echo "  实时跟踪: tail -f ${log_file}"
+    echo "  快速查询: cat ${status_file}"
+    echo "  菜单跟踪: 主菜单 → v → t（实时跟踪，Ctrl+C 仅退出查看）"
+    echo ""
+    echo -e "${BLUE}---------------- 当前日志（最后 20 行）----------------${NC}"
+    if [[ -f "$log_file" ]]; then
+        tail -n 20 "$log_file" 2>/dev/null || true
+    else
+        echo "  （日志尚未生成，稍候片刻可用上面的 tail 命令查看）"
+    fi
+    echo -e "${BLUE}-------------------------------------------------------${NC}"
+}
+
+tail_upgrade_log() {
+    local status_dir="/var/log/xray-deploy"
+    local latest_log component status_file pid_file
+
+    if ! compgen -G "${status_dir}/upgrade-*.log" >/dev/null; then
+        log_warn "暂无升级日志"
+        return
+    fi
+
+    latest_log=$(ls -t "${status_dir}"/upgrade-*.log 2>/dev/null | head -1)
+    component=$(basename "$latest_log" | sed -E 's/^upgrade-([^-]+)-.*\.log$/\1/')
+    status_file="${status_dir}/upgrade-${component}.status"
+    pid_file="${status_dir}/upgrade-${component}.pid"
+
+    echo ""
+    echo -e "${BLUE}================ 实时跟踪升级日志 ================${NC}"
+    echo "  组件: ${component}"
+    echo "  日志: ${latest_log}"
+    [[ -f "$status_file" ]] && echo "  状态: $(cat "$status_file")"
+    echo ""
+
+    if upgrade_job_is_alive "$pid_file"; then
+        echo -e "  ${GREEN}任务运行中${NC}，按 ${YELLOW}Ctrl+C${NC} 退出查看（不会终止后台任务）"
+        echo ""
+        sleep 1
+        trap : INT
+        tail -n 50 -f "$latest_log" || true
+        trap - INT
+        echo ""
+        if [[ -f "$status_file" ]]; then
+            echo "  最新状态: $(cat "$status_file")"
+        fi
+    else
+        echo -e "  ${YELLOW}任务已结束${NC}，显示最终日志（最后 80 行）"
+        echo ""
+        tail -n 80 "$latest_log" 2>/dev/null || true
+    fi
+    echo ""
 }
 
 show_upgrade_status() {
@@ -1648,6 +1736,7 @@ do_upgrade_menu() {
     upgrade_menu_line 5 "NaiveProxy" naive
     echo "  6. 全部升级（仅升级有更新的组件）"
     echo "  l. 查看最近升级状态/日志"
+    echo "  t. 实时跟踪最近一次升级（tail -f）"
     echo "  q. 返回主菜单"
     echo ""
     echo "  升级会在 screen 或 nohup 后台运行，SSH 断开不影响任务。"
@@ -1666,6 +1755,11 @@ do_upgrade_menu() {
         6) component="all" ;;
         l|L)
             show_upgrade_status
+            done_return
+            return
+            ;;
+        t|T)
+            tail_upgrade_log
             done_return
             return
             ;;
