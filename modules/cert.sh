@@ -166,6 +166,227 @@ rebuild_cf_ini_files() {
     done
 }
 
+# ── CF Token 验证（调用 Cloudflare API） ────────────────────
+# 用法: verify_cf_token <token> [<root_domain>]
+# 返回码:
+#   0 = Token 有效且（如给了根域名）能访问该 Zone
+#   1 = Token 无效（401 / success:false / 4xx）
+#   2 = 网络错误（curl 失败 / 超时 / 5xx / 空响应）
+#   3 = Token 有效，但无法访问指定根域名的 Zone（result 为空）
+verify_cf_token() {
+    local token="$1" root_domain="${2:-}"
+    local resp body http_code curl_rc
+
+    # ── 第一步：/user/tokens/verify ──
+    resp=$(curl -sS --max-time 5 \
+        -H "Authorization: Bearer ${token}" \
+        -w $'\n%{http_code}' \
+        "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null) || curl_rc=$?
+    curl_rc="${curl_rc:-0}"
+
+    if [[ "$curl_rc" -ne 0 || -z "$resp" ]]; then
+        return 2
+    fi
+
+    http_code=$(printf '%s\n' "$resp" | tail -n1)
+    body=$(printf '%s\n' "$resp" | sed '$d')
+
+    case "$http_code" in
+        200) ;;
+        5*)  return 2 ;;
+        *)   return 1 ;;
+    esac
+
+    if ! echo "$body" | grep -q '"success":[[:space:]]*true'; then
+        return 1
+    fi
+
+    # ── 第二步（可选）：Zone 权限校验 ──
+    [[ -z "$root_domain" ]] && return 0
+
+    curl_rc=0
+    resp=$(curl -sS --max-time 5 \
+        -H "Authorization: Bearer ${token}" \
+        -w $'\n%{http_code}' \
+        "https://api.cloudflare.com/client/v4/zones?name=${root_domain}" 2>/dev/null) || curl_rc=$?
+
+    if [[ "$curl_rc" -ne 0 || -z "$resp" ]]; then
+        return 2
+    fi
+
+    http_code=$(printf '%s\n' "$resp" | tail -n1)
+    body=$(printf '%s\n' "$resp" | sed '$d')
+
+    case "$http_code" in
+        200) ;;
+        5*)  return 2 ;;
+        *)   return 1 ;;
+    esac
+
+    if ! echo "$body" | grep -q '"success":[[:space:]]*true'; then
+        return 1
+    fi
+
+    # result 为空数组 → 该 Token 无权访问该根域名
+    if echo "$body" | grep -qE '"result"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]'; then
+        return 3
+    fi
+
+    return 0
+}
+
+# ── 查找已使用该 Token 的账号文件（去重检测用） ─────────────
+# 用法: find_cf_token_owner_file <token> [<exclude_ini_file>]
+# 成功输出匹配的 ini 文件全路径并返回 0；无匹配返回 1
+find_cf_token_owner_file() {
+    local token="$1" exclude_file="${2:-}"
+    local f t
+    for f in $(_scan_cf_account_files); do
+        [[ -n "$exclude_file" && "$f" == "$exclude_file" ]] && continue
+        t=$(_cf_ini_token "$f")
+        if [[ -n "$t" && "$t" == "$token" ]]; then
+            echo "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── 查找根域名已关联的 CF 账号文件 ──────────────────────────
+# 用法: find_root_domain_owner_file <root_domain>
+# 输出: 关联的账号 ini 文件全路径（找不到则空），返回 0/1
+find_root_domain_owner_file() {
+    local root="$1"
+    local filebase
+    filebase=$(domain_to_ini_name "$root")
+
+    # 新格式 per-root 账号文件直接命中
+    if [[ -f "${CF_CONFIG_DIR}/${filebase}.ini" ]]; then
+        echo "${CF_CONFIG_DIR}/${filebase}.ini"
+        return 0
+    fi
+
+    # domain_<root>.ini 映射存在 → 反查源账号 ini
+    local mapping="${CF_CONFIG_DIR}/domain_${filebase}.ini"
+    if [[ -f "$mapping" ]]; then
+        local mapped_token
+        mapped_token=$(_cf_ini_token "$mapping")
+        if [[ -n "$mapped_token" ]]; then
+            local f t
+            for f in $(_scan_cf_account_files); do
+                t=$(_cf_ini_token "$f")
+                if [[ -n "$t" && "$t" == "$mapped_token" ]]; then
+                    echo "$f"
+                    return 0
+                fi
+            done
+        fi
+        # 找不到源账号则返回映射文件本身
+        echo "$mapping"
+        return 0
+    fi
+
+    return 1
+}
+
+# ── Token 写入前的去重确认（供 prompt_cf_token 内部使用） ───
+# 用法: _accept_cf_token <token> [<exclude_ini_file>]
+# 成功（无重复 / 用户确认覆盖）: 写 PROMPT_CF_TOKEN_RESULT 返回 0
+# 用户拒绝覆盖: 返回 1，由上层循环重新提示输入
+_accept_cf_token() {
+    local token="$1" exclude_file="${2:-}"
+    local dup_file dup_name cont
+    dup_file=$(find_cf_token_owner_file "$token" "$exclude_file" || true)
+    if [[ -n "$dup_file" ]]; then
+        dup_name=$(basename "$dup_file" .ini)
+        log_warn "该 Token 已被账号 [${dup_name}] 使用"
+        read -rp "  是否继续写入？[y/N]: " cont
+        if [[ "${cont,,}" != "y" ]]; then
+            log_info "请重新输入 Token..."
+            return 1
+        fi
+    fi
+    PROMPT_CF_TOKEN_RESULT="$token"
+    return 0
+}
+
+# ── 交互式 Token 输入 + 验证（三种失败场景分别处理） ────────
+# 用法: prompt_cf_token <prompt_label> [<root_domain>] [<exclude_ini_file>]
+# 成功: 把校验通过的 Token 写入全局变量 PROMPT_CF_TOKEN_RESULT，返回 0
+# 用户放弃 / 连续 3 次无效: 清空 PROMPT_CF_TOKEN_RESULT，返回 1
+# exclude_ini_file: 去重检测时排除的目标文件（重配置/覆盖写场景）
+prompt_cf_token() {
+    local label="$1" root_domain="${2:-}" exclude_file="${3:-}"
+    PROMPT_CF_TOKEN_RESULT=""
+    local token rc invalid_attempts=0 choice
+
+    while true; do
+        read -rp "  ${label}: " token
+        if [[ -z "$token" ]]; then
+            log_warn "Token 不能为空，请重新输入"
+            continue
+        fi
+
+        rc=0
+        verify_cf_token "$token" "$root_domain" || rc=$?
+
+        case "$rc" in
+            0)
+                if [[ -n "$root_domain" ]]; then
+                    log_info "Token 验证通过（可访问 ${root_domain} 的 Zone）"
+                else
+                    log_info "Token 验证通过"
+                fi
+                _accept_cf_token "$token" "$exclude_file" && return 0
+                ;;
+            1)
+                invalid_attempts=$((invalid_attempts + 1))
+                if [[ $invalid_attempts -ge 3 ]]; then
+                    log_error "Token 连续 3 次验证失败，放弃本次配置（未写入任何文件）"
+                    return 1
+                fi
+                log_warn "Token 无效（CF API 拒绝），请重新输入 [${invalid_attempts}/3]"
+                ;;
+            2)
+                log_warn "无法连接 api.cloudflare.com（超时 / 连接失败 / 5xx）"
+                echo "  a. 重试验证（保留刚才输入的 Token）"
+                echo "  b. 跳过验证强行写入（你自己确认 Token 正确，后续 certbot 会再验一次）"
+                echo "  c. 放弃返回菜单"
+                read -rp "  请选择 [a/b/c]: " choice
+                case "${choice,,}" in
+                    b)
+                        log_warn "已跳过 CF API 验证，按你的输入写入"
+                        _accept_cf_token "$token" "$exclude_file" && return 0
+                        ;;
+                    c)
+                        log_warn "已放弃，未写入任何文件"
+                        return 1
+                        ;;
+                    *)
+                        log_info "重试验证..."
+                        ;;
+                esac
+                ;;
+            3)
+                log_warn "Token 有效，但无法访问域名 ${root_domain} 的 Zone"
+                log_warn "请确认该 Token 的权限范围 / 所属 CF 账号是否正确"
+                echo "  a. 重新输入 Token"
+                echo "  b. 忽略并继续（使用此 Token 写入配置）"
+                read -rp "  请选择 [a/b]: " choice
+                case "${choice,,}" in
+                    b)
+                        log_warn "已忽略 Zone 权限警告，按你的输入写入"
+                        _accept_cf_token "$token" "$exclude_file" && return 0
+                        ;;
+                    *)
+                        log_info "请重新输入 Token..."
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
 # ── 重新配置指定 CF 账号 ─────────────────────────────────────
 reconfigure_cf_accounts() {
     local account_indexes=("$@")
@@ -176,9 +397,13 @@ reconfigure_cf_accounts() {
     for i in "${account_indexes[@]}"; do
         echo ""
         log_info "── 配置第 ${i} 个 CF 账号 ──"
-        read -rp "  账号 ${i} 的 CF API Token: " cf_token
-
         local ini_file="${CF_CONFIG_DIR}/cf_account_${i}.ini"
+        if ! prompt_cf_token "账号 ${i} 的 CF API Token" "" "$ini_file"; then
+            log_error "账号 ${i} 配置已放弃，停止配置剩余账号"
+            return 1
+        fi
+        local cf_token="$PROMPT_CF_TOKEN_RESULT"
+
         cat > "$ini_file" << INI
 # Cloudflare API Token - 账号 ${i}
 dns_cloudflare_api_token = ${cf_token}
@@ -1058,11 +1283,27 @@ add_cf_account() {
     cf_root="${cf_root,,}"
     [[ -z "$cf_root" ]] && { log_error "根域名不能为空"; return 1; }
 
-    read -rp "请输入 CF API Token: " cf_token
-
     local filebase
     filebase=$(domain_to_ini_name "$cf_root")
     local ini_file="${CF_CONFIG_DIR}/${filebase}.ini"
+
+    # 根域名重复检测
+    local existing_owner ow
+    existing_owner=$(find_root_domain_owner_file "$cf_root" || true)
+    if [[ -n "$existing_owner" ]]; then
+        log_warn "根域名 ${cf_root} 已关联账号 [$(basename "$existing_owner" .ini)]"
+        read -rp "  是否覆盖现有关联？[y/N]: " ow
+        if [[ "${ow,,}" != "y" ]]; then
+            log_info "已取消，未修改任何文件"
+            return 1
+        fi
+    fi
+
+    if ! prompt_cf_token "请输入 CF API Token" "$cf_root" "$ini_file"; then
+        log_error "新增 CF 账号已放弃，未写入任何文件"
+        return 1
+    fi
+    cf_token="$PROMPT_CF_TOKEN_RESULT"
 
     cat > "$ini_file" << INI
 # Cloudflare API Token — ${cf_root}
@@ -1157,9 +1398,15 @@ add_domain_and_cert() {
             suffix=$(echo "$domain" | tr '.' '_')
             current_mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
             current_protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+            log_warn "域名 $domain 已存在 [mode=$current_mode, proto=$current_protos]"
+            local edit_confirm
+            read -rp "  是否修改其配置？[y/N]: " edit_confirm
+            if [[ "${edit_confirm,,}" != "y" ]]; then
+                log_info "已跳过 $domain"
+                continue
+            fi
             is_existing=true
-            log_warn "域名 $domain 已存在，将追加协议"
-            log_info "当前配置: $domain [mode=$current_mode, proto=$current_protos]"
+            log_info "进入编辑模式（协议将追加，mode 可改）"
         fi
 
         # ── 多选协议 ──
