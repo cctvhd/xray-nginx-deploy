@@ -136,7 +136,7 @@ get_state() {
 save_state() {
     local key="$1"
     local value="$2"
-    local escaped
+    local escaped tmp_file
 
     mkdir -p "$STATE_DIR" || return 1
     chmod 700 "$STATE_DIR" || return 1
@@ -144,8 +144,16 @@ save_state() {
     chmod 600 "$STATE_FILE" || return 1
 
     escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
-    sed -i "/^${key}=/d" "$STATE_FILE" || return 1
-    echo "${key}='${escaped}'" >> "$STATE_FILE" || return 1
+    tmp_file="${STATE_FILE}.tmp.$$"
+
+    # 原子写入：在内存构建完整内容 → 写 .tmp → mv（同 fs 下原子）
+    # 任一步失败都不污染正式文件
+    {
+        grep -v "^${key}=" "$STATE_FILE" 2>/dev/null || true
+        echo "${key}='${escaped}'"
+    } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$STATE_FILE" || { rm -f "$tmp_file"; return 1; }
 }
 
 get_step() {
