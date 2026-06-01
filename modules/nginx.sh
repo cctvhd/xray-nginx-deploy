@@ -10,34 +10,33 @@ install_nginx() {
 
     case "$OS_ID" in
         ubuntu|debian)
-            curl -fsSL https://nginx.org/keys/nginx_signing.key | \
-                gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+            if ! grep -q 'nginx\.org' /etc/apt/sources.list.d/nginx.list 2>/dev/null; then
+                curl -fsSL https://nginx.org/keys/nginx_signing.key | \
+                    gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
 
-            case "$OS_ID" in
-                ubuntu)
-                    echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
-http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" \
-                        > /etc/apt/sources.list.d/nginx.list
-                    ;;
-                debian)
-                    echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
-http://nginx.org/packages/debian $(lsb_release -cs) nginx" \
-                        > /etc/apt/sources.list.d/nginx.list
-                    ;;
-            esac
+                local codename
+                codename=$(lsb_release -cs)
+                echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
+http://nginx.org/packages/${OS_ID} ${codename} nginx" \
+                    > /etc/apt/sources.list.d/nginx.list
 
-            cat > /etc/apt/preferences.d/99nginx << PREF
+                cat > /etc/apt/preferences.d/99nginx << PREF
 Package: nginx
 Pin: origin nginx.org
 Pin-Priority: 900
 PREF
+                log_info "已添加 nginx 官方 apt 仓库"
+            else
+                log_info "nginx 官方 apt 仓库已存在，跳过"
+            fi
 
             apt-get update -y >/dev/null 2>&1
             apt-get install -y nginx >/dev/null 2>&1
             ;;
 
         centos|rhel|rocky|almalinux)
-            cat > /etc/yum.repos.d/nginx.repo << REPO
+            if [[ ! -f /etc/yum.repos.d/nginx.repo ]]; then
+                cat > /etc/yum.repos.d/nginx.repo << REPO
 [nginx-stable]
 name=nginx stable repo
 baseurl=http://nginx.org/packages/centos/\$releasever/\$basearch/
@@ -54,6 +53,10 @@ enabled=0
 gpgkey=https://nginx.org/keys/nginx_signing.key
 module_hotfixes=true
 REPO
+                log_info "已添加 nginx 官方 yum 仓库"
+            else
+                log_info "nginx 官方 yum 仓库已存在，跳过"
+            fi
 
             dnf install -y nginx >/dev/null 2>&1
             ;;
