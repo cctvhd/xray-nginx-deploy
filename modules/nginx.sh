@@ -892,9 +892,10 @@ generate_servers_conf() {
 
     # xhttp CDN server 块
     if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
-        local xhttp_root
+        local xhttp_root cert_path
         xhttp_root=$(get_root_domain "${XHTTP_DOMAIN}")
-        local cert_path="/etc/letsencrypt/live/${xhttp_root}"
+        cert_path=$(get_state "CERT_PATH_${xhttp_root//./_}" "")
+        [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${xhttp_root}"
 
         # 同域名合并：xhttp 与 gRPC 共用同一域名时，gRPC location 并入此 server 块
         local grpc_merged_location=""
@@ -1072,9 +1073,10 @@ CONF
     # gRPC CDN server 块
     # 同域名时已合并进 xhttp server 块（20443），跳过独立 gRPC 块以避免端口/SNI 冲突
     if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]]; then
-        local grpc_root
+        local grpc_root cert_path
         grpc_root=$(get_root_domain "${GRPC_DOMAIN}")
-        local cert_path="/etc/letsencrypt/live/${grpc_root}"
+        cert_path=$(get_state "CERT_PATH_${grpc_root//./_}" "")
+        [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${grpc_root}"
 
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 

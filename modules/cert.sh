@@ -1648,6 +1648,7 @@ request_certificates() {
             log_info "证书已存在，跳过: *.${root_domain}"
             CERT_EXISTING_ROOTS+=("$root_domain")
             ROOT_DOMAIN_DONE["$root_domain"]="existing"
+            save_state "CERT_PATH_${root_domain//./_}" "/etc/letsencrypt/live/${root_domain}"
             continue
         fi
 
@@ -1682,6 +1683,7 @@ request_certificates() {
                 log_info "证书申请成功: *.${root_domain} (第 ${attempt} 次尝试)"
                 CERT_SUCCESS_ROOTS+=("$root_domain")
                 ROOT_DOMAIN_DONE["$root_domain"]="success"
+                save_state "CERT_PATH_${root_domain//./_}" "/etc/letsencrypt/live/${root_domain}"
                 break
             fi
 
