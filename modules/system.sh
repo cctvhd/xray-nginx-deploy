@@ -542,7 +542,7 @@ setup_selinux_policy() {
         fi
     fi
 
-    local ports=(20443 20445 20880 18443 9443 8443)
+    local ports=(8380 8390 8400 8360 8320 8330)
     local existing_http_ports
     existing_http_ports=$(semanage port -l 2>/dev/null | grep '^http_port_t' || true)
 

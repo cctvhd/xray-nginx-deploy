@@ -216,7 +216,7 @@ generate_singbox_config() {
       "type":        "anytls",
       "tag":         "anytls-in",
       "listen":      "127.0.0.1",
-      "listen_port": 8443,
+      "listen_port": 8330,
       "users": [
         {
           "password": "${SINGBOX_PASSWORD}"
@@ -348,7 +348,7 @@ run_singbox() {
     log_info "关键参数（请保存）："
     echo "  AnyTLS 域名:  ${ANYTLS_DOMAIN}"
     echo "  AnyTLS 密码:  ${SINGBOX_PASSWORD}"
-    echo "  监听端口:     8443 (nginx → 127.0.0.1:8443)"
+    echo "  监听端口:     8330 (nginx → 127.0.0.1:8330)"
 
     local anytls_pass_encoded
     anytls_pass_encoded=$(python3 -c "import urllib.parse; print(urllib.parse.quote('${SINGBOX_PASSWORD}', safe=''))" 2>/dev/null || echo "${SINGBOX_PASSWORD}")

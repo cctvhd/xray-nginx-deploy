@@ -470,17 +470,17 @@ _preflight_check_xhttp_path() {
 # 关联数组 key 重复会被 bash 静默覆盖，count 偏离 11 即异常
 _preflight_check_internal_ports() {
     declare -A _internal_ports=(
-        [8001]="xray vless-xhttp-cdn"
-        [8002]="xray vless-grpc-cdn"
-        [8443]="sing-box anytls"
-        [8444]="caddy-naive"
-        [9443]="xray reality-direct"
-        [10080]="nginx fallback"
-        [18443]="nginx middle->anytls"
-        [18444]="nginx middle->naive"
-        [20443]="nginx xhttp ssl"
-        [20445]="nginx grpc ssl"
-        [20880]="nginx SNI trap"
+        [8300]="xray vless-xhttp-cdn"
+        [8310]="xray vless-grpc-cdn"
+        [8330]="sing-box anytls"
+        [8340]="caddy-naive"
+        [8320]="xray reality-direct"
+        [8350]="nginx fallback"
+        [8360]="nginx middle->anytls"
+        [8370]="nginx middle->naive"
+        [8380]="nginx xhttp ssl"
+        [8390]="nginx grpc ssl"
+        [8400]="nginx SNI trap"
     )
     if (( ${#_internal_ports[@]} != 11 )); then
         _preflight_fail \
@@ -1560,7 +1560,7 @@ do_conf_nginx() {
     # ── state 健全性检查 ────────────────────────────────────────
     # restore_domain_arrays 只读 state，不重建；若 state 陈旧会导致
     # XHTTP_DOMAIN / GRPC_DOMAIN 为空，使 generate_servers_conf 静默
-    # 跳过 gRPC merged-location，令 gRPC 节点在 :20443 上无 location 匹配。
+    # 跳过 gRPC merged-location，令 gRPC 节点在 :8380 上无 location 匹配。
     #
     # rebuild_protocol_domains 才是"从注册表重建并写回 state"的函数，
     # 只在 collect_domains(b/c) 和 add_domain_and_cert 里被调用；
@@ -2664,7 +2664,7 @@ do_selinux_mgmt() {
     if command -v semanage >/dev/null 2>&1; then
         local existing
         existing=$(semanage port -l 2>/dev/null | grep '^http_port_t' || true)
-        local ports=(20443 20445 20880 18443 9443 8443)
+        local ports=(8380 8390 8400 8360 8320 8330)
         for port in "${ports[@]}"; do
             if ! echo "$existing" | grep -qw "\\b${port}\\b"; then
                 echo "  ! 端口 ${port}/tcp 缺少 http_port_t 标签"
