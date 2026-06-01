@@ -1310,12 +1310,7 @@ show_status() {
 
 do_sync_modules() {
     echo ""
-    log_warn "将从 GitHub 下载所有模块覆盖本地缓存，需要网络连接。"
-    read -rp "确认继续？[y/N]: " confirm
-    if [[ "${confirm,,}" != "y" ]]; then
-        return
-    fi
-    echo ""
+    log_info "从 GitHub 下载所有模块覆盖本地缓存..."
     sync_modules
     done_return
 }
