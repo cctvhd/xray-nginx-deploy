@@ -1908,7 +1908,14 @@ do_warp() {
 
 upgrade_component_method() {
     case "$1" in
-        nginx|singbox) echo "系统仓库安装" ;;
+        nginx)
+            if command -v nginx &>/dev/null && [[ "$(nginx_install_method)" == "compiled" ]]; then
+                echo "编译安装"
+            else
+                echo "系统仓库安装"
+            fi
+            ;;
+        singbox) echo "系统仓库安装" ;;
         xray|hysteria2) echo "脚本安装" ;;
         naive) echo "编译安装" ;;
         *) echo "未知" ;;
@@ -1955,9 +1962,20 @@ upgrade_apt_candidate() {
 
 upgrade_remote_version() {
     case "$1" in
-        nginx)     upgrade_apt_candidate nginx ;;
-        singbox)   upgrade_apt_candidate sing-box ;;
-        xray)      upgrade_github_latest XTLS/Xray-core ;;
+        nginx)
+            curl -fsSL --max-time 8 "https://nginx.org/en/CHANGES" 2>/dev/null \
+                | grep -m1 'Changes with nginx' \
+                | grep -oP '[0-9]+\.[0-9]+\.[0-9]+'
+            ;;
+        singbox)
+            upgrade_github_latest SagerNet/sing-box
+            ;;
+        xray)
+            curl -fsSL --max-time 5 "https://api.github.com/repos/XTLS/Xray-core/releases" 2>/dev/null \
+                | grep -oP '"tag_name"\s*:\s*"\K[^"]+' \
+                | head -1 \
+                | sed 's/^v//'
+            ;;
         hysteria2) upgrade_github_latest apernet/hysteria ;;
         naive)     upgrade_github_latest caddyserver/caddy ;;
     esac
@@ -2005,8 +2023,12 @@ upgrade_repo_component() {
     load_os_info
     case "$component" in
         nginx)
-            load_module nginx
-            install_nginx
+            if [[ "$(nginx_install_method)" == "compiled" ]]; then
+                upgrade_nginx_compiled
+            else
+                load_module nginx
+                install_nginx
+            fi
             restart_service_if_configured "nginx.service" "nginx -t >/dev/null 2>&1"
             save_state "INST_NGINX" "1"
             ;;
@@ -2040,6 +2062,129 @@ upgrade_script_component() {
             save_state "INST_HYSTERIA2" "1"
             ;;
     esac
+}
+
+# ── Nginx 安装方式检测 ─────────────────────────────────────────
+# 返回 "pkg"（包管理器）/ "compiled"（编译安装）/ "none"（未安装）
+nginx_install_method() {
+    if dpkg -l nginx 2>/dev/null | grep -q '^ii'; then echo "pkg"; return; fi
+    if rpm -q nginx 2>/dev/null | grep -qv 'is not installed'; then echo "pkg"; return; fi
+    if command -v nginx &>/dev/null; then echo "compiled"; return; fi
+    echo "none"
+}
+
+# ── Nginx 编译依赖 ─────────────────────────────────────────────
+nginx_install_build_deps() {
+    log_step "安装 Nginx 编译依赖..."
+    case "$OS_ID" in
+        ubuntu|debian)
+            apt-get install -y build-essential libpcre3-dev libssl-dev zlib1g-dev >/dev/null 2>&1 ;;
+        centos|rhel|rocky|almalinux|fedora)
+            dnf install -y gcc make pcre-devel openssl-devel zlib-devel >/dev/null 2>&1 ;;
+    esac
+}
+
+# ── Nginx 编译升级 ─────────────────────────────────────────────
+upgrade_nginx_compiled() {
+    local target_ver current_ver configure_args tmp_dir src_dir
+    local sbin_path pid_path old_pid waited
+
+    # ── 版本检测，已是最新则跳过 ─────────────────────────────────
+    target_ver=$(upgrade_remote_version nginx)
+    [[ -z "$target_ver" ]] && { log_error "无法获取 Nginx 最新版本"; exit 1; }
+    current_ver=$(upgrade_command_version nginx)
+    if [[ -n "$current_ver" && "$current_ver" == "$target_ver" ]]; then
+        log_info "Nginx 已是最新版本 ${current_ver}，跳过"
+        return 0
+    fi
+    log_info "当前: ${current_ver:-未知}  →  目标: ${target_ver}"
+
+    # ── 提取原始 configure 参数（路径全部保留）────────────────────
+    configure_args=$(nginx -V 2>&1 | grep -oP '(?<=configure arguments:).*' | sed 's/^ //')
+    [[ -z "$configure_args" ]] && { log_error "无法提取 Nginx 编译参数（nginx -V 输出异常）"; exit 1; }
+    log_info "原编译参数: ${configure_args}"
+
+    # 从 configure 参数中提取关键路径
+    sbin_path=$(echo "$configure_args" | grep -oP '(?<=--sbin-path=)\S+')
+    [[ -z "$sbin_path" ]] && sbin_path=$(command -v nginx)
+    pid_path=$(echo "$configure_args" | grep -oP '(?<=--pid-path=)\S+')
+    [[ -z "$pid_path" ]] && pid_path="/var/run/nginx.pid"
+    log_info "二进制: ${sbin_path}  PID: ${pid_path}"
+
+    # 检查外部 --add-module= 路径是否存在
+    while IFS= read -r mod; do
+        [[ -n "$mod" && ! -d "$mod" ]] && log_warn "外部模块目录不存在: $mod（configure 可能失败）"
+    done < <(echo "$configure_args" | grep -oP '(?<=--add-module=)[^ ]+')
+
+    nginx_install_build_deps
+
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' RETURN
+
+    # ── 下载源码 ──────────────────────────────────────────────────
+    log_step "下载 nginx-${target_ver} 源码..."
+    curl -fsSL --max-time 120 \
+        "https://nginx.org/download/nginx-${target_ver}.tar.gz" \
+        -o "${tmp_dir}/nginx.tar.gz" \
+        || { log_error "下载 Nginx 源码失败"; exit 1; }
+
+    tar -xzf "${tmp_dir}/nginx.tar.gz" -C "$tmp_dir"
+    src_dir=$(find "$tmp_dir" -maxdepth 1 -name 'nginx-*' -type d | head -1)
+    [[ -z "$src_dir" ]] && { log_error "源码解压失败"; exit 1; }
+
+    # ── 编译（复用原始 configure 参数，路径与原安装完全一致）──────
+    pushd "$src_dir" >/dev/null
+    log_step "configure..."
+    # shellcheck disable=SC2086
+    ./configure $configure_args 2>&1 || { popd >/dev/null; log_error "Nginx configure 失败"; exit 1; }
+
+    log_step "make（$(nproc) 线程）..."
+    make -j"$(nproc)" 2>&1 || { popd >/dev/null; log_error "Nginx make 失败"; exit 1; }
+
+    # ── 热升级：只替换二进制，不覆盖配置 ────────────────────────
+    log_step "替换二进制文件..."
+    cp -f "$sbin_path" "${sbin_path}.old"   # 备份，供回滚
+    cp -f objs/nginx "$sbin_path"
+    chmod 755 "$sbin_path"
+    popd >/dev/null
+
+    # nginx 未在运行时直接启动，跳过热重启流程
+    if [[ ! -f "$pid_path" ]] || ! kill -0 "$(cat "$pid_path" 2>/dev/null)" 2>/dev/null; then
+        log_warn "Nginx 未在运行，直接启动新版本"
+        systemctl start nginx 2>/dev/null || nginx 2>/dev/null || true
+        rm -f "${sbin_path}.old"
+        log_info "Nginx 编译升级完成: $(nginx -v 2>&1 | grep -oP '[0-9.]+' | head -1)"
+        return 0
+    fi
+
+    # ── USR2：让 nginx 以新二进制启动新 master，保持旧 master 在线
+    old_pid=$(cat "$pid_path")
+    log_step "发送 USR2 启动新 master（旧 PID: ${old_pid}）..."
+    kill -USR2 "$old_pid" || { log_error "USR2 发送失败"; cp -f "${sbin_path}.old" "$sbin_path"; exit 1; }
+
+    # 等待新 master 生成 .oldbin PID 文件（最多 15 秒）
+    waited=0
+    while [[ ! -f "${pid_path}.oldbin" && $waited -lt 15 ]]; do
+        sleep 1; (( waited++ ))
+    done
+
+    if [[ ! -f "${pid_path}.oldbin" ]]; then
+        log_warn "新 master 启动超时，回滚二进制"
+        cp -f "${sbin_path}.old" "$sbin_path"
+        log_error "Nginx 热升级失败"
+        exit 1
+    fi
+
+    # ── WINCH：旧 worker 停止接受新连接，优雅排干
+    log_step "WINCH 旧 worker，等待连接排干..."
+    kill -WINCH "$old_pid" 2>/dev/null || true
+    sleep 3
+
+    # ── QUIT：旧 master 退出，完成升级
+    kill -QUIT "$old_pid" 2>/dev/null || true
+
+    rm -f "${sbin_path}.old"
+    log_info "Nginx 编译升级完成: $(nginx -v 2>&1 | grep -oP '[0-9.]+' | head -1)"
 }
 
 upgrade_compiled_component() {
