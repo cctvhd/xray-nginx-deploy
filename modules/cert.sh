@@ -2191,6 +2191,69 @@ refresh_domain_assignments() {
     rebuild_protocol_domains
     load_domain_state
 
+    # ── XHTTP/gRPC 合并检测：两槽位落到同一域名时引导用户分离 ──
+    if [[ -n "${XHTTP_DOMAIN:-}" && "${XHTTP_DOMAIN}" == "${GRPC_DOMAIN:-}" ]]; then
+        local _reg _d _sfx _m
+        _reg=$(get_state "DOMAIN_REGISTRY")
+        local -a _other_cdn=()
+        for _d in $_reg; do
+            [[ "$_d" == "$XHTTP_DOMAIN" ]] && continue
+            _sfx=$(echo "$_d" | tr '.' '_')
+            _m=$(get_state "DOMAIN_MODE_${_sfx}" "direct")
+            [[ "$_m" == "cdn" ]] && _other_cdn+=("$_d")
+        done
+
+        if [[ ${#_other_cdn[@]} -gt 0 ]]; then
+            echo ""
+            log_warn "xhttp 和 gRPC 均解析到同一域名: ${XHTTP_DOMAIN}"
+            log_warn "注册表中存在其他 CDN 候选域名: ${_other_cdn[*]}"
+            echo "  建议将两个协议分配到不同域名。"
+            echo ""
+            local _split_yn
+            read -rp "  是否重新分配 xhttp/gRPC 到不同域名？[y/N]: " _split_yn
+            if [[ "${_split_yn,,}" == "y" ]]; then
+                echo ""
+                echo "  请选择要从 ${XHTTP_DOMAIN} 分离出去的协议："
+                echo "    1) ${XHTTP_DOMAIN} 保留 xhttp，gRPC 分给候选域名"
+                echo "    2) ${XHTTP_DOMAIN} 保留 gRPC，xhttp 分给候选域名"
+                local _proto_choice
+                read -rp "  请选择 [1/2]: " _proto_choice
+                local _keep_tag _move_tag
+                case "$_proto_choice" in
+                    1) _keep_tag="xray-xhttp"; _move_tag="xray-grpc" ;;
+                    2) _keep_tag="xray-grpc";  _move_tag="xray-xhttp" ;;
+                    *) log_warn "无效选择，跳过重新分配"; _proto_choice="" ;;
+                esac
+
+                if [[ -n "$_proto_choice" ]]; then
+                    echo ""
+                    echo "  将 ${_move_tag} 分配给哪个域名？"
+                    local _ci=1
+                    for _d in "${_other_cdn[@]}"; do echo "    ${_ci}) ${_d}"; ((_ci++)); done
+                    local _cand_choice
+                    read -rp "  请选择 [1-${#_other_cdn[@]}]: " _cand_choice
+                    local _target="${_other_cdn[$((_cand_choice-1))]:-}"
+
+                    if [[ -n "$_target" ]]; then
+                        local _msuffix _tsuffix
+                        _msuffix=$(echo "$XHTTP_DOMAIN" | tr '.' '_')
+                        _tsuffix=$(echo "$_target"      | tr '.' '_')
+                        save_state "DOMAIN_PROTO_${_msuffix}" "$_keep_tag"
+                        save_state "DOMAIN_PROTO_${_tsuffix}" "$_move_tag"
+                        save_state "DOMAIN_PRIMARY_XRAY_XHTTP" ""
+                        save_state "DOMAIN_PRIMARY_XRAY_GRPC"  ""
+                        log_info "已更新: ${XHTTP_DOMAIN} → ${_keep_tag}"
+                        log_info "已更新: ${_target} → ${_move_tag}"
+                        rebuild_protocol_domains
+                        load_domain_state
+                    else
+                        log_warn "无效选择，跳过重新分配"
+                    fi
+                fi
+            fi
+        fi
+    fi
+
     if [[ -z "${HYSTERIA2_DOMAIN:-}" ]]; then
         local registry
         registry=$(get_state "DOMAIN_REGISTRY")
