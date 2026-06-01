@@ -815,6 +815,37 @@ load_domain_state() {
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
 }
 
+# ── 读取延迟档位参数 → 设置协议生成变量 ────────────────────
+# 调用后可用：LATENCY_XMUX_CONCURRENCY / LATENCY_XMUX_REQUEST_TIMES /
+#             LATENCY_XMUX_REUSABLE_SECS / LATENCY_GRPC_TIMEOUT / LATENCY_PROXY_TIMEOUT
+load_latency_params() {
+    local level
+    level=$(get_state "LATENCY_LEVEL" "medium")
+    case "$level" in
+        low)
+            LATENCY_XMUX_CONCURRENCY="8-16"
+            LATENCY_XMUX_REQUEST_TIMES="300-500"
+            LATENCY_XMUX_REUSABLE_SECS="1200-1800"
+            LATENCY_GRPC_TIMEOUT=60
+            LATENCY_PROXY_TIMEOUT=1800
+            ;;
+        high)
+            LATENCY_XMUX_CONCURRENCY="32-64"
+            LATENCY_XMUX_REQUEST_TIMES="1000-1500"
+            LATENCY_XMUX_REUSABLE_SECS="3000-5400"
+            LATENCY_GRPC_TIMEOUT=300
+            LATENCY_PROXY_TIMEOUT=7200
+            ;;
+        medium|*)
+            LATENCY_XMUX_CONCURRENCY="16-32"
+            LATENCY_XMUX_REQUEST_TIMES="600-900"
+            LATENCY_XMUX_REUSABLE_SECS="1800-3000"
+            LATENCY_GRPC_TIMEOUT=120
+            LATENCY_PROXY_TIMEOUT=7200
+            ;;
+    esac
+}
+
 # ── 模块加载：本地缓存 → 脚本同级目录 → 远程下载并缓存 ─────
 load_module() {
     local module="$1"

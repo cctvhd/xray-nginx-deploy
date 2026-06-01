@@ -791,6 +791,13 @@ CONF
 generate_fallback_conf() {
     log_step "生成 fallback 配置..."
 
+    if declare -F load_latency_params &>/dev/null; then
+        load_latency_params
+    else
+        LATENCY_GRPC_TIMEOUT=120
+        LATENCY_PROXY_TIMEOUT=7200
+    fi
+
     cat > /etc/nginx/conf.d/fallback.conf << CONF
 # ============================================================
 # /etc/nginx/conf.d/fallback.conf
@@ -830,10 +837,10 @@ listen 127.0.0.1:8350;
         proxy_next_upstream_tries   0;
         client_max_body_size    0;
         proxy_connect_timeout   15s;
-        proxy_send_timeout      7200s;
-        proxy_read_timeout      7200s;
+        proxy_send_timeout      ${LATENCY_PROXY_TIMEOUT}s;
+        proxy_read_timeout      ${LATENCY_PROXY_TIMEOUT}s;
         # P5修复：fallback 长连接单独覆盖
-        keepalive_timeout       7200s;
+        keepalive_timeout       ${LATENCY_PROXY_TIMEOUT}s;
     }
 
     location /grpc.Service {
@@ -842,15 +849,15 @@ listen 127.0.0.1:8350;
         grpc_set_header      Host \$host;
         grpc_next_upstream   off;
         grpc_connect_timeout 15s;
-        grpc_send_timeout    7200s;
-        grpc_read_timeout    7200s;
+        grpc_send_timeout    ${LATENCY_GRPC_TIMEOUT}s;
+        grpc_read_timeout    ${LATENCY_GRPC_TIMEOUT}s;
         # fallback 直连长连接，跟 Reality 入口保持长超时
         grpc_buffer_size     128k;
         grpc_socket_keepalive on;
-        keepalive_timeout    7200s;
+        keepalive_timeout    ${LATENCY_GRPC_TIMEOUT}s;
         client_max_body_size 0;
-        client_body_timeout 7200s;
-        send_timeout 7200s;
+        client_body_timeout ${LATENCY_GRPC_TIMEOUT}s;
+        send_timeout ${LATENCY_GRPC_TIMEOUT}s;
     }
 
     location / {
@@ -881,6 +888,13 @@ generate_servers_conf() {
             log_error "servers.conf 生成已阻止"
             return 1
         fi
+    fi
+
+    if declare -F load_latency_params &>/dev/null; then
+        load_latency_params
+    else
+        LATENCY_GRPC_TIMEOUT=120
+        LATENCY_PROXY_TIMEOUT=7200
     fi
 
     # 有意清空配置文件，后续以 >> 追加方式逐段写入
@@ -918,17 +932,17 @@ generate_servers_conf() {
         grpc_set_header       Content-Type "application/grpc";
 
         grpc_connect_timeout  15s;
-        grpc_send_timeout     120s;
-        grpc_read_timeout     120s;
+        grpc_send_timeout     ${LATENCY_GRPC_TIMEOUT}s;
+        grpc_read_timeout     ${LATENCY_GRPC_TIMEOUT}s;
         grpc_socket_keepalive on;
         grpc_next_upstream    off;
-        # CF 免费版硬限制约 100s，这里按 120s 管理 CDN 侧连接
+        # CF 免费版硬限制约 100s，中延迟默认 120s，高延迟用 300s
         grpc_buffer_size      128k;
-        keepalive_timeout     120s;
+        keepalive_timeout     ${LATENCY_GRPC_TIMEOUT}s;
 
         client_max_body_size  0;
-        client_body_timeout   120s;
-        send_timeout          120s;
+        client_body_timeout   ${LATENCY_GRPC_TIMEOUT}s;
+        send_timeout          ${LATENCY_GRPC_TIMEOUT}s;
     }
 CONF
 )
@@ -997,8 +1011,8 @@ server {
         proxy_hide_header X-Cache-Status;
 
         proxy_connect_timeout       15s;
-        proxy_send_timeout          7200s;
-        proxy_read_timeout          7200s;
+        proxy_send_timeout          ${LATENCY_PROXY_TIMEOUT}s;
+        proxy_read_timeout          ${LATENCY_PROXY_TIMEOUT}s;
         proxy_buffering             off;
         proxy_request_buffering     off;
         chunked_transfer_encoding   on;
@@ -1009,10 +1023,10 @@ server {
         proxy_next_upstream_timeout 0;
         proxy_next_upstream_tries   0;
         client_max_body_size        0;
-        client_body_timeout         7200s;
-        send_timeout                7200s;
+        client_body_timeout         ${LATENCY_PROXY_TIMEOUT}s;
+        send_timeout                ${LATENCY_PROXY_TIMEOUT}s;
         # P5修复：长连接在 location 内单独覆盖
-        keepalive_timeout           7200s;
+        keepalive_timeout           ${LATENCY_PROXY_TIMEOUT}s;
         keepalive_requests          5000;
     }
 ${grpc_merged_location}
@@ -1124,17 +1138,17 @@ server {
         grpc_set_header       Content-Type "application/grpc";
 
         grpc_connect_timeout  15s;
-        grpc_send_timeout     120s;
-        grpc_read_timeout     120s;
+        grpc_send_timeout     ${LATENCY_GRPC_TIMEOUT}s;
+        grpc_read_timeout     ${LATENCY_GRPC_TIMEOUT}s;
         grpc_socket_keepalive on;
         grpc_next_upstream    off;
-        # CF 免费版硬限制约 100s，这里按 120s 管理 CDN 侧连接
+        # CF 免费版硬限制约 100s，中延迟默认 120s，高延迟用 300s
         grpc_buffer_size      128k;
-        keepalive_timeout     120s;
+        keepalive_timeout     ${LATENCY_GRPC_TIMEOUT}s;
 
         client_max_body_size  0;
-        client_body_timeout   120s;
-        send_timeout          120s;
+        client_body_timeout   ${LATENCY_GRPC_TIMEOUT}s;
+        send_timeout          ${LATENCY_GRPC_TIMEOUT}s;
     }
 
     location = /health {

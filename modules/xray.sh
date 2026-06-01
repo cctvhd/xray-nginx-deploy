@@ -290,6 +290,15 @@ WGJSON
 generate_xray_config() {
     log_step "生成 Xray 配置文件..."
 
+    # 读取延迟档位参数（无 state 时使用中延迟默认值）
+    if declare -F load_latency_params &>/dev/null; then
+        load_latency_params
+    else
+        LATENCY_XMUX_CONCURRENCY="16-32"
+        LATENCY_XMUX_REQUEST_TIMES="600-900"
+        LATENCY_XMUX_REUSABLE_SECS="1800-3000"
+    fi
+
     local x_padding="${XRAY_PADDING:-}"
     case "${x_padding}" in
         ""|"128-2048"|"128-1024") x_padding="100-1000" ;;
@@ -414,11 +423,11 @@ generate_xray_config() {
                         "scStreamUpServerSecs":   "20-80",
                         "headers":                {"User-Agent": "chrome"},
                         "xmux": {
-                            "maxConcurrency":   "16-32",
+                            "maxConcurrency":   "${LATENCY_XMUX_CONCURRENCY}",
                             "maxConnections":   0,
                             "cMaxReuseTimes":   0,
-                            "hMaxRequestTimes": "600-900",
-                            "hMaxReusableSecs": "1800-3000",
+                            "hMaxRequestTimes": "${LATENCY_XMUX_REQUEST_TIMES}",
+                            "hMaxReusableSecs": "${LATENCY_XMUX_REUSABLE_SECS}",
                             "hKeepAlivePeriod": 0
                         }
                     }
