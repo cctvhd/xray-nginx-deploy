@@ -990,6 +990,35 @@ _collect_protocols_from_choices() {
     echo "$out"
 }
 
+# 当同时选择 xray-xhttp 和 xray-grpc 时，询问用户该域名绑定哪个协议
+# 用于 collect_domains 和 add_domain_and_cert 的协议选择后置处理
+# 调用方式：protocols=$(_resolve_cdn_proto_split "$domain" "$protocols")
+_resolve_cdn_proto_split() {
+    local domain="$1" protocols="$2"
+
+    # 未同时包含两个 CDN 协议时直接返回
+    case ",${protocols}," in *,xray-xhttp,*) ;; *) echo "$protocols"; return ;; esac
+    case ",${protocols}," in *,xray-grpc,*)  ;; *) echo "$protocols"; return ;; esac
+
+    echo "" >&2
+    log_warn "同时选择了 xray-xhttp + xray-grpc，每个协议槽位只能绑定一个主域名。" >&2
+    echo "  请为 ${domain} 指定绑定方式：" >&2
+    echo "    a) 合并：两个协议共用 ${domain}（:20443 按 path 分流）" >&2
+    echo "    b) 分离：${domain} 只绑 xhttp（gRPC 另行指定域名）" >&2
+    echo "    c) 分离：${domain} 只绑 gRPC（xhttp 另行指定域名）" >&2
+    local split_choice
+    read -rp "  请选择 [a/b/c，默认 a]: " split_choice
+
+    local out="" tag
+    IFS=',' read -ra _split_tags <<< "$protocols"
+    case "${split_choice,,}" in
+        b) for tag in "${_split_tags[@]}"; do [[ "$tag" != "xray-grpc"  ]] && out="${out:+$out,}$tag"; done ;;
+        c) for tag in "${_split_tags[@]}"; do [[ "$tag" != "xray-xhttp" ]] && out="${out:+$out,}$tag"; done ;;
+        *) out="$protocols" ;;
+    esac
+    echo "$out"
+}
+
 # 由协议列表自动推导 mode（CDN 当且仅当包含 xhttp 或 grpc）
 _derive_mode_from_protocols() {
     local protos="$1"
@@ -1384,6 +1413,8 @@ collect_domains() {
         read -rp "  输入序号如: 1 4: " choices
 
         protocols=$(_collect_protocols_from_choices "$choices")
+        [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
+        protocols=$(_resolve_cdn_proto_split "$domain" "$protocols")
         [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
 
         # ── 连接方式自动推导 ──
@@ -1991,6 +2022,8 @@ add_domain_and_cert() {
         if [[ "$is_existing" == "true" ]]; then
             protocols=$(merge_domain_protocols "$current_protos" "$protocols")
         fi
+        protocols=$(_resolve_cdn_proto_split "$domain" "$protocols")
+        [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
 
         # ── 连接方式自动推导（编辑场景同样按当前协议列表推导，不再询问）──
         mode=$(_derive_mode_from_protocols "$protocols")
