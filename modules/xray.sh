@@ -396,7 +396,7 @@ generate_xray_config() {
         {
             "tag":      "vless-xhttp-cdn",
             "listen":   "127.0.0.1",
-            "port":     8001,
+            "port":     8300,
             "protocol": "vless",
             "settings": {
                 "clients":     [{"id": "${XRAY_UUID}"}],
@@ -437,7 +437,7 @@ generate_xray_config() {
         {
             "tag":      "vless-grpc-cdn",
             "listen":   "127.0.0.1",
-            "port":     8002,
+            "port":     8310,
             "protocol": "vless",
             "settings": {
                 "clients":    [{"id": "${XRAY_UUID}"}],
@@ -465,7 +465,7 @@ generate_xray_config() {
         {
             "tag":      "reality-direct",
             "listen":   "127.0.0.1",
-            "port":     9443,
+            "port":     8320,
             "protocol": "vless",
             "settings": {
                 "clients": [
@@ -478,16 +478,16 @@ generate_xray_config() {
                 "fallbacks":  [
                     {
                         "path": "${XHTTP_PATH}",
-                        "dest": "127.0.0.1:10080",
+                        "dest": "127.0.0.1:8350",
                         "xver": 0
                     },
                     {
                         "path": "/grpc.Service",
-                        "dest": "127.0.0.1:10080",
+                        "dest": "127.0.0.1:8350",
                         "xver": 0
                     },
                     {
-                        "dest": "127.0.0.1:10080",
+                        "dest": "127.0.0.1:8350",
                         "xver": 0
                     }
                 ]

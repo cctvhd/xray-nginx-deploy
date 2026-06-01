@@ -111,7 +111,7 @@ create_nginx_dirs() {
 log_info "目录结构创建完成"
 }
 
-# ── 生成 20880 陷阱端口自签证书（P3修复：让TLS握手能完成）──
+# ── 生成 8400 陷阱端口自签证书（P3修复：让TLS握手能完成）──
 generate_trap_cert() {
     log_step "生成 SNI 陷阱端口自签证书..."
 
@@ -663,7 +663,7 @@ stream {
     map \$ssl_preread_server_name \$backend {
 $(generate_sni_map)
         # -- SNI 陷阱兜底 -----------------------------------------
-        default               127.0.0.1:20880;
+        default               127.0.0.1:8400;
     }
 
     server {
@@ -678,16 +678,16 @@ $(generate_sni_map)
 
     # -- 中间层: 消费 proxy_protocol 后转发给 sing-box ----------
     server {
-        listen 127.0.0.1:18443 proxy_protocol;
-        proxy_pass            127.0.0.1:8443;
+        listen 127.0.0.1:8360 proxy_protocol;
+        proxy_pass            127.0.0.1:8330;
         proxy_connect_timeout 10s;
         proxy_timeout         7200s;
     }
 
     # -- 中间层: 消费 proxy_protocol 后转发给 caddy-naive -------
     server {
-        listen 127.0.0.1:18444 proxy_protocol;
-        proxy_pass            127.0.0.1:8444;
+        listen 127.0.0.1:8370 proxy_protocol;
+        proxy_pass            127.0.0.1:8340;
         proxy_connect_timeout 10s;
         proxy_timeout         7200s;
     }
@@ -698,7 +698,7 @@ CONF
 }
 
 # ── 生成 SNI 路由映射 ────────────────────────────────────────
-# P4修复：Reality serverNames 里的所有域名都加进 stream map 指向 9443
+# P4修复：Reality serverNames 里的所有域名都加进 stream map 指向 8320
 generate_sni_map() {
     local had_output=0
     local sn
@@ -706,8 +706,8 @@ generate_sni_map() {
 
     # Reality 自有域名
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames 全部路由到 9443）--"
-        echo "        ${REALITY_DOMAIN}     127.0.0.1:9443;"
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames 全部路由到 8320）--"
+        echo "        ${REALITY_DOMAIN}     127.0.0.1:8320;"
         seen_sni["${REALITY_DOMAIN}"]=1
         had_output=1
     fi
@@ -715,11 +715,11 @@ generate_sni_map() {
     # Reality 所有 serverNames（包括公共域名）全部指向 9443
     # 确保客户端用任意 serverName 连接时都能命中正确后端
     if [[ -n "${REALITY_SERVER_NAMES:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality serverNames 全部路由到 9443 ---------------"
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality serverNames 全部路由到 8320 ---------------"
         for sn in "${REALITY_SERVER_NAMES[@]}"; do
             [[ -n "$sn" ]] || continue
             [[ -n "${seen_sni[$sn]:-}" ]] && continue
-            echo "        ${sn}     127.0.0.1:9443;"
+            echo "        ${sn}     127.0.0.1:8320;"
             seen_sni["$sn"]=1
         done
         had_output=1
@@ -728,31 +728,31 @@ generate_sni_map() {
     if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" == "${XHTTP_DOMAIN}" ]]; then
-            echo "        # -- xhttp + gRPC CDN 回源（同域名合并到 20443，按 path 分流）--"
+            echo "        # -- xhttp + gRPC CDN 回源（同域名合并到 8380，按 path 分流）--"
         else
             echo "        # -- xhttp CDN 回源 -----------------------------------"
         fi
-        echo "        ${XHTTP_DOMAIN}        127.0.0.1:20443;"
+        echo "        ${XHTTP_DOMAIN}        127.0.0.1:8380;"
         had_output=1
     fi
 
     if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- gRPC CDN 回源 ------------------------------------"
-        echo "        ${GRPC_DOMAIN}         127.0.0.1:20445;"
+        echo "        ${GRPC_DOMAIN}         127.0.0.1:8390;"
         had_output=1
     fi
 
     if [[ -n "${ANYTLS_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- AnyTLS -> nginx 中间层 -> sing-box ---------------"
-        echo "        ${ANYTLS_DOMAIN}       127.0.0.1:18443;"
+        echo "        ${ANYTLS_DOMAIN}       127.0.0.1:8360;"
     fi
 
     if [[ -n "${NAIVE_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- NaiveProxy -> nginx 中间层 -> caddy-naive ------"
-        echo "        ${NAIVE_DOMAIN}       127.0.0.1:18444;"
+        echo "        ${NAIVE_DOMAIN}       127.0.0.1:8370;"
     fi
 }
 
@@ -765,7 +765,7 @@ generate_upstreams_conf() {
 # /etc/nginx/conf.d/00-upstreams.conf
 # ============================================================
 upstream vless_xhttp_backend {
-    server 127.0.0.1:8001 max_fails=0 fail_timeout=30s;
+    server 127.0.0.1:8300 max_fails=0 fail_timeout=30s;
     keepalive          256;
     keepalive_requests 10000;
 # 与 Xray xhttp hMaxReusableSecs(1800-3600s) 形成梯度
@@ -774,7 +774,7 @@ keepalive_timeout 300s;
 }
 
 upstream vless_grpc_backend {
-    server 127.0.0.1:8002 max_fails=0 fail_timeout=30s;
+    server 127.0.0.1:8310 max_fails=0 fail_timeout=30s;
     keepalive          128;
     keepalive_requests 1000;
     # 修复3：与 xray grpc idle_timeout(80s) 形成梯度
@@ -800,7 +800,7 @@ generate_fallback_conf() {
 # 因此 listen 不加 proxy_protocol
 # ============================================================
 server {
-listen 127.0.0.1:10080;
+listen 127.0.0.1:8350;
     server_name   _;
     access_log    off;
     server_tokens off;
@@ -941,7 +941,7 @@ CONF
 # P1修复：location 路径与 xray xhttpSettings.path 保持一致
 # ===================================================================
 server {
-    listen 127.0.0.1:20443 ssl proxy_protocol;
+    listen 127.0.0.1:8380 ssl proxy_protocol;
     http2  on;
     server_name ${XHTTP_DOMAIN};
     gzip   on;
@@ -1071,7 +1071,7 @@ CONF
     fi
 
     # gRPC CDN server 块
-    # 同域名时已合并进 xhttp server 块（20443），跳过独立 gRPC 块以避免端口/SNI 冲突
+    # 同域名时已合并进 xhttp server 块（8380），跳过独立 gRPC 块以避免端口/SNI 冲突
     if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]]; then
         local grpc_root cert_path
         grpc_root=$(get_root_domain "${GRPC_DOMAIN}")
@@ -1084,7 +1084,7 @@ CONF
 # CDN ${GRPC_DOMAIN} — gRPC
 # ===================================================================
 server {
-    listen 127.0.0.1:20445 ssl proxy_protocol;
+    listen 127.0.0.1:8390 ssl proxy_protocol;
     http2  on;
     server_name ${GRPC_DOMAIN};
     gzip   on;
@@ -1197,26 +1197,26 @@ CONF
 # 兜底：SNI 不匹配拒绝握手
 # ===================================================================
 server {
-    listen 127.0.0.1:20443 ssl default_server proxy_protocol;
+    listen 127.0.0.1:8380 ssl default_server proxy_protocol;
     ssl_reject_handshake on;
 }
 
 server {
-    listen 127.0.0.1:20445 ssl default_server proxy_protocol;
+    listen 127.0.0.1:8390 ssl default_server proxy_protocol;
     ssl_reject_handshake on;
 }
 CONF
 
-    # P3修复：20880 加自签证书完成 TLS 握手，返回伪装页而非 RST
+    # P3修复：8400 加自签证书完成 TLS 握手，返回伪装页而非 RST
     cat >> /etc/nginx/conf.d/servers.conf << 'CONF'
 
 # ===================================================================
-# SNI 陷阱伪装站（20880）
+# SNI 陷阱伪装站（8400）
 # P3修复：加自签证书让扫描器能完成 TLS 握手，返回正常伪装页
 #         而非直接 RST（更难被识别为代理节点）
 # ===================================================================
 server {
-    listen 127.0.0.1:20880 ssl proxy_protocol;
+    listen 127.0.0.1:8400 ssl proxy_protocol;
     ssl_certificate     /etc/nginx/certs/trap.crt;
     ssl_certificate_key /etc/nginx/certs/trap.key;
     ssl_protocols       TLSv1.2 TLSv1.3;
