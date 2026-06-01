@@ -694,6 +694,20 @@ _migrate_xray_proto_v1_to_v2() {
                 new_list="${new_list:+$new_list,}$item"
             fi
         done
+        # 去重仅对 CDN 域名执行：xhttp/grpc 迁移时可能产生重复标签；
+        # direct 域名（reality 等）不受影响，直接写回
+        # （mode 已在本循环顶部从 DOMAIN_MODE_${suffix} 读取）
+        if [[ "$mode" == "cdn" ]]; then
+            local _dp _seen_p="," _deduped=""
+            IFS=',' read -ra _dp_arr <<< "$new_list"
+            for _dp in "${_dp_arr[@]}"; do
+                [[ -z "$_dp" ]] && continue
+                case "$_seen_p" in *",${_dp},"*) continue ;; esac
+                _deduped="${_deduped:+$_deduped,}${_dp}"
+                _seen_p="${_seen_p}${_dp},"
+            done
+            new_list="$_deduped"
+        fi
         save_state "DOMAIN_PROTO_${suffix}" "$new_list"
         migrated_count=$((migrated_count + 1))
     done
@@ -1542,6 +1556,45 @@ do_conf_nginx() {
 
     load_os_info
     restore_domain_arrays   # 内含 REALITY_SERVER_NAMES 恢复
+
+    # ── state 健全性检查 ────────────────────────────────────────
+    # restore_domain_arrays 只读 state，不重建；若 state 陈旧会导致
+    # XHTTP_DOMAIN / GRPC_DOMAIN 为空，使 generate_servers_conf 静默
+    # 跳过 gRPC merged-location，令 gRPC 节点在 :20443 上无 location 匹配。
+    #
+    # rebuild_protocol_domains 才是"从注册表重建并写回 state"的函数，
+    # 只在 collect_domains(b/c) 和 add_domain_and_cert 里被调用；
+    # 直接调 do_conf_nginx 时不会触发，state 可能持有旧值。
+    _cdn_state_stale=false
+    if [[ ${#CDN_DOMAINS[@]} -gt 0 && -z "${XHTTP_DOMAIN:-}" ]]; then
+        _cdn_state_stale=true
+    fi
+    if [[ "$_cdn_state_stale" == false && -z "${GRPC_DOMAIN:-}" ]]; then
+        local _sreg _sd _ss _sp
+        _sreg=$(get_state "DOMAIN_REGISTRY" "")
+        for _sd in $_sreg; do
+            _ss=$(echo "$_sd" | tr '.' '_')
+            _sp=$(get_state "DOMAIN_PROTO_${_ss}" "")
+            case ",${_sp}," in
+                *,xray-grpc,*) _cdn_state_stale=true; break ;;
+            esac
+        done
+    fi
+    if [[ "$_cdn_state_stale" == true ]]; then
+        log_warn "CDN 协议域名 state 陈旧，自动修复中..."
+        [[ -z "${XHTTP_DOMAIN:-}" ]] && log_warn "  XHTTP_DOMAIN 为空"
+        [[ -z "${GRPC_DOMAIN:-}"  ]] && log_warn "  GRPC_DOMAIN  为空"
+        # rebuild_protocol_domains：纯 state 读写，幂等，无交互、无证书申请、无网络调用
+        rebuild_protocol_domains
+        # 修复后复查：若仍为空说明 DOMAIN_REGISTRY 本身未初始化，无法自愈
+        if [[ ${#CDN_DOMAINS[@]} -gt 0 && -z "${XHTTP_DOMAIN:-}" ]]; then
+            log_error "自动修复失败：CDN_DOMAINS 非空但 XHTTP_DOMAIN 仍为空。"
+            log_warn  "请先运行菜单选项 5（申请证书 / 重新收集域名）初始化域名配置。"
+            done_return
+            return
+        fi
+        log_info "state 修复完成：XHTTP_DOMAIN=${XHTTP_DOMAIN:-<空>}  GRPC_DOMAIN=${GRPC_DOMAIN:-<空>}"
+    fi
 
     XHTTP_PATH=$(get_state "XHTTP_PATH")
     if [[ -z "${XHTTP_PATH}" ]]; then
