@@ -51,6 +51,7 @@ run_system_optimize() {
     log_step "========== 优化系统 =========="
     detect_os
     collect_hardware_info
+    collect_latency_tier
     install_base_tools           # 先装工具，后续优化依赖 ethtool/tc
     load_kernel_modules
     optimize_hardware_interrupts
@@ -228,6 +229,61 @@ collect_hardware_info() {
     log_info "  带宽       : ${HW_BANDWIDTH}"
     log_info "════════════════════════════════════════"
     echo ""
+}
+
+# ── 网络延迟档位配置 ──────────────────────────────────────────
+collect_latency_tier() {
+    log_step "配置网络延迟档位..."
+
+    local current_level current_ms
+    current_level=$(get_state "LATENCY_LEVEL" "")
+    current_ms=$(get_state "LATENCY_MS" "")
+
+    if [[ -n "$current_level" ]]; then
+        log_info "当前延迟档位: ${current_level}（${current_ms}ms）"
+        local reconf
+        read -rp "是否重新配置延迟档位？[y/N]: " reconf
+        if [[ "${reconf,,}" != "y" ]]; then
+            LATENCY_LEVEL="$current_level"
+            LATENCY_MS="$current_ms"
+            return 0
+        fi
+    fi
+
+    echo ""
+    echo "  请选择服务器到客户端的网络延迟档位："
+    echo "    1) 低延迟  （≤80ms，亚太/国内直连）"
+    echo "    2) 中延迟  （80-150ms，东南亚/日韩）"
+    echo "    3) 高延迟  （150-300ms，欧美）"
+    echo "    4) 自定义  （手动输入 ms 值）"
+    echo ""
+    local tier_choice
+    read -rp "  请选择 [1-4，默认2]: " tier_choice
+
+    case "${tier_choice:-2}" in
+        1) LATENCY_LEVEL="low";    LATENCY_MS=40  ;;
+        2) LATENCY_LEVEL="medium"; LATENCY_MS=120 ;;
+        3) LATENCY_LEVEL="high";   LATENCY_MS=200 ;;
+        4)
+            local custom_ms
+            read -rp "  请输入延迟值（ms，整数，如 100）: " custom_ms
+            if [[ "$custom_ms" =~ ^[0-9]+$ ]]; then
+                LATENCY_MS="$custom_ms"
+                if   (( LATENCY_MS <= 80  )); then LATENCY_LEVEL="low"
+                elif (( LATENCY_MS <= 150 )); then LATENCY_LEVEL="medium"
+                else                               LATENCY_LEVEL="high"
+                fi
+            else
+                log_warn "无效输入，默认使用中延迟档位"
+                LATENCY_LEVEL="medium"; LATENCY_MS=120
+            fi
+            ;;
+        *)  LATENCY_LEVEL="medium"; LATENCY_MS=120 ;;
+    esac
+
+    save_state "LATENCY_LEVEL" "$LATENCY_LEVEL"
+    save_state "LATENCY_MS"    "$LATENCY_MS"
+    log_info "延迟档位已保存: ${LATENCY_LEVEL}（${LATENCY_MS}ms）"
 }
 
 # ── 检测虚拟化环境（仅用于日志） ─────────────────────────────
