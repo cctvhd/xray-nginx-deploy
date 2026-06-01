@@ -33,6 +33,7 @@ load_existing_params() {
     NAIVE_USER=$(get_state "NAIVE_USER")
     NAIVE_PASS=$(get_state "NAIVE_PASS")
     NAIVE_PROBE_LINK=$(get_state "NAIVE_PROBE_LINK")
+    SUBSCRIPTION_PATH=$(get_state "SUBSCRIPTION_PATH")
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
@@ -290,6 +291,54 @@ print(urllib.parse.quote('${NAIVE_PASS}', safe=''))
     NAIVE_URL="naive+https://${NAIVE_USER}:${pass_encoded}@${NAIVE_DOMAIN}:443?${naive_params}#$(python3 -c "import urllib.parse; print(urllib.parse.quote('naive-${_hn}'))" 2>/dev/null || echo "naive-${_hn}")"
 }
 
+# ── 生成机场风格订阅文件 ─────────────────────────────────────
+write_subscription_file() {
+    local sub_domain="${XHTTP_DOMAIN:-${GRPC_DOMAIN:-}}"
+    local sub_dir="/var/www/html"
+    local machine_name sub_name sub_prefix
+
+    SUBSCRIPTION_URL=""
+    if [[ -z "${sub_domain}" ]]; then
+        return
+    fi
+
+    machine_name=$(hostname -s 2>/dev/null || echo "server")
+    sub_name=$(printf '%s' "${machine_name:-server}" | tr -c 'A-Za-z0-9._-' '-')
+    sub_name="${sub_name:-server}"
+    sub_prefix="/sub-${sub_name}-"
+    SUBSCRIPTION_NAME="${machine_name:-server}"
+
+    if [[ -z "${SUBSCRIPTION_PATH:-}" || ! "${SUBSCRIPTION_PATH}" =~ ^/[A-Za-z0-9._-]+$ || "${SUBSCRIPTION_PATH}" != "${sub_prefix}"* ]]; then
+        SUBSCRIPTION_PATH="${sub_prefix}$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+        save_state "SUBSCRIPTION_PATH" "${SUBSCRIPTION_PATH}"
+    fi
+
+    mkdir -p "$sub_dir"
+    local sub_file="${sub_dir}${SUBSCRIPTION_PATH}"
+    local tmp_links
+    tmp_links=$(mktemp)
+    {
+        [[ -n "${XHTTP_URL:-}" ]] && echo "$XHTTP_URL"
+        [[ -n "${GRPC_URL:-}" ]] && echo "$GRPC_URL"
+        [[ -n "${REALITY_URL:-}" ]] && echo "$REALITY_URL"
+        [[ -n "${ANYTLS_URL:-}" ]] && echo "$ANYTLS_URL"
+        [[ -n "${HYSTERIA2_URL:-}" ]] && echo "$HYSTERIA2_URL"
+        [[ -n "${NAIVE_URL:-}" ]] && echo "$NAIVE_URL"
+    } > "$tmp_links"
+
+    if [[ ! -s "$tmp_links" ]]; then
+        rm -f "$tmp_links"
+        return
+    fi
+
+    base64 -w 0 "$tmp_links" > "$sub_file"
+    echo >> "$sub_file"
+    chmod 644 "$sub_file"
+    rm -f "$tmp_links"
+
+    SUBSCRIPTION_URL="https://${sub_domain}${SUBSCRIPTION_PATH}"
+}
+
 # ── 保存并展示所有链接 ───────────────────────────────────────
 show_client_links() {
     local output_file="/root/xray_client_links.txt"
@@ -308,6 +357,18 @@ show_client_links() {
         echo "# ============================================================"
         echo ""
     } > "$output_file"
+
+    if [[ -n "${SUBSCRIPTION_URL:-}" ]]; then
+        echo -e "${GREEN}[订阅链接: ${SUBSCRIPTION_NAME}]${NC}"
+        echo "$SUBSCRIPTION_URL"
+        echo ""
+        {
+            echo "# 订阅名称: ${SUBSCRIPTION_NAME}"
+            echo "# 订阅链接"
+            echo "$SUBSCRIPTION_URL"
+            echo ""
+        } >> "$output_file"
+    fi
 
     # xhttp CDN
     if [[ -n "${XHTTP_URL:-}" ]]; then
@@ -429,6 +490,7 @@ run_client() {
     gen_anytls_url
     gen_hysteria2_url
     gen_naive_url
+    write_subscription_file
     show_client_links
     log_info "========== 客户端链接生成完成 =========="
 }
