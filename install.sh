@@ -1970,12 +1970,7 @@ upgrade_remote_version() {
         singbox)
             upgrade_github_latest SagerNet/sing-box
             ;;
-        xray)
-            curl -fsSL --max-time 5 "https://api.github.com/repos/XTLS/Xray-core/releases" 2>/dev/null \
-                | grep -oP '"tag_name"\s*:\s*"\K[^"]+' \
-                | head -1 \
-                | sed 's/^v//'
-            ;;
+        xray)      upgrade_github_latest XTLS/Xray-core ;;
         hysteria2) upgrade_github_latest apernet/hysteria ;;
         naive)     upgrade_github_latest caddyserver/caddy ;;
     esac
