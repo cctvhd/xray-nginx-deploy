@@ -5,81 +5,11 @@
 # warp 出站：内嵌 wireguard（由 warp.sh 提供凭证），不依赖本地 SOCKS5
 # ============================================================
 
-# ── 安装 Xray（直接从 GitHub releases 下载，包含预发布版本）──
+# ── 安装 Xray（官方脚本，稳定版）────────────────────────────
 install_xray() {
-    log_step "安装 Xray..."
+    log_step "安装 Xray（官方脚本）..."
 
-    local ver arch zip_name tmp_dir
-
-    # 从 /releases 列表取最新版本（包含 pre-release），而非 /releases/latest
-    ver=$(curl -fsSL --max-time 10 \
-        "https://api.github.com/repos/XTLS/Xray-core/releases" 2>/dev/null \
-        | grep -oP '"tag_name"\s*:\s*"\K[^"]+' | head -1)
-    [[ -z "$ver" ]] && { log_error "无法获取 Xray 最新版本"; exit 1; }
-    log_info "目标版本: ${ver}"
-
-    case "$(uname -m)" in
-        x86_64)          arch="64" ;;
-        aarch64|arm64)   arch="arm64-v8a" ;;
-        armv7*|armv6*)   arch="arm32-v7a" ;;
-        *)               arch="64" ;;
-    esac
-    zip_name="Xray-linux-${arch}.zip"
-
-    # 确保 unzip 可用
-    command -v unzip &>/dev/null || \
-        apt-get install -y unzip 2>/dev/null || \
-        dnf install -y unzip 2>/dev/null || true
-
-    tmp_dir=$(mktemp -d)
-    trap 'rm -rf "$tmp_dir"' RETURN
-
-    log_step "下载 ${zip_name}..."
-    curl -fsSL --max-time 120 \
-        "https://github.com/XTLS/Xray-core/releases/download/${ver}/${zip_name}" \
-        -o "${tmp_dir}/xray.zip" \
-        || { log_error "下载 Xray 失败"; exit 1; }
-
-    unzip -q "${tmp_dir}/xray.zip" -d "${tmp_dir}/xray" \
-        || { log_error "解压 Xray 失败"; exit 1; }
-
-    log_step "安装 Xray 二进制..."
-    install -m 755 "${tmp_dir}/xray/xray" /usr/local/bin/xray
-
-    # 安装地理数据（升级时一并更新）
-    mkdir -p /usr/local/share/xray
-    for dat in geoip.dat geosite.dat; do
-        [[ -f "${tmp_dir}/xray/${dat}" ]] && \
-            install -m 644 "${tmp_dir}/xray/${dat}" /usr/local/share/xray/
-    done
-
-    # 首次安装时创建 systemd service（升级时保留已有 service 文件）
-    if [[ ! -f /etc/systemd/system/xray.service ]]; then
-        cat > /etc/systemd/system/xray.service << 'SERVICE'
-[Unit]
-Description=Xray Service
-Documentation=https://github.com/xtls
-After=network.target nss-lookup.target
-
-[Service]
-User=nobody
-CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-NoNewPrivileges=true
-ExecStart=/usr/local/bin/xray run -config /usr/local/etc/xray/config.json
-Restart=on-failure
-RestartPreventExitStatus=23
-LimitNPROC=10000
-LimitNOFILE=1000000
-
-[Install]
-WantedBy=multi-user.target
-SERVICE
-        systemctl daemon-reload >/dev/null 2>&1 || true
-    fi
-
-    mkdir -p /usr/local/etc/xray /var/log/xray
-    chmod 755 /var/log/xray
+    bash -c "$(curl -L https://github.com/XTLS/Xray-install/raw/main/install-release.sh)" @ install
 
     if ! command -v xray &>/dev/null; then
         log_error "Xray 安装失败"
@@ -89,6 +19,9 @@ SERVICE
     local xray_ver
     xray_ver=$(xray version 2>&1 | grep -oP '[\d.]+' | head -1)
     log_info "Xray 安装成功: v${xray_ver}"
+
+    mkdir -p /var/log/xray
+    chmod 755 /var/log/xray
 }
 
 # ── 配置 Xray systemd 资源限制 ──────────────────────────────
