@@ -2005,7 +2005,7 @@ _rotate_xray_credentials() {
     new_public=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
     new_short_ids=$(_new_xray_short_ids)
     new_xhttp_path=$(_new_xhttp_path)
-    tmp="${config}.tmp.$$"
+    tmp="${config}.tmp.$$.json"
     backup="${config}.bak.$$"
 
     if ! NEW_XRAY_UUID="${new_uuid}" \
