@@ -28,7 +28,7 @@ STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync uninstall upgrade)
+DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync security uninstall upgrade)
 ALL_MODULES=()
 
 init_module_list() {
@@ -2281,6 +2281,12 @@ do_warp() {
     done_return
 }
 
+do_security_ssh() {
+    load_module security
+    run_security_ssh
+    done_return
+}
+
 upgrade_component_method() {
     case "$1" in
         nginx)
@@ -3349,6 +3355,7 @@ main_menu_loop() {
         echo "  k. 重置所有节点凭据并生成新订阅"
         echo "  b. 查看当前状态"
         echo "  c. 检查配置健康（preflight）"
+        echo "  d. SSH 登录安全检查/加固"
         echo "  s. 同步/更新模块到本地缓存"
         echo "  v. 升级组件（后台运行）"
         echo "  w. 配置 WARP WireGuard 凭证（步骤 11/12 的前置依赖）"
@@ -3390,6 +3397,7 @@ main_menu_loop() {
                 read -rp "按回车返回主菜单..." _
                 ;;
             c|C) run_menu_action "配置健康检查"   do_preflight_report ;;
+            d|D) run_menu_action "SSH 登录安全检查/加固" do_security_ssh ;;
             s|S) run_menu_action "同步模块"        do_sync_modules ;;
             v|V) run_menu_action "升级组件"        do_upgrade_menu ;;
             w|W) run_menu_action "配置 WARP"       do_warp ;;
