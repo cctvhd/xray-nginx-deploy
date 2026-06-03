@@ -40,6 +40,11 @@ _security_sshd_effective_value() {
     awk -v k="$key" '$1 == k { $1=""; sub(/^ /, ""); print; exit }' <<< "${SSHD_EFFECTIVE_CONFIG:-}"
 }
 
+_security_effective_value_from() {
+    local config="$1" key="$2"
+    awk -v k="$key" '$1 == k { $1=""; sub(/^ /, ""); print; exit }' <<< "$config"
+}
+
 _security_current_ssh_ports() {
     local ports effective_ports
     effective_ports=$(awk '$1 == "port" { print $2 }' <<< "${SSHD_EFFECTIVE_CONFIG:-}" \
@@ -105,14 +110,16 @@ _security_primary_authorized_key_file() {
 }
 
 _security_ensure_dropin_include() {
-    local main_conf="/etc/ssh/sshd_config"
+    local main_conf="/etc/ssh/sshd_config" first_active
     [[ -f "$main_conf" ]] || return 0
 
-    if grep -qiE '^[[:space:]]*Include[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf' "$main_conf"; then
+    first_active=$(awk '/^[[:space:]]*($|#)/ { next } { print; exit }' "$main_conf")
+    if [[ "$first_active" =~ ^[[:space:]]*[Ii]nclude[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$) ]]; then
         return 0
     fi
 
-    cp -f "$main_conf" "${main_conf}.bak.$(date +%Y%m%d%H%M%S)"
+    SECURITY_MAIN_CONF_BACKUP="${main_conf}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -f "$main_conf" "$SECURITY_MAIN_CONF_BACKUP"
     {
         echo "Include /etc/ssh/sshd_config.d/*.conf"
         sed '/^[[:space:]]*Include[[:space:]]\+\/etc\/ssh\/sshd_config\.d\/\*\.conf/I d' "$main_conf"
@@ -186,6 +193,7 @@ _security_dropin_conflicts() {
                 for (i in items) managed[items[i]] = 1
             }
             /^[[:space:]]*($|#)/ { next }
+            tolower($1) == "match" { exit }
             {
                 key = tolower($1)
                 if (managed[key]) {
@@ -211,6 +219,12 @@ _security_comment_conflicting_dropins() {
                 for (i in items) managed[items[i]] = 1
             }
             /^[[:space:]]*($|#)/ { print; next }
+            tolower($1) == "match" {
+                print
+                in_match = 1
+                next
+            }
+            in_match { print; next }
             {
                 key = tolower($1)
                 if (managed[key]) {
@@ -224,8 +238,11 @@ _security_comment_conflicting_dropins() {
         ' "$file" > "$tmp" || changed=$?
 
         if [[ "$changed" == "10" ]]; then
-            cp -f "$file" "${file}.bak.$(date +%Y%m%d%H%M%S)"
+            local backup
+            backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
+            cp -f "$file" "$backup"
             mv -f "$tmp" "$file"
+            SECURITY_MODIFIED_DROPINS+=("${file}|${backup}")
             log_info "已注释冲突项: ${file}"
             total=$((total + 1))
         else
@@ -234,6 +251,21 @@ _security_comment_conflicting_dropins() {
     done < <(_security_dropin_files "$dropin_dir")
 
     (( total > 0 )) && log_info "已处理 ${total} 个 SSH drop-in 配置文件"
+}
+
+_security_restore_modified_dropins() {
+    local item file backup
+    for item in "${SECURITY_MODIFIED_DROPINS[@]:-}"; do
+        file=${item%%|*}
+        backup=${item#*|}
+        [[ -f "$backup" ]] || continue
+        cp -f "$backup" "$file"
+        log_warn "已恢复 SSH drop-in 备份: ${file}"
+    done
+    if [[ -n "${SECURITY_MAIN_CONF_BACKUP:-}" && -f "$SECURITY_MAIN_CONF_BACKUP" ]]; then
+        cp -f "$SECURITY_MAIN_CONF_BACKUP" /etc/ssh/sshd_config
+        log_warn "已恢复 /etc/ssh/sshd_config 备份"
+    fi
 }
 
 _security_latest_backup() {
@@ -245,6 +277,81 @@ _security_latest_backup() {
         | sort -rn \
         | awk '{print $2}')
     [[ -n "$latest" ]] && echo "$latest"
+}
+
+_security_effective_ports_match() {
+    local effective="$1" expected="$2" effective_ports expected_ports
+    effective_ports=$(awk '$1 == "port" { print $2 }' <<< "$effective" \
+        | sort -n -u \
+        | tr '\n' ' ' \
+        | sed 's/[[:space:]]*$//')
+    expected_ports=$(printf '%s\n' "$expected" \
+        | tr ' ' '\n' \
+        | sort -n -u \
+        | tr '\n' ' ' \
+        | sed 's/[[:space:]]*$//')
+    [[ "$effective_ports" == "$expected_ports" ]]
+}
+
+_security_require_effective_value() {
+    local effective="$1" key="$2" expected="$3" actual
+    actual=$(_security_effective_value_from "$effective" "$key")
+    if [[ "$actual" != "$expected" ]]; then
+        log_error "SSH 生效配置不符合预期: ${key}=${actual:-missing}，期望 ${expected}"
+        return 1
+    fi
+}
+
+_security_verify_effective_config() {
+    local effective="$1" ssh_ports="$2" root_login="$3" allow_forward="$4" gateway_ports="$5"
+    local permit_tunnel="$6" alive_interval="$7" crypto_mode="$8"
+
+    _security_effective_ports_match "$effective" "$ssh_ports" || {
+        log_error "SSH 生效端口不符合预期: ${ssh_ports}"
+        return 1
+    }
+    _security_require_effective_value "$effective" "permitrootlogin" "$root_login" || return 1
+    _security_require_effective_value "$effective" "passwordauthentication" "no" || return 1
+    _security_require_effective_value "$effective" "kbdinteractiveauthentication" "no" || return 1
+    _security_require_effective_value "$effective" "pubkeyauthentication" "yes" || return 1
+    _security_require_effective_value "$effective" "authenticationmethods" "publickey" || return 1
+    _security_require_effective_value "$effective" "clientaliveinterval" "$alive_interval" || return 1
+    _security_require_effective_value "$effective" "clientalivecountmax" "10" || return 1
+    _security_require_effective_value "$effective" "allowtcpforwarding" "$allow_forward" || return 1
+    _security_require_effective_value "$effective" "allowagentforwarding" "$allow_forward" || return 1
+    _security_require_effective_value "$effective" "gatewayports" "$gateway_ports" || return 1
+    _security_require_effective_value "$effective" "permittunnel" "$permit_tunnel" || return 1
+    _security_require_effective_value "$effective" "allowstreamlocalforwarding" "no" || return 1
+    _security_require_effective_value "$effective" "maxauthtries" "3" || return 1
+    _security_require_effective_value "$effective" "logingracetime" "30" || return 1
+    _security_require_effective_value "$effective" "maxsessions" "3" || return 1
+    _security_require_effective_value "$effective" "maxstartups" "3:30:10" || return 1
+    _security_require_effective_value "$effective" "strictmodes" "yes" || return 1
+    [[ "$crypto_mode" == "modern" ]] || return 0
+    _security_require_effective_value "$effective" "kexalgorithms" "curve25519-sha256,diffie-hellman-group16-sha512" || return 1
+    _security_require_effective_value "$effective" "ciphers" "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com" || return 1
+    _security_require_effective_value "$effective" "macs" "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com" || return 1
+}
+
+_security_ports_listening() {
+    local ssh_ports="$1" port listening
+    listening=$(ss -tln 2>/dev/null || true)
+    for port in $ssh_ports; do
+        if ! awk -v p="$port" '$4 ~ ":" p "$" { found = 1 } END { exit found ? 0 : 1 }' <<< "$listening"; then
+            log_error "SSH 重启后未检测到端口 ${port} 正在监听"
+            return 1
+        fi
+    done
+}
+
+_security_restore_security_dropin() {
+    local dropin="$1" latest_backup
+    latest_backup=$(_security_latest_backup "${dropin}.bak.*")
+    if [[ -n "$latest_backup" ]]; then
+        cp -f "$latest_backup" "$dropin"
+    else
+        rm -f "$dropin"
+    fi
 }
 
 _security_add_authorized_key_interactive() {
@@ -284,6 +391,7 @@ run_security_ssh() {
     log_step "========== SSH 登录安全检查与加固 =========="
 
     local service current_ports ssh_ports root_login allow_forward gateway_ports permit_tunnel alive_interval
+    local crypto_mode effective_after
     local current_root_login current_password_auth current_pubkey_auth current_auth_keys
     local current_allow_forward current_gateway_ports current_permit_tunnel current_alive_interval conflicts
     service=$(_security_ssh_service)
@@ -369,8 +477,20 @@ run_security_ssh() {
         return 1
     fi
 
+    echo ""
+    echo "SSH 加密算法模式:"
+    echo "  1. modern（推荐，现代高性能算法，旧客户端可能不兼容）"
+    echo "  2. compatible（使用系统默认算法，兼容性更好）"
+    read -rp "输入序号 [1-2，默认 1]: " crypto_choice
+    case "${crypto_choice:-1}" in
+        2) crypto_mode="compatible" ;;
+        *) crypto_mode="modern" ;;
+    esac
+
     local dropin_dir="/etc/ssh/sshd_config.d"
     local dropin="${dropin_dir}/99-xray-deploy-security.conf"
+    SECURITY_MODIFIED_DROPINS=()
+    SECURITY_MAIN_CONF_BACKUP=""
     mkdir -p "$dropin_dir"
     _security_ensure_dropin_include
 
@@ -420,9 +540,11 @@ run_security_ssh() {
         echo "PrintMotd no"
         echo "PrintLastLog yes"
         echo "Banner none"
-        echo "KexAlgorithms curve25519-sha256,diffie-hellman-group16-sha512"
-        echo "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
-        echo "MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+        if [[ "$crypto_mode" == "modern" ]]; then
+            echo "KexAlgorithms curve25519-sha256,diffie-hellman-group16-sha512"
+            echo "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
+            echo "MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+        fi
         echo "SyslogFacility AUTHPRIV"
         echo "LogLevel VERBOSE"
     } > "$dropin"
@@ -430,14 +552,18 @@ run_security_ssh() {
     log_info "已写入 ${dropin}"
     log_step "验证 SSH 配置语法..."
     if ! _security_sshd_config_test; then
-        local latest_backup
         log_error "SSH 配置验证失败，已恢复备份（如存在）"
-        latest_backup=$(_security_latest_backup "${dropin}.bak.*")
-        if [[ -n "$latest_backup" ]]; then
-            cp -f "$latest_backup" "$dropin"
-        else
-            rm -f "$dropin"
-        fi
+        _security_restore_security_dropin "$dropin"
+        _security_restore_modified_dropins
+        return 1
+    fi
+
+    log_step "验证 SSH 生效配置..."
+    effective_after=$(_security_sshd_effective_config || true)
+    if [[ -z "$effective_after" ]] || ! _security_verify_effective_config "$effective_after" "$ssh_ports" "$root_login" "$allow_forward" "$gateway_ports" "$permit_tunnel" "$alive_interval" "$crypto_mode"; then
+        log_error "SSH 生效配置验证失败，已恢复备份（如存在）"
+        _security_restore_security_dropin "$dropin"
+        _security_restore_modified_dropins
         return 1
     fi
 
@@ -451,13 +577,27 @@ run_security_ssh() {
         return 0
     fi
 
-    systemctl restart "${service}.service"
+    if ! systemctl restart "${service}.service"; then
+        log_error "SSH 重启失败"
+        _security_restore_security_dropin "$dropin"
+        _security_restore_modified_dropins
+        systemctl restart "${service}.service" 2>/dev/null || true
+        return 1
+    fi
+    if ! _security_ports_listening "$ssh_ports"; then
+        _security_restore_security_dropin "$dropin"
+        _security_restore_modified_dropins
+        systemctl restart "${service}.service" 2>/dev/null || true
+        return 1
+    fi
+
     save_state "SSH_PORTS" "$ssh_ports"
     save_state "SSH_ROOT_LOGIN" "$root_login"
     save_state "SSH_ALLOW_FORWARD" "$allow_forward"
     save_state "SSH_GATEWAY_PORTS" "$gateway_ports"
     save_state "SSH_PERMIT_TUNNEL" "$permit_tunnel"
     save_state "SSH_CLIENT_ALIVE_INTERVAL" "$alive_interval"
+    save_state "SSH_CRYPTO_MODE" "$crypto_mode"
     save_state "SSH_AUTHORIZED_KEYS_FILE" "$(_security_primary_authorized_key_file)"
     save_state "CONF_SECURITY_SSH" "1"
 
