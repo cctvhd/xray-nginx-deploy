@@ -823,24 +823,39 @@ load_latency_params() {
     level=$(get_state "LATENCY_LEVEL" "medium")
     case "$level" in
         low)
+            # shellcheck disable=SC2034
             LATENCY_XMUX_CONCURRENCY="8-16"
+            # shellcheck disable=SC2034
             LATENCY_XMUX_REQUEST_TIMES="300-500"
+            # shellcheck disable=SC2034
             LATENCY_XMUX_REUSABLE_SECS="1200-1800"
+            # shellcheck disable=SC2034
             LATENCY_GRPC_TIMEOUT=60
+            # shellcheck disable=SC2034
             LATENCY_PROXY_TIMEOUT=1800
             ;;
         high)
+            # shellcheck disable=SC2034
             LATENCY_XMUX_CONCURRENCY="32-64"
+            # shellcheck disable=SC2034
             LATENCY_XMUX_REQUEST_TIMES="1000-1500"
+            # shellcheck disable=SC2034
             LATENCY_XMUX_REUSABLE_SECS="3000-5400"
+            # shellcheck disable=SC2034
             LATENCY_GRPC_TIMEOUT=300
+            # shellcheck disable=SC2034
             LATENCY_PROXY_TIMEOUT=7200
             ;;
         medium|*)
+            # shellcheck disable=SC2034
             LATENCY_XMUX_CONCURRENCY="16-32"
+            # shellcheck disable=SC2034
             LATENCY_XMUX_REQUEST_TIMES="600-900"
+            # shellcheck disable=SC2034
             LATENCY_XMUX_REUSABLE_SECS="1800-3000"
+            # shellcheck disable=SC2034
             LATENCY_GRPC_TIMEOUT=120
+            # shellcheck disable=SC2034
             LATENCY_PROXY_TIMEOUT=7200
             ;;
     esac
@@ -932,21 +947,39 @@ sync_modules() {
 }
 
 # ── 根据实际服务状态自动补全 state ──────────────────────────
+_sync_state_if_needed() {
+    local key="$1"
+    [[ "$(get_step "$key")" == "1" ]] && return 0
+    save_state "$key" "1"
+}
+
 _sync_inst_state() {
-    command -v nginx    &>/dev/null && [[ "$(get_step INST_NGINX)"   != "1" ]] && save_state "INST_NGINX"   "1" || true
-    command -v xray     &>/dev/null && [[ "$(get_step INST_XRAY)"    != "1" ]] && save_state "INST_XRAY"    "1" || true
-    command -v sing-box   &>/dev/null && [[ "$(get_step INST_SINGBOX)"   != "1" ]] && save_state "INST_SINGBOX"   "1" || true
-    command -v hysteria   &>/dev/null && [[ "$(get_step INST_HYSTERIA2)" != "1" ]] && save_state "INST_HYSTERIA2" "1" || true
-    command -v caddy-naive &>/dev/null && [[ "$(get_step INST_NAIVE)"    != "1" ]] && save_state "INST_NAIVE"    "1" || true
-    command -v wgcf       &>/dev/null && [[ "$(get_step INST_WARP)"      != "1" ]] && save_state "INST_WARP"      "1" || true
-    command -v unbound  &>/dev/null && [[ "$(get_step INST_UNBOUND)" != "1" ]] && save_state "INST_UNBOUND" "1" || true
-    systemctl is-active --quiet nginx    2>/dev/null && [[ -f /etc/nginx/conf.d/servers.conf ]] && [[ "$(get_step CONF_NGINX)"   != "1" ]] && save_state "CONF_NGINX"   "1" || true
-    systemctl is-active --quiet xray     2>/dev/null && [[ -f /usr/local/etc/xray/config.json ]]    && [[ "$(get_step CONF_XRAY)"    != "1" ]] && save_state "CONF_XRAY"    "1" || true
-    systemctl is-active --quiet sing-box 2>/dev/null && [[ -f /etc/sing-box/config.json ]]          && [[ "$(get_step CONF_SINGBOX)"   != "1" ]] && save_state "CONF_SINGBOX"   "1" || true
-    systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f /etc/hysteria/config.yaml ]]   && [[ "$(get_step CONF_HYSTERIA2)" != "1" ]] && save_state "CONF_HYSTERIA2" "1" || true
-    systemctl is-active --quiet caddy-naive 2>/dev/null && [[ -f /etc/caddy-naive/Caddyfile ]]       && [[ "$(get_step CONF_NAIVE)"     != "1" ]] && save_state "CONF_NAIVE"     "1" || true
-    [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]] && \
-        [[ "$(get_step CONF_WARP)" != "1" ]] && save_state "CONF_WARP" "1" || true
+    if command -v nginx &>/dev/null; then _sync_state_if_needed "INST_NGINX"; fi
+    if command -v xray &>/dev/null; then _sync_state_if_needed "INST_XRAY"; fi
+    if command -v sing-box &>/dev/null; then _sync_state_if_needed "INST_SINGBOX"; fi
+    if command -v hysteria &>/dev/null; then _sync_state_if_needed "INST_HYSTERIA2"; fi
+    if command -v caddy-naive &>/dev/null; then _sync_state_if_needed "INST_NAIVE"; fi
+    if command -v wgcf &>/dev/null; then _sync_state_if_needed "INST_WARP"; fi
+    if command -v unbound &>/dev/null; then _sync_state_if_needed "INST_UNBOUND"; fi
+
+    if systemctl is-active --quiet nginx 2>/dev/null && [[ -f /etc/nginx/conf.d/servers.conf ]]; then
+        _sync_state_if_needed "CONF_NGINX"
+    fi
+    if systemctl is-active --quiet xray 2>/dev/null && [[ -f /usr/local/etc/xray/config.json ]]; then
+        _sync_state_if_needed "CONF_XRAY"
+    fi
+    if systemctl is-active --quiet sing-box 2>/dev/null && [[ -f /etc/sing-box/config.json ]]; then
+        _sync_state_if_needed "CONF_SINGBOX"
+    fi
+    if systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f /etc/hysteria/config.yaml ]]; then
+        _sync_state_if_needed "CONF_HYSTERIA2"
+    fi
+    if systemctl is-active --quiet caddy-naive 2>/dev/null && [[ -f /etc/caddy-naive/Caddyfile ]]; then
+        _sync_state_if_needed "CONF_NAIVE"
+    fi
+    if [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]]; then
+        _sync_state_if_needed "CONF_WARP"
+    fi
     _sync_cert_state
 }
 
@@ -1082,6 +1115,7 @@ ENV
     OS_ID=$(get_state "OS_ID")
     OS_NAME=$(get_state "OS_NAME")
     PKG_MANAGER=$(get_state "PKG_MANAGER")
+    # shellcheck disable=SC2034
     KERNEL_UPGRADED=$(get_state "KERNEL_UPGRADED")
     HW_CPU_CORES=$(get_state "HW_CPU_CORES")
     HW_MEM_GB=$(get_state "HW_MEM_GB")
@@ -1152,11 +1186,15 @@ load_os_info() {
     if [[ -n "${OS_ID:-}" ]]; then
         case "$OS_ID" in
             ubuntu|debian)
+                # shellcheck disable=SC2034
                 PKG_UPDATE="apt-get update -y"
+                # shellcheck disable=SC2034
                 PKG_INSTALL="apt-get install -y"
                 ;;
             centos|rhel|rocky|almalinux|fedora)
+                # shellcheck disable=SC2034
                 PKG_UPDATE="dnf makecache -y"
+                # shellcheck disable=SC2034
                 PKG_INSTALL="dnf install -y"
                 ;;
             *)
@@ -1181,6 +1219,7 @@ show_status() {
     local s_kernel s_system s_unbound s_nginx s_cert s_xray s_singbox s_hysteria2 s_naive s_warp
     local c_nginx c_xray c_singbox c_hysteria2 c_naive c_warp
     restore_domain_arrays 2>/dev/null || true
+    # shellcheck disable=SC2034
     local cf_ini_for_domain=""
 
     { [[ "$(get_step INST_KERNEL)"  == "1" ]] || \
@@ -1249,7 +1288,9 @@ show_status() {
 
     local cached_count=0
     for m in "${ALL_MODULES[@]}"; do
-        [[ -f "${LOCAL_MODULES_DIR}/${m}.sh" ]] && (( cached_count++ )) || true
+        if [[ -f "${LOCAL_MODULES_DIR}/${m}.sh" ]]; then
+            (( cached_count++ ))
+        fi
     done
     local total_modules=${#ALL_MODULES[@]}
 
@@ -1745,6 +1786,7 @@ do_conf_singbox() {
     load_os_info
     restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    # shellcheck disable=SC2034
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
 
@@ -2787,7 +2829,9 @@ tail_upgrade_log() {
         return
     fi
 
-    latest_log=$(ls -t "${status_dir}"/upgrade-*.log 2>/dev/null | head -1)
+    latest_log=$(find "$status_dir" -maxdepth 1 -type f -name 'upgrade-*.log' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn \
+        | awk 'NR == 1 { $1=""; sub(/^ /, ""); print }')
     component=$(basename "$latest_log" | sed -E 's/^upgrade-([^-]+)-.*\.log$/\1/')
     status_file="${status_dir}/upgrade-${component}.status"
     pid_file="${status_dir}/upgrade-${component}.pid"
@@ -2834,7 +2878,9 @@ show_upgrade_status() {
         echo "  暂无升级状态文件"
     fi
 
-    latest_log=$(ls -t "${status_dir}"/upgrade-*.log 2>/dev/null | head -1 || true)
+    latest_log=$(find "$status_dir" -maxdepth 1 -type f -name 'upgrade-*.log' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn \
+        | awk 'NR == 1 { $1=""; sub(/^ /, ""); print }')
     if [[ -n "$latest_log" ]]; then
         echo ""
         echo "  最新日志: ${latest_log}"
@@ -3125,6 +3171,7 @@ run_full_install_flow() {
 
     restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    # shellcheck disable=SC2034
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     generate_singbox_params
@@ -3264,9 +3311,11 @@ do_selinux_mgmt() {
             read -rp "  请选择 [1/q]: " mgmt_choice
             case "${mgmt_choice:-}" in
                 1)
-                    setenforce 0 2>/dev/null && \
-                        log_info "已切换到 Permissive 模式" || \
+                    if setenforce 0 2>/dev/null; then
+                        log_info "已切换到 Permissive 模式"
+                    else
                         log_error "切换失败"
+                    fi
                     ;;
             esac
             ;;
@@ -3278,9 +3327,11 @@ do_selinux_mgmt() {
                 read -rp "  请选择 [1/q]: " mgmt_choice
                 case "${mgmt_choice:-}" in
                     1)
-                        setenforce 1 2>/dev/null && \
-                            log_info "已切换到 Enforcing 模式" || \
+                        if setenforce 1 2>/dev/null; then
+                            log_info "已切换到 Enforcing 模式"
+                        else
                             log_error "切换失败"
+                        fi
                         ;;
                 esac
             else
@@ -3294,9 +3345,11 @@ do_selinux_mgmt() {
                         log_warn "端口标签或布尔值不完整，强制切换 Enforcing 可能导致服务异常"
                         read -rp "确认切换？[y/N]: " c
                         if [[ "${c,,}" == "y" ]]; then
-                            setenforce 1 2>/dev/null && \
-                                log_info "已切换到 Enforcing 模式" || \
+                            if setenforce 1 2>/dev/null; then
+                                log_info "已切换到 Enforcing 模式"
+                            else
                                 log_error "切换失败"
+                            fi
                         fi
                         ;;
                     2)
