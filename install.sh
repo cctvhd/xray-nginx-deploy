@@ -1889,6 +1889,381 @@ do_client() {
     done_return
 }
 
+_new_uuid() {
+    if command -v xray &>/dev/null; then
+        xray uuid
+    else
+        cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen
+    fi
+}
+
+_new_xray_short_ids() {
+    printf '%s %s %s %s %s' \
+        "$(openssl rand -hex 4)" \
+        "$(openssl rand -hex 4)" \
+        "$(openssl rand -hex 4)" \
+        "$(openssl rand -hex 6)" \
+        "$(openssl rand -hex 8)"
+}
+
+_new_xhttp_path() {
+    printf '/%s' "$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+}
+
+_new_subscription_path() {
+    local old_path machine_name sub_name new_path
+    old_path=$(get_state "SUBSCRIPTION_PATH" "")
+    if [[ "${old_path}" =~ ^/[A-Za-z0-9._-]+$ ]]; then
+        rm -f "/var/www/html${old_path}"
+    fi
+
+    machine_name=$(hostname -s 2>/dev/null || echo "server")
+    sub_name=$(printf '%s' "${machine_name:-server}" | tr -c 'A-Za-z0-9._-' '-')
+    sub_name="${sub_name:-server}"
+    new_path="/sub-${sub_name}-$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+    save_state "SUBSCRIPTION_PATH" "${new_path}"
+    log_info "已生成新订阅路径: ${new_path}"
+}
+
+_is_conf_step_enabled() {
+    local step="$1"
+    [[ "$(get_step "$step")" == "1" ]]
+}
+
+_restart_rotated_service() {
+    local service="$1" backup="$2" config="$3" keep_backup="${4:-0}"
+
+    if systemctl restart "$service"; then
+        [[ "$keep_backup" == "1" ]] || rm -f "$backup"
+        return 0
+    fi
+
+    log_error "${service} 重启失败，恢复旧配置"
+    mv -f "$backup" "$config" 2>/dev/null || true
+    systemctl restart "$service" 2>/dev/null || true
+    return 1
+}
+
+_sync_nginx_after_credential_reset() {
+    _is_conf_step_enabled "CONF_NGINX" || return 0
+
+    log_step "同步 Nginx 协议入口配置..."
+    load_os_info
+    restore_domain_arrays
+
+    if ! preflight_config_check "credential_reset_nginx_sync"; then
+        log_error "Nginx 同步前检查失败，已停止安全重置"
+        return 1
+    fi
+
+    load_module nginx
+    generate_upstreams_conf
+    generate_fallback_conf
+    generate_servers_conf || return 1
+    generate_nginx_conf
+    if ! nginx -t; then
+        log_error "Nginx 配置验证失败，已停止安全重置"
+        return 1
+    fi
+    if ! systemctl restart nginx; then
+        log_error "Nginx 重启失败，已停止安全重置"
+        return 1
+    fi
+    log_info "Nginx 已同步新 XHTTP 路径"
+}
+
+_restore_xray_after_nginx_sync_failure() {
+    local config="/usr/local/etc/xray/config.json"
+    [[ -n "${RESET_XRAY_BACKUP:-}" && -f "${RESET_XRAY_BACKUP}" ]] || return 0
+
+    log_error "Nginx 同步失败，恢复 Xray 旧配置和旧 XHTTP 路径"
+    mv -f "${RESET_XRAY_BACKUP}" "$config" 2>/dev/null || true
+    save_state "XRAY_UUID" "${RESET_OLD_XRAY_UUID:-}"
+    save_state "XRAY_PRIVATE_KEY" "${RESET_OLD_XRAY_PRIVATE_KEY:-}"
+    save_state "XRAY_PUBLIC_KEY" "${RESET_OLD_XRAY_PUBLIC_KEY:-}"
+    save_state "REALITY_SHORT_IDS" "${RESET_OLD_REALITY_SHORT_IDS:-}"
+    save_state "REALITY_SHORT_ID" "${RESET_OLD_REALITY_SHORT_ID:-}"
+    [[ -n "${RESET_OLD_XHTTP_PATH:-}" ]] && save_state "XHTTP_PATH" "${RESET_OLD_XHTTP_PATH}"
+    systemctl restart xray.service 2>/dev/null || true
+}
+
+_rotate_xray_credentials() {
+    local config="/usr/local/etc/xray/config.json"
+    _is_conf_step_enabled "CONF_XRAY" || return 0
+    [[ -f "${config}" ]] || { log_warn "跳过 Xray：未找到 ${config}"; return 0; }
+
+    if ! command -v xray &>/dev/null; then
+        log_warn "跳过 Xray：未找到 xray 命令"
+        return 0
+    fi
+
+    log_step "轮换 Xray UUID / Reality 密钥 / shortIds..."
+    local new_uuid keypair new_private new_public new_short_ids new_xhttp_path tmp backup
+    new_uuid=$(_new_uuid)
+    keypair=$(xray x25519)
+    new_private=$(echo "$keypair" | grep -i "private" | awk '{print $NF}')
+    new_public=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
+    new_short_ids=$(_new_xray_short_ids)
+    new_xhttp_path=$(_new_xhttp_path)
+    tmp="${config}.tmp.$$"
+    backup="${config}.bak.$$"
+
+    if ! NEW_XRAY_UUID="${new_uuid}" \
+        NEW_XRAY_PRIVATE_KEY="${new_private}" \
+        NEW_XRAY_SHORT_IDS="${new_short_ids}" \
+        NEW_XHTTP_PATH="${new_xhttp_path}" \
+        python3 - "$config" "$tmp" << 'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+tmp = Path(sys.argv[2])
+with path.open() as f:
+    config = json.load(f)
+
+new_uuid = os.environ["NEW_XRAY_UUID"]
+new_private_key = os.environ["NEW_XRAY_PRIVATE_KEY"]
+new_short_ids = os.environ["NEW_XRAY_SHORT_IDS"].split()
+new_xhttp_path = os.environ["NEW_XHTTP_PATH"]
+
+changed = 0
+for inbound in config.get("inbounds", []):
+    for client in inbound.get("settings", {}).get("clients", []):
+        if "id" in client:
+            client["id"] = new_uuid
+            changed += 1
+
+    reality = inbound.get("streamSettings", {}).get("realitySettings")
+    if reality:
+        reality["privateKey"] = new_private_key
+        reality["shortIds"] = new_short_ids
+        changed += 1
+
+    xhttp = inbound.get("streamSettings", {}).get("xhttpSettings")
+    if xhttp and "path" in xhttp:
+        xhttp["path"] = new_xhttp_path
+        changed += 1
+
+if changed == 0:
+    sys.exit("no Xray client or Reality credential fields matched")
+
+with tmp.open("w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+    then
+        rm -f "$tmp"
+        log_error "Xray 配置字段匹配失败，已停止安全重置"
+        exit 1
+    fi
+
+    if ! xray run -test -config "$tmp"; then
+        rm -f "$tmp"
+        log_error "Xray 配置验证失败，已停止安全重置"
+        exit 1
+    fi
+    cp -p "$config" "$backup"
+    mv -f "$tmp" "$config"
+
+    RESET_OLD_XRAY_UUID=$(get_state "XRAY_UUID" "")
+    RESET_OLD_XRAY_PRIVATE_KEY=$(get_state "XRAY_PRIVATE_KEY" "")
+    RESET_OLD_XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY" "")
+    RESET_OLD_REALITY_SHORT_IDS=$(get_state "REALITY_SHORT_IDS" "")
+    RESET_OLD_REALITY_SHORT_ID=$(get_state "REALITY_SHORT_ID" "")
+    RESET_OLD_XHTTP_PATH=$(get_state "XHTTP_PATH" "")
+    RESET_XRAY_BACKUP="$backup"
+    _restart_rotated_service "xray.service" "$backup" "$config" "1" || exit 1
+    save_state "XRAY_UUID" "${new_uuid}"
+    save_state "XRAY_PRIVATE_KEY" "${new_private}"
+    save_state "XRAY_PUBLIC_KEY" "${new_public}"
+    save_state "XHTTP_PATH" "${new_xhttp_path}"
+    save_state "REALITY_SHORT_IDS" "${new_short_ids}"
+    save_state "REALITY_SHORT_ID" "$(awk '{print $2}' <<< "${new_short_ids}")"
+    log_info "Xray 凭据已轮换"
+
+}
+
+_rotate_singbox_credentials() {
+    local config="/etc/sing-box/config.json"
+    _is_conf_step_enabled "CONF_SINGBOX" || return 0
+    [[ -f "${config}" ]] || { log_warn "跳过 Sing-Box：未找到 ${config}"; return 0; }
+
+    log_step "轮换 Sing-Box AnyTLS 密码..."
+    local new_password tmp backup
+    new_password=$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-20)
+    new_password="${new_password}-$(openssl rand -hex 4)"
+    tmp="${config}.tmp.$$"
+    backup="${config}.bak.$$"
+
+    if ! NEW_SINGBOX_PASSWORD="${new_password}" python3 - "$config" "$tmp" << 'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+tmp = Path(sys.argv[2])
+with path.open() as f:
+    config = json.load(f)
+
+new_password = os.environ["NEW_SINGBOX_PASSWORD"]
+changed = 0
+for inbound in config.get("inbounds", []):
+    if inbound.get("type") == "anytls":
+        for user in inbound.get("users", []):
+            user["password"] = new_password
+            changed += 1
+
+if changed == 0:
+    sys.exit("no Sing-Box AnyTLS users matched")
+
+with tmp.open("w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+    then
+        rm -f "$tmp"
+        log_error "Sing-Box 配置字段匹配失败，已停止安全重置"
+        exit 1
+    fi
+
+    if command -v sing-box &>/dev/null && ! sing-box check -c "$tmp"; then
+        rm -f "$tmp"
+        log_error "Sing-Box 配置验证失败，已停止安全重置"
+        exit 1
+    fi
+    cp -p "$config" "$backup"
+    mv -f "$tmp" "$config"
+
+    _restart_rotated_service "sing-box.service" "$backup" "$config" || exit 1
+    save_state "SINGBOX_PASSWORD" "${new_password}"
+    log_info "Sing-Box AnyTLS 密码已轮换"
+}
+
+_rotate_hysteria2_credentials() {
+    local config="/etc/hysteria/config.yaml"
+    _is_conf_step_enabled "CONF_HYSTERIA2" || return 0
+    [[ -f "${config}" ]] || { log_warn "跳过 Hysteria2：未找到 ${config}"; return 0; }
+
+    log_step "轮换 Hysteria2 密码..."
+    local new_password tmp backup
+    new_password=$(openssl rand -base64 18)
+    tmp="${config}.tmp.$$"
+    backup="${config}.bak.$$"
+
+    if ! NEW_HYSTERIA2_PASSWORD="${new_password}" python3 - "$config" "$tmp" << 'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+tmp = Path(sys.argv[2])
+new_password = os.environ["NEW_HYSTERIA2_PASSWORD"]
+text = path.read_text()
+text, password_count = re.subn(r"^(\s+password:\s*).*$", rf"\g<1>{new_password}", text, flags=re.MULTILINE)
+text, secret_count = re.subn(r"^(\s+secret:\s*).*$", rf"\g<1>{new_password}", text, flags=re.MULTILINE)
+if password_count + secret_count == 0:
+    sys.exit("no Hysteria2 password or secret fields matched")
+tmp.write_text(text)
+PY
+    then
+        rm -f "$tmp"
+        log_error "Hysteria2 配置字段匹配失败，已停止安全重置"
+        exit 1
+    fi
+    cp -p "$config" "$backup"
+    mv -f "$tmp" "$config"
+
+    _restart_rotated_service "hysteria-server.service" "$backup" "$config" || exit 1
+    save_state "HYSTERIA2_PASSWORD" "${new_password}"
+    log_info "Hysteria2 密码已轮换"
+}
+
+_rotate_naive_credentials() {
+    local config="/etc/caddy-naive/Caddyfile"
+    _is_conf_step_enabled "CONF_NAIVE" || return 0
+    [[ -f "${config}" ]] || { log_warn "跳过 NaiveProxy：未找到 ${config}"; return 0; }
+
+    log_step "轮换 NaiveProxy 用户名 / 密码 / probe_resistance..."
+    local new_user new_password new_probe tmp backup
+    new_user="u$(openssl rand -hex 6)"
+    new_password="$(openssl rand -hex 10)"
+    new_probe=$(openssl rand -hex 8)
+    tmp="${config}.tmp.$$"
+    backup="${config}.bak.$$"
+
+    if ! NEW_NAIVE_USER="${new_user}" \
+        NEW_NAIVE_PASS="${new_password}" \
+        NEW_NAIVE_PROBE="${new_probe}" \
+        python3 - "$config" "$tmp" << 'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+tmp = Path(sys.argv[2])
+text = path.read_text()
+text, auth_count = re.subn(
+    r"^(\s*basic_auth\s+)\S+\s+\S+\s*$",
+    rf"\g<1>{os.environ['NEW_NAIVE_USER']} {os.environ['NEW_NAIVE_PASS']}",
+    text,
+    flags=re.MULTILINE,
+)
+text, probe_count = re.subn(
+    r"^(\s*probe_resistance\s+)[^.]+(\..*)$",
+    rf"\g<1>{os.environ['NEW_NAIVE_PROBE']}\2",
+    text,
+    flags=re.MULTILINE,
+)
+if auth_count == 0 or probe_count == 0:
+    sys.exit("no NaiveProxy basic_auth or probe_resistance fields matched")
+tmp.write_text(text)
+PY
+    then
+        rm -f "$tmp"
+        log_error "NaiveProxy 配置字段匹配失败，已停止安全重置"
+        exit 1
+    fi
+
+    if command -v caddy-naive &>/dev/null && ! caddy-naive validate --config "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        log_error "NaiveProxy 配置验证失败，已停止安全重置"
+        exit 1
+    fi
+    cp -p "$config" "$backup"
+    mv -f "$tmp" "$config"
+
+    _restart_rotated_service "caddy-naive.service" "$backup" "$config" || exit 1
+    save_state "NAIVE_USER" "${new_user}"
+    save_state "NAIVE_PASS" "${new_password}"
+    save_state "NAIVE_PROBE_LINK" "${new_probe}"
+    log_info "NaiveProxy 凭据已轮换"
+}
+
+do_reset_client_credentials() {
+    log_warn "这会重置所有已配置节点的客户端凭据，旧订阅和旧节点链接将失效。"
+    read -rp "确认继续？[y/N]: " c
+    [[ "${c,,}" != "y" ]] && return
+
+    _rotate_xray_credentials
+    _rotate_singbox_credentials
+    _rotate_hysteria2_credentials
+    _rotate_naive_credentials
+    _sync_nginx_after_credential_reset || {
+        _restore_xray_after_nginx_sync_failure
+        exit 1
+    }
+    rm -f "${RESET_XRAY_BACKUP:-}"
+    RESET_XRAY_BACKUP=""
+    _new_subscription_path
+
+    do_client
+}
+
 do_warp() {
     load_os_info
     load_module warp
@@ -2971,6 +3346,7 @@ main_menu_loop() {
         echo ""
         echo "  === 其他 ==="
         echo "  a. 生成客户端链接"
+        echo "  k. 重置所有节点凭据并生成新订阅"
         echo "  b. 查看当前状态"
         echo "  c. 检查配置健康（preflight）"
         echo "  s. 同步/更新模块到本地缓存"
@@ -3008,6 +3384,7 @@ main_menu_loop() {
           h|H) run_menu_action "重新配置 Hysteria2"  do_reconf_hysteria2 ;;
           i|I) run_menu_action "重新配置 NaiveProxy" do_reconf_naive ;;
             a|A) run_menu_action "生成客户端链接"   do_client ;;
+            k|K) run_menu_action "重置所有节点凭据并生成新订阅" do_reset_client_credentials ;;
             b|B)
                 run_menu_action "查看状态" show_status
                 read -rp "按回车返回主菜单..." _
