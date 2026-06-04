@@ -182,13 +182,15 @@ install_naive() {
         exit 1
     fi
 
-    if ! cp "${build_tmpdir}/caddy" /usr/local/bin/caddy-naive; then
+    # Use copy-then-rename to avoid "Text file busy" when caddy-naive is running
+    if ! cp "${build_tmpdir}/caddy" /usr/local/bin/caddy-naive.new; then
         log_error "安装 caddy-naive 失败: 无法复制到 /usr/local/bin/"
         rm -rf "$build_tmpdir"
         set +x
         exit 1
     fi
-    chmod +x /usr/local/bin/caddy-naive
+    chmod +x /usr/local/bin/caddy-naive.new
+    mv -f /usr/local/bin/caddy-naive.new /usr/local/bin/caddy-naive
     rm -rf "$build_tmpdir"
 
     # SELinux: 标记 Caddy 二进制为普通 bin_t（AlmaLinux/CentOS 12/SuSE 等加固环境）
