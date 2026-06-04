@@ -3219,6 +3219,42 @@ do_reconf_nginx() {
 	log_info "Nginx 配置清理完成，开始重新生成..."
 
 	do_conf_nginx
+
+	# ── 端口一致性检查：nginx 期望的内部端口 vs xray/singbox 实际配置 ──
+	local mismatch=0
+	# xray xhttp 应监听 8300
+	if [[ -f /usr/local/etc/xray/config.json ]]; then
+		if ! grep -q '"port":\s*8300' /usr/local/etc/xray/config.json && \
+		   ! grep -q '"port": 8300'   /usr/local/etc/xray/config.json; then
+			log_warn "检测到端口不一致：Xray config.json 中未找到 xhttp inbound 端口 8300"
+			mismatch=1
+		fi
+		if ! grep -q '"port":\s*8310' /usr/local/etc/xray/config.json && \
+		   ! grep -q '"port": 8310'   /usr/local/etc/xray/config.json; then
+			log_warn "检测到端口不一致：Xray config.json 中未找到 gRPC inbound 端口 8310"
+			mismatch=1
+		fi
+		if ! grep -q '"port":\s*8320' /usr/local/etc/xray/config.json && \
+		   ! grep -q '"port": 8320'   /usr/local/etc/xray/config.json; then
+			log_warn "检测到端口不一致：Xray config.json 中未找到 Reality inbound 端口 8320"
+			mismatch=1
+		fi
+	fi
+	# singbox anytls 应监听 8330
+	if [[ -f /etc/sing-box/config.json ]]; then
+		if ! grep -q '"listen_port":\s*8330' /etc/sing-box/config.json && \
+		   ! grep -q '"listen_port": 8330'   /etc/sing-box/config.json; then
+			log_warn "检测到端口不一致：sing-box config.json 中未找到 AnyTLS inbound 端口 8330"
+			mismatch=1
+		fi
+	fi
+	if [[ "$mismatch" -eq 1 ]]; then
+		log_warn "━━━ 内部端口不一致，Nginx 无法正确转发请求 ━━━"
+		log_warn "需要重新配置 Xray / Sing-Box 以对齐端口，否则相关协议无法工作"
+		log_warn "请从主菜单依次执行："
+		log_warn "  x → 重新配置 Xray"
+		log_warn "  g → 重新配置 Sing-Box（如已安装）"
+	fi
 }
 
 do_reconf_xray() {
