@@ -2448,7 +2448,7 @@ restart_service_if_configured() {
         return 0
     fi
 
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${service}"; then
+    if systemctl cat "$service" >/dev/null 2>&1; then
         systemctl restart "$service" || {
             log_warn "${service} 重启失败，请查看: journalctl -u ${service} --no-pager -n 50"
             return 0
