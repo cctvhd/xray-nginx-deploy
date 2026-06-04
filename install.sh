@@ -2329,6 +2329,12 @@ do_security_ssh() {
     done_return
 }
 
+do_security_keys() {
+    load_module security
+    run_security_keys
+    done_return
+}
+
 do_firewall_nftables() {
     load_module firewall
     run_firewall_nftables
@@ -3427,6 +3433,7 @@ main_menu_loop() {
         echo "  b. 查看当前状态"
         echo "  c. 检查配置健康（preflight）"
         echo "  d. SSH 登录安全检查/加固"
+        echo "  m. SSH 公钥管理（查看/追加/替换）"
         echo "  f. nftables 防火墙安装/配置"
         echo "  e. CrowdSec 安装/配置"
         echo "  j. CrowdSec 更新"
@@ -3472,6 +3479,7 @@ main_menu_loop() {
                 ;;
             c|C) run_menu_action "配置健康检查"   do_preflight_report ;;
             d|D) run_menu_action "SSH 登录安全检查/加固" do_security_ssh ;;
+            m|M) run_menu_action "SSH 公钥管理" do_security_keys ;;
             f|F) run_menu_action "nftables 防火墙安装/配置" do_firewall_nftables ;;
             e|E) run_menu_action "CrowdSec 安装/配置" do_crowdsec_install_config ;;
             j|J) run_menu_action "CrowdSec 更新" do_crowdsec_update ;;

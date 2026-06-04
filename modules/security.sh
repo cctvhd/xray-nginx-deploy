@@ -392,12 +392,109 @@ _security_restore_crypto_policy() {
     SECURITY_CRYPTO_POLICY_BACKUP=""
 }
 
-_security_add_authorized_key_interactive() {
-    local key key_file key_dir
-    key_file=$(_security_primary_authorized_key_file)
+_security_key_valid() {
+    local key type keydata
+    key=$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -z "$key" ]] && return 1
+    type=$(awk '{print $1}' <<< "$key")
+    keydata=$(awk '{print $2}' <<< "$key")
+    [[ ${#keydata} -lt 40 ]] && return 1
+    case "$type" in
+        ssh-ed25519|sk-ssh-ed25519@openssh.com) ;;
+        ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ;;
+        sk-ecdsa-sha2-nistp256@openssh.com) ;;
+        ssh-rsa) log_warn "检测到 ssh-rsa；建议改用 ED25519 新密钥" ;;
+        ssh-dss) log_warn "ssh-dss 已不安全，强烈建议更换 ED25519 密钥" ;;
+        *) return 1 ;;
+    esac
+    SECURITY_KEY_TYPE="$type"
+    return 0
+}
+
+_security_key_user_home() {
+    local user="$1" home
+    if command -v getent >/dev/null 2>&1; then
+        home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    fi
+    [[ -z "$home" ]] && home=$(awk -F: -v u="$user" '$1==u{print $6;exit}' /etc/passwd 2>/dev/null)
+    if [[ -z "$home" ]]; then
+        [[ "$user" == "root" ]] && home="/root" || home="/home/$user"
+    fi
+    echo "$home"
+}
+
+_security_key_file_for() {
+    local user="$1" home pattern entry
+    home=$(_security_key_user_home "$user")
+    pattern=""
+    [[ -n "${SSHD_EFFECTIVE_CONFIG:-}" ]] && pattern=$(_security_sshd_effective_value "authorizedkeysfile")
+    [[ -z "$pattern" ]] && pattern=".ssh/authorized_keys"
+    entry=$(awk '{print $1}' <<< "$pattern")
+    entry="${entry//%u/$user}"
+    entry="${entry//%h/$home}"
+    entry="${entry//%H/$home}"
+    case "$entry" in
+        /*) echo "$entry" ;;
+        ./*) echo "${home}/${entry#./}" ;;
+        *) echo "${home}/${entry}" ;;
+    esac
+}
+
+_security_key_ensure_dir() {
+    local key_file="$1" user="${2:-root}" key_dir
     key_dir=$(dirname "$key_file")
     mkdir -p "$key_dir"
     chmod 700 "$key_dir"
+    [[ -f "$key_file" ]] || touch "$key_file"
+    chmod 600 "$key_file"
+    if [[ "$user" != "root" ]]; then
+        chown "$user:" "$key_dir" "$key_file" 2>/dev/null || true
+    fi
+    command -v restorecon >/dev/null 2>&1 \
+        && restorecon -v "$key_dir" "$key_file" 2>/dev/null || true
+}
+
+_security_key_list() {
+    local key_file="$1" i=0 line ktype kcomment
+    if [[ ! -s "$key_file" ]]; then
+        log_info "（无授权公钥）"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        (( i++ ))
+        ktype=$(awk '{print $1}' <<< "$line")
+        kcomment=$(awk 'NF>=3{for(j=3;j<=NF;j++) printf "%s%s",$j,(j<NF?" ":""); print ""}' <<< "$line")
+        printf "  %2d. %-40s  %s\n" "$i" "$ktype" "${kcomment:-（无注释）}"
+    done < "$key_file"
+}
+
+_security_key_append() {
+    local key_file="$1" key="$2" user="${3:-root}"
+    _security_key_ensure_dir "$key_file" "$user"
+    if grep -qxF "$key" "$key_file" 2>/dev/null; then
+        log_info "该公钥已存在，跳过追加"
+        return 0
+    fi
+    printf '%s\n' "$key" >> "$key_file"
+    log_info "公钥已追加 → ${key_file}"
+}
+
+_security_key_replace() {
+    local key_file="$1" key="$2" user="${3:-root}" backup
+    _security_key_ensure_dir "$key_file" "$user"
+    if [[ -s "$key_file" ]]; then
+        backup="${key_file}.bak.$(date +%Y%m%d%H%M%S)"
+        cp -f "$key_file" "$backup"
+        log_info "已备份原文件 → ${backup}"
+    fi
+    printf '%s\n' "$key" > "$key_file"
+    log_info "authorized_keys 已替换 → ${key_file}"
+}
+
+_security_add_authorized_key_interactive() {
+    local key key_file
+    key_file=$(_security_primary_authorized_key_file)
 
     echo ""
     log_warn "未检测到 root 可用 SSH 公钥。"
@@ -407,22 +504,11 @@ _security_add_authorized_key_interactive() {
 
     echo "请粘贴单行公钥（推荐 ssh-ed25519 AAAA... comment）："
     read -r key
-    if [[ ! "$key" =~ ^(ssh-ed25519|ssh-rsa|ecdsa-sha2-nistp(256|384|521))[[:space:]]+ ]]; then
+    if ! _security_key_valid "$key"; then
         log_error "公钥格式看起来不正确，已取消写入"
         return 1
     fi
-    if [[ "$key" == ssh-rsa* ]]; then
-        log_warn "检测到 ssh-rsa 公钥；建议优先使用 ED25519 新密钥"
-    fi
-
-    touch "$key_file"
-    chmod 600 "$key_file"
-    if grep -qxF "$key" "$key_file"; then
-        log_info "该公钥已存在，跳过追加"
-    else
-        printf '%s\n' "$key" >> "$key_file"
-        log_info "公钥已追加到 ${key_file}"
-    fi
+    _security_key_append "$key_file" "$key"
 }
 
 run_security_ssh() {
@@ -650,4 +736,63 @@ run_security_ssh() {
 
     log_info "SSH 已重启。请立即用新终端测试: ssh -p $(awk '{print $1}' <<< "$ssh_ports") root@<服务器IP>"
     log_info "========== SSH 登录安全检查与加固完成 =========="
+}
+
+run_security_keys() {
+    log_step "========== SSH 公钥管理 =========="
+    [[ -z "${SSHD_EFFECTIVE_CONFIG:-}" ]] && SSHD_EFFECTIVE_CONFIG=$(_security_sshd_effective_config || true)
+
+    echo ""
+    local target_user key_file
+    read -rp "管理哪个用户的公钥？[默认: root]: " target_user
+    target_user="${target_user:-root}"
+
+    local user_exists=0
+    if command -v getent >/dev/null 2>&1; then
+        getent passwd "$target_user" >/dev/null 2>&1 && user_exists=1
+    else
+        grep -q "^${target_user}:" /etc/passwd 2>/dev/null && user_exists=1
+    fi
+    if (( user_exists == 0 )); then
+        log_error "用户 ${target_user} 不存在"
+        return 1
+    fi
+
+    key_file=$(_security_key_file_for "$target_user")
+    log_info "公钥文件: ${key_file}"
+
+    echo ""
+    log_info "当前已授权公钥:"
+    _security_key_list "$key_file"
+
+    echo ""
+    echo "操作:"
+    echo "  a. 追加公钥（自动去重）"
+    echo "  r. 替换（备份原文件后重写）"
+    echo "  q. 返回"
+    read -rp "请选择 [a/r/q]: " key_action
+    echo ""
+
+    case "${key_action,,}" in
+        a|r)
+            echo "请粘贴单行公钥（ssh-ed25519 / ecdsa-sha2-nistp* / ssh-rsa）："
+            read -r new_key
+            if ! _security_key_valid "$new_key"; then
+                log_error "公钥格式不正确（期望: TYPE AAAA... [comment]），已取消"
+                return 1
+            fi
+            if [[ "${key_action,,}" == "a" ]]; then
+                _security_key_append "$key_file" "$new_key" "$target_user"
+            else
+                _security_key_replace "$key_file" "$new_key" "$target_user"
+            fi
+            echo ""
+            log_info "操作后 authorized_keys:"
+            _security_key_list "$key_file"
+            ;;
+        q|Q) return 0 ;;
+        *) log_warn "无效选择，已取消"; return 0 ;;
+    esac
+
+    log_info "========== SSH 公钥管理完成 =========="
 }
