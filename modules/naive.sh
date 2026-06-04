@@ -169,7 +169,7 @@ install_naive() {
     local build_tmpdir
     build_tmpdir=$(mktemp -d)
 
-    if ! xcaddy build --with "${fp_module}@naive" --output "${build_tmpdir}/caddy"; then
+    if ! xcaddy build --with "${fp_module}=github.com/klzgrad/forwardproxy@naive" --output "${build_tmpdir}/caddy"; then
         log_error "xcaddy 编译失败"
         rm -rf "$build_tmpdir"
         exit 1
