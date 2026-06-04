@@ -8,13 +8,14 @@
 # ── 辅助：从 klzgrad/forwardproxy 仓库 go.mod 动态获取 module 路径 ──
 # 不硬编码，避免未来 fork/迁移后路径失效
 _get_forwardproxy_module() {
-    local go_mod_url="https://raw.githubusercontent.com/klzgrad/forwardproxy/master/go.mod"
+    # Read from the naive branch — same branch used in the build — to get the correct module path
+    local go_mod_url="https://raw.githubusercontent.com/klzgrad/forwardproxy/naive/go.mod"
     local mod_path
     mod_path=$(curl -fsSL "$go_mod_url" 2>/dev/null \
         | grep '^module ' | head -1 | awk '{print $2}')
     if [[ -z "$mod_path" ]]; then
         log_warn "无法解析 forwardproxy go.mod，使用默认值"
-        mod_path="github.com/caddyserver/forwardproxy"
+        mod_path="github.com/klzgrad/forwardproxy"
     fi
     echo "$mod_path"
 }
@@ -168,7 +169,7 @@ install_naive() {
     local build_tmpdir
     build_tmpdir=$(mktemp -d)
 
-    if ! xcaddy build --with "${fp_module}=github.com/klzgrad/forwardproxy@naive" --output "${build_tmpdir}/caddy"; then
+    if ! xcaddy build --with "${fp_module}@naive" --output "${build_tmpdir}/caddy"; then
         log_error "xcaddy 编译失败"
         rm -rf "$build_tmpdir"
         exit 1
