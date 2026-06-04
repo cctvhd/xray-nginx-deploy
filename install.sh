@@ -2396,7 +2396,7 @@ upgrade_github_latest() {
     curl -fsSL --max-time 5 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
         | grep -oP '"tag_name"\s*:\s*"\K[^"]+' \
         | head -1 \
-        | sed 's/^v//'
+        | grep -oP '[0-9]+(\.[0-9]+)+'
 }
 
 upgrade_apt_candidate() {
