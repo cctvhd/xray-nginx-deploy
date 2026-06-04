@@ -2925,93 +2925,96 @@ do_upgrade_menu() {
     echo -e "${BLUE}================ 升级组件 ================${NC}"
     echo "  正在查询远程版本（5s 超时）..."
     upgrade_collect_remote_versions
-    clear
-    echo ""
-    echo -e "${BLUE}================ 升级组件 ================${NC}"
-    upgrade_menu_line 1 "Nginx"      nginx
-    upgrade_menu_line 2 "Xray"       xray
-    upgrade_menu_line 3 "Sing-Box"   singbox
-    upgrade_menu_line 4 "Hysteria2"  hysteria2
-    upgrade_menu_line 5 "NaiveProxy" naive
-    echo "  6. 全部升级（仅升级有更新的组件）"
-    echo "  l. 查看最近升级状态/日志"
-    echo "  t. 实时跟踪最近一次升级（tail -f）"
-    echo "  q. 返回主菜单"
-    echo ""
-    echo "  升级会在 screen 或 nohup 后台运行，SSH 断开不影响任务。"
-    echo ""
 
-    local upgrade_choice component
-    read -rp "  请选择: " upgrade_choice
-    echo ""
+    while true; do
+        clear
+        echo ""
+        echo -e "${BLUE}================ 升级组件 ================${NC}"
+        upgrade_menu_line 1 "Nginx"      nginx
+        upgrade_menu_line 2 "Xray"       xray
+        upgrade_menu_line 3 "Sing-Box"   singbox
+        upgrade_menu_line 4 "Hysteria2"  hysteria2
+        upgrade_menu_line 5 "NaiveProxy" naive
+        echo "  6. 全部升级（仅升级有更新的组件）"
+        echo "  l. 查看最近升级状态/日志"
+        echo "  t. 实时跟踪最近一次升级（tail -f）"
+        echo "  q. 返回主菜单"
+        echo ""
+        echo "  升级会在 screen 或 nohup 后台运行，SSH 断开不影响任务。"
+        echo ""
 
-    case "$upgrade_choice" in
-        1) component="nginx" ;;
-        2) component="xray" ;;
-        3) component="singbox" ;;
-        4) component="hysteria2" ;;
-        5) component="naive" ;;
-        6) component="all" ;;
-        l|L)
-            show_upgrade_status
-            done_return
-            return
-            ;;
-        t|T)
-            tail_upgrade_log
-            done_return
-            return
-            ;;
-        q|Q) return ;;
-        *)
-            log_error "无效选择"
-            sleep 1
-            return
-            ;;
-    esac
+        local upgrade_choice component
+        read -rp "  请选择: " upgrade_choice
+        echo ""
 
-    if [[ "$component" == "all" ]]; then
-        local pending=() c cur rem
-        for c in nginx xray singbox hysteria2 naive; do
-            cur=$(upgrade_command_version "$c")
-            rem="${UPGRADE_REMOTE_VERSIONS[$c]:-}"
-            if [[ -n "$rem" && -n "$cur" && "$cur" != "$rem" ]]; then
-                pending+=("$c")
+        case "$upgrade_choice" in
+            1) component="nginx" ;;
+            2) component="xray" ;;
+            3) component="singbox" ;;
+            4) component="hysteria2" ;;
+            5) component="naive" ;;
+            6) component="all" ;;
+            l|L)
+                show_upgrade_status
+                read -rp "按回车继续..." _
+                continue
+                ;;
+            t|T)
+                tail_upgrade_log
+                read -rp "按回车继续..." _
+                continue
+                ;;
+            q|Q) return ;;
+            *)
+                log_error "无效选择"
+                sleep 1
+                continue
+                ;;
+        esac
+
+        if [[ "$component" == "all" ]]; then
+            local pending=() c cur rem
+            for c in nginx xray singbox hysteria2 naive; do
+                cur=$(upgrade_command_version "$c")
+                rem="${UPGRADE_REMOTE_VERSIONS[$c]:-}"
+                if [[ -n "$rem" && -n "$cur" && "$cur" != "$rem" ]]; then
+                    pending+=("$c")
+                fi
+            done
+            if [[ ${#pending[@]} -eq 0 ]]; then
+                log_info "所有组件均已是最新版本"
+                read -rp "按回车继续..." _
+                continue
             fi
-        done
-        if [[ ${#pending[@]} -eq 0 ]]; then
-            log_info "所有组件均已是最新版本"
-            done_return
-            return
+            log_info "待升级: ${pending[*]}"
+            local confirm
+            read -rp "  确认升级以上组件？[y/N]: " confirm
+            if [[ "${confirm,,}" != "y" ]]; then
+                read -rp "按回车继续..." _
+                continue
+            fi
+            for c in "${pending[@]}"; do
+                start_upgrade_job "$c"
+            done
+            read -rp "按回车继续..." _
+            continue
         fi
-        log_info "待升级: ${pending[*]}"
-        local confirm
-        read -rp "  确认升级以上组件？[y/N]: " confirm
-        if [[ "${confirm,,}" != "y" ]]; then
-            done_return
-            return
-        fi
-        for c in "${pending[@]}"; do
-            start_upgrade_job "$c"
-        done
-        done_return
-        return
-    fi
 
-    local current remote
-    current=$(upgrade_command_version "$component")
-    remote="${UPGRADE_REMOTE_VERSIONS[$component]:-}"
-    if [[ -n "$remote" && -n "$current" && "$current" == "$remote" ]]; then
-        local force
-        read -rp "  ${component} 已是最新（${current}），强制重装？[y/N]: " force
-        if [[ "${force,,}" != "y" ]]; then
-            done_return
-            return
+        local current remote
+        current=$(upgrade_command_version "$component")
+        remote="${UPGRADE_REMOTE_VERSIONS[$component]:-}"
+        if [[ -n "$remote" && -n "$current" && "$current" == "$remote" ]]; then
+            local force
+            read -rp "  ${component} 已是最新（${current}），强制重装？[y/N]: " force
+            if [[ "${force,,}" != "y" ]]; then
+                read -rp "按回车继续..." _
+                continue
+            fi
         fi
-    fi
 
-    start_upgrade_job "$component"
-    done_return
+        start_upgrade_job "$component"
+        read -rp "按回车继续..." _
+    done
 }
 
 do_uninstall_menu() {
