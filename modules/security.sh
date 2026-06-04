@@ -310,7 +310,16 @@ _security_verify_effective_config() {
         log_error "SSH 生效端口不符合预期: ${ssh_ports}"
         return 1
     }
-    _security_require_effective_value "$effective" "permitrootlogin" "$root_login" || return 1
+    # 'without-password' is a legacy alias for 'prohibit-password'; normalize before comparing
+    local actual_root_login normalized_expected
+    actual_root_login=$(_security_effective_value_from "$effective" "permitrootlogin")
+    [[ "$actual_root_login" == "without-password" ]] && actual_root_login="prohibit-password"
+    normalized_expected="$root_login"
+    [[ "$normalized_expected" == "without-password" ]] && normalized_expected="prohibit-password"
+    if [[ "$actual_root_login" != "$normalized_expected" ]]; then
+        log_error "SSH 生效配置不符合预期: permitrootlogin=${actual_root_login:-missing}，期望 ${normalized_expected}"
+        return 1
+    fi
     _security_require_effective_value "$effective" "passwordauthentication" "no" || return 1
     _security_require_effective_value "$effective" "kbdinteractiveauthentication" "no" || return 1
     _security_require_effective_value "$effective" "pubkeyauthentication" "yes" || return 1
