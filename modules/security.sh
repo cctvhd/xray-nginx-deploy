@@ -194,6 +194,10 @@ _security_dropin_conflicts() {
             }
             /^[[:space:]]*($|#)/ { next }
             tolower($1) == "match" { exit }
+            /^[[:space:]]*[Ii]nclude[[:space:]]+\/etc\/crypto-policies\// {
+                print FILENAME ":" FNR ": " $0
+                next
+            }
             {
                 key = tolower($1)
                 if (managed[key]) {
@@ -337,6 +341,8 @@ _security_verify_effective_config() {
     _security_require_effective_value "$effective" "maxstartups" "3:30:10" || return 1
     _security_require_effective_value "$effective" "strictmodes" "yes" || return 1
     [[ "$crypto_mode" == "modern" ]] || return 0
+    # When system crypto-policy manages algorithms, skip exact match — policy enforces security
+    [[ "${SECURITY_USE_CRYPTO_POLICY:-0}" == "1" ]] && return 0
     _security_require_effective_value "$effective" "kexalgorithms" "curve25519-sha256,diffie-hellman-group16-sha512" || return 1
     _security_require_effective_value "$effective" "ciphers" "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com" || return 1
     _security_require_effective_value "$effective" "macs" "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com" || return 1
@@ -361,6 +367,29 @@ _security_restore_security_dropin() {
     else
         rm -f "$dropin"
     fi
+}
+
+_security_apply_crypto_policy() {
+    local policy="$1"
+    command -v update-crypto-policies >/dev/null 2>&1 || return 1
+    local current
+    current=$(update-crypto-policies --show 2>/dev/null | tr -d '[:space:]' || true)
+    SECURITY_CRYPTO_POLICY_BACKUP="${current:-}"
+    if update-crypto-policies --set "$policy" >/dev/null 2>&1; then
+        log_info "已设置系统 crypto-policy: ${policy}（原: ${current:-unknown}）"
+        return 0
+    fi
+    log_warn "update-crypto-policies --set ${policy} 执行失败，将使用显式算法配置"
+    SECURITY_CRYPTO_POLICY_BACKUP=""
+    return 1
+}
+
+_security_restore_crypto_policy() {
+    [[ -z "${SECURITY_CRYPTO_POLICY_BACKUP:-}" ]] && return 0
+    command -v update-crypto-policies >/dev/null 2>&1 || return 0
+    update-crypto-policies --set "$SECURITY_CRYPTO_POLICY_BACKUP" 2>/dev/null || true
+    log_warn "已恢复系统 crypto-policy: ${SECURITY_CRYPTO_POLICY_BACKUP}"
+    SECURITY_CRYPTO_POLICY_BACKUP=""
 }
 
 _security_add_authorized_key_interactive() {
@@ -500,6 +529,11 @@ run_security_ssh() {
     local dropin="${dropin_dir}/99-xray-deploy-security.conf"
     SECURITY_MODIFIED_DROPINS=()
     SECURITY_MAIN_CONF_BACKUP=""
+    SECURITY_CRYPTO_POLICY_BACKUP=""
+    SECURITY_USE_CRYPTO_POLICY=0
+    if [[ "$crypto_mode" == "modern" ]] && _security_apply_crypto_policy "DEFAULT:NO-SHA1"; then
+        SECURITY_USE_CRYPTO_POLICY=1
+    fi
     mkdir -p "$dropin_dir"
     _security_ensure_dropin_include
 
@@ -549,7 +583,7 @@ run_security_ssh() {
         echo "PrintMotd no"
         echo "PrintLastLog yes"
         echo "Banner none"
-        if [[ "$crypto_mode" == "modern" ]]; then
+        if [[ "$crypto_mode" == "modern" && "${SECURITY_USE_CRYPTO_POLICY:-0}" == "0" ]]; then
             echo "KexAlgorithms curve25519-sha256,diffie-hellman-group16-sha512"
             echo "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
             echo "MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
@@ -564,6 +598,7 @@ run_security_ssh() {
         log_error "SSH 配置验证失败，已恢复备份（如存在）"
         _security_restore_security_dropin "$dropin"
         _security_restore_modified_dropins
+        _security_restore_crypto_policy
         return 1
     fi
 
@@ -573,6 +608,7 @@ run_security_ssh() {
         log_error "SSH 生效配置验证失败，已恢复备份（如存在）"
         _security_restore_security_dropin "$dropin"
         _security_restore_modified_dropins
+        _security_restore_crypto_policy
         return 1
     fi
 
@@ -590,12 +626,14 @@ run_security_ssh() {
         log_error "SSH 重启失败"
         _security_restore_security_dropin "$dropin"
         _security_restore_modified_dropins
+        _security_restore_crypto_policy
         systemctl restart "${service}.service" 2>/dev/null || true
         return 1
     fi
     if ! _security_ports_listening "$ssh_ports"; then
         _security_restore_security_dropin "$dropin"
         _security_restore_modified_dropins
+        _security_restore_crypto_policy
         systemctl restart "${service}.service" 2>/dev/null || true
         return 1
     fi
