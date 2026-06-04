@@ -165,19 +165,49 @@ install_naive() {
     fp_module=$(_get_forwardproxy_module)
     log_info "forwardproxy module: ${fp_module}"
 
+    # 读取 naive 分支 go.mod 中 Caddy 版本以保持兼容
+    local caddy_ver_for_build
+    caddy_ver_for_build=$(curl -fsSL "https://raw.githubusercontent.com/klzgrad/forwardproxy/naive/go.mod" 2>/dev/null \
+        | grep 'github.com/caddyserver/caddy/v2' | awk '{print $2}' | head -1)
+    if [[ -z "$caddy_ver_for_build" ]]; then
+        log_warn "无法从 naive go.mod 获取 Caddy 版本，使用 xcaddy 默认版本"
+        caddy_ver_for_build=""
+    else
+        log_info "将使用 Caddy ${caddy_ver_for_build}（与 naive 分支匹配）"
+    fi
+
     log_info "开始编译 Caddy + forwardproxy（首次编译需下载依赖，请耐心等待）..."
     local build_tmpdir
     build_tmpdir=$(mktemp -d)
 
-    if ! xcaddy build --with "${fp_module}=github.com/klzgrad/forwardproxy@naive" --output "${build_tmpdir}/caddy"; then
+    local xcaddy_cmd="xcaddy build"
+    [[ -n "$caddy_ver_for_build" ]] && xcaddy_cmd+=" ${caddy_ver_for_build}"
+    xcaddy_cmd+=" --with ${fp_module}=github.com/klzgrad/forwardproxy@naive"
+    xcaddy_cmd+=" --output ${build_tmpdir}/caddy"
+
+    log_info "编译命令: ${xcaddy_cmd}"
+    if ! eval "$xcaddy_cmd"; then
         log_error "xcaddy 编译失败"
         rm -rf "$build_tmpdir"
         exit 1
     fi
 
     # ── 5. 验证编译产物 ────────────────────────────────────
-    if ! "${build_tmpdir}/caddy" list-modules 2>/dev/null | grep -q 'forward_proxy'; then
-        log_error "编译验证失败: caddy list-modules 未包含 forward_proxy"
+    local modules_out
+    modules_out=$("${build_tmpdir}/caddy" list-modules 2>&1)
+    log_info "caddy list-modules 完整输出（前50行）:"
+    echo "$modules_out" | head -50
+    local proxy_lines
+    proxy_lines=$(echo "$modules_out" | grep -iE 'proxy|forward' || true)
+    if [[ -n "$proxy_lines" ]]; then
+        log_info "proxy/forward 相关模块: ${proxy_lines}"
+    else
+        log_warn "list-modules 中无任何 proxy/forward 相关模块"
+    fi
+    # 兼容 "forward_proxy" 或 "forwardproxy"（Caddy 不同版本命名不同）
+    if ! echo "$modules_out" | grep -qiE 'forward.?proxy'; then
+        log_error "编译验证失败: caddy list-modules 未包含 forward_proxy / forwardproxy"
+        log_error "请检查 klzgrad/forwardproxy naive 分支是否兼容当前 Caddy 版本"
         rm -rf "$build_tmpdir"
         exit 1
     fi
