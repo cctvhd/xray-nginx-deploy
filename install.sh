@@ -1289,7 +1289,7 @@ show_status() {
     local cached_count=0
     for m in "${ALL_MODULES[@]}"; do
         if [[ -f "${LOCAL_MODULES_DIR}/${m}.sh" ]]; then
-            (( cached_count++ ))
+            cached_count=$((cached_count + 1))
         fi
     done
     local total_modules=${#ALL_MODULES[@]}
