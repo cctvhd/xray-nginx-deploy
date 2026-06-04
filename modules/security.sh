@@ -573,11 +573,11 @@ run_security_ssh() {
         *) root_login="prohibit-password" ;;
     esac
 
-    read -rp "是否允许 TCP/Agent 转发？代理场景建议保留 [Y/n/keep]: " forward_choice
+    read -rp "是否允许 TCP/Agent 转发？[y/N/keep]: " forward_choice
     case "${forward_choice,,}" in
-        n) allow_forward="no" ;;
+        y) allow_forward="yes" ;;
         keep|k) allow_forward="${current_allow_forward:-yes}" ;;
-        *) allow_forward="yes" ;;
+        *) allow_forward="no" ;;
     esac
 
     read -rp "是否允许远程转发绑定非 loopback？[y/N/keep]: " gateway_choice
