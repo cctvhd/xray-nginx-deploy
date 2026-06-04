@@ -1975,6 +1975,13 @@ _is_conf_step_enabled() {
 _restart_rotated_service() {
     local service="$1" backup="$2" config="$3" keep_backup="${4:-0}"
 
+    if ! systemctl cat "$service" >/dev/null 2>&1; then
+        log_warn "${service} 单元不存在，跳过重启（配置已更新）"
+        [[ "$keep_backup" == "1" ]] || rm -f "$backup"
+        return 0
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
     if systemctl restart "$service"; then
         [[ "$keep_backup" == "1" ]] || rm -f "$backup"
         return 0
