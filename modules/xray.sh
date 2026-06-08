@@ -122,6 +122,8 @@ generate_xray_params() {
 }
 
 # ── 收集 Reality 伪装参数 ────────────────────────────────────
+# Current correct values on this server: dest=www.mpg.de:443, spiderX=/
+# When re-running, select: Europe(2) -> mpg.de(5), then input spiderX=/
 collect_reality_params() {
     echo ""
     log_step "配置 Reality 伪装参数"
@@ -333,6 +335,7 @@ generate_xray_config() {
 
     mkdir -p /usr/local/etc/xray
 
+    # Fix: grpc initial_windows_size 4194304 (4MB) prevents CDN GOAWAY on high-BDP paths; default 65536 too small
     cat > /usr/local/etc/xray/config.json << CONF
 {
     "log": {
@@ -428,7 +431,7 @@ generate_xray_config() {
                             "cMaxReuseTimes":   0,
                             "hMaxRequestTimes": "${LATENCY_XMUX_REQUEST_TIMES}",
                             "hMaxReusableSecs": "${LATENCY_XMUX_REUSABLE_SECS}",
-                            "hKeepAlivePeriod": 0
+                            "hKeepAlivePeriod": 60
                         }
                     }
                 },
@@ -461,7 +464,7 @@ generate_xray_config() {
                     "idle_timeout":         60,
                     "health_check_timeout": 20,
                     "permit_without_stream": false,
-                    "initial_windows_size":  65536
+                    "initial_windows_size":  4194304
                 }
             },
             "sniffing": {
