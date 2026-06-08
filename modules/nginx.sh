@@ -780,9 +780,10 @@ upstream vless_grpc_backend {
     server 127.0.0.1:8310 max_fails=0 fail_timeout=30s;
     keepalive          128;
     keepalive_requests 1000;
-    # 修复3：与 xray grpc idle_timeout(80s) 形成梯度
-    # nginx(90s) > xray(80s) > 客户端(60s)，避免连接被提前回收
-    keepalive_timeout  90s;
+    # Fix: nginx must recycle before xray grpc idle_timeout(60s)
+    # nginx(50s) < xray(60s): nginx closes idle conn first, preventing reuse of connections xray has already closed
+    # See: nginx ngx_http_upstream_module keepalive_timeout docs
+    keepalive_timeout  50s;
 }
 CONF
 
@@ -827,7 +828,8 @@ listen 127.0.0.1:8350;
         gzip off;
         proxy_pass              http://vless_xhttp_backend;
         proxy_http_version      1.1;
-        proxy_set_header        Connection "";
+        # Fix: "close" disables upstream keepalive reuse; xhttp half-close causes broken-pipe with Connection ""
+        proxy_set_header        Connection "close";
         proxy_set_header        Host \$host;
  # fallback 经 xver=0 转发，无 proxy_protocol，使用 \$final_real_ip 获取真实 IP
         proxy_set_header        X-Real-IP \$final_real_ip;
@@ -993,7 +995,8 @@ server {
         http2_push_preload      off;
         proxy_pass              http://vless_xhttp_backend;
         proxy_http_version      1.1;
-        proxy_set_header        Connection "";
+        # Fix: "close" disables upstream keepalive reuse; xhttp half-close causes broken-pipe with Connection ""
+        proxy_set_header        Connection "close";
         proxy_set_header        Host \$host;
         proxy_set_header        X-Real-IP \$final_real_ip;
         proxy_set_header        X-Forwarded-For \$final_real_ip;
