@@ -992,7 +992,6 @@ server {
         limit_req  zone=websocket burst=100 nodelay;
         limit_conn conn_limit 200;
 
-        http2_push_preload      off;
         proxy_pass              http://vless_xhttp_backend;
         proxy_http_version      1.1;
         # Fix: "close" disables upstream keepalive reuse; xhttp half-close causes broken-pipe with Connection ""

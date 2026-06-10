@@ -1772,6 +1772,8 @@ systemctl restart xray     2>/dev/null && echo "xray restarted"     || true
 systemctl restart sing-box 2>/dev/null && echo "sing-box restarted" || true
 HOOK
     chmod +x /etc/letsencrypt/renewal-hooks/deploy/xray-nginx-deploy-reload.sh
+    # 清理旧版本遗留的重复 hook（功能已被上面的脚本覆盖）
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
     if certbot_uses_snap; then
         crontab -l 2>/dev/null | grep -v certbot | crontab - || true
