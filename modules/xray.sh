@@ -121,6 +121,22 @@ generate_xray_params() {
     log_info "xhttp path:  ${XHTTP_PATH}"
 }
 
+# ── 探测伪装域名可用路径（用于 Reality spiderX）─────────────────
+# 用法: detect_spider_path <domain>
+# 依次测试常见路径，echo 第一个返回 200 的路径并返回 0；全部失败返回 1
+detect_spider_path() {
+    local domain="$1"
+    local path code
+    for path in / /index.html /favicon.ico /robots.txt /sitemap.xml; do
+        code=$(curl -o /dev/null -s -w "%{http_code}" --max-time 5 "https://${domain}${path}")
+        if [[ "$code" == "200" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ── 收集 Reality 伪装参数 ────────────────────────────────────
 # Current correct values on this server: dest=www.mpg.de:443, spiderX=/
 # When re-running, select: Europe(2) -> mpg.de(5), then input spiderX=/
@@ -245,8 +261,19 @@ collect_reality_params() {
     done
     REALITY_SERVER_NAMES=("${deduped_server_names[@]}")
 
-    read -rp "Reality spiderX [默认 /api/health]: " spider_x
-    REALITY_SPIDER_X="${spider_x:-/api/health}"
+    local reality_dest_domain="${REALITY_DEST%%:*}"
+    echo ""
+    log_step "探测伪装域名 ${reality_dest_domain} 的可用路径..."
+    local detected_path
+    if detected_path=$(detect_spider_path "${reality_dest_domain}"); then
+        REALITY_SPIDER_X="${detected_path}"
+        log_info "spiderX 自动设为 ${detected_path}（${reality_dest_domain} 返回 200）"
+    else
+        log_warn "未探测到任何返回 200 的路径"
+        read -rp "请手动输入 Reality spiderX [默认 /]: " spider_x
+        REALITY_SPIDER_X="${spider_x:-/}"
+        log_warn "请确认该路径在目标网站返回 200，否则流量特征异常"
+    fi
 
     log_info "Reality dest:        ${REALITY_DEST}"
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
