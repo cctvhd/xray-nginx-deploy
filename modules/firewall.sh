@@ -154,6 +154,20 @@ _firewall_build_extra_udp() {
     echo "        udp dport { $(_firewall_ports_to_set "$ports") } accept"
 }
 
+# Hysteria2 端口跳跃 UDP 段放行（从状态文件读取范围）
+# 注意：当前 hysteria 自建 nft redirect 表（prerouting 阶段把跳跃段改写为 443），
+# 包进 input 链时 dport 已是 443，本规则命中不到，属防御性纵深——
+# 仅当未来 hysteria 改用 DNAT/不自建表时才参与转发。不可据此认为它「修复了端口跳跃」。
+_firewall_build_porthopping_udp() {
+    local start end
+    start=$(get_state "HYSTERIA2_PH_START" "")
+    end=$(get_state "HYSTERIA2_PH_END" "")
+    [[ -z "$start" || -z "$end" ]] && return 0
+    [[ "$start" =~ ^[0-9]+$ && "$end" =~ ^[0-9]+$ ]] || return 0
+    (( start >= 1 && end <= 65535 && start < end )) || return 0
+    echo "        udp dport ${start}-${end} accept"
+}
+
 _firewall_build_ipv6_rules() {
     local dual_stack="$1"
     [[ "$dual_stack" == "true" ]] || return 0
@@ -223,10 +237,11 @@ $(_firewall_build_ipv6_input "$dual_stack")
         tcp dport { ${ssh_set} } ct state new meter ssh_meter { ip saddr limit rate 5/minute burst 3 packets } accept
         tcp dport { ${ssh_set} } ct state new reject with tcp reset
 
-        tcp dport 443 ct state new accept
+        tcp dport { 80, 443 } ct state new accept
         udp dport 443 accept
 $(_firewall_build_extra_tcp "$extra_tcp")
 $(_firewall_build_extra_udp "$extra_udp")
+$(_firewall_build_porthopping_udp)
         limit rate 10/second burst 30 packets log prefix "[nft drop in] " flags all level warn
         drop
     }
@@ -296,6 +311,14 @@ run_firewall_nftables() {
     systemctl enable nftables >/dev/null 2>&1 || true
     systemctl restart nftables
     nft -f "$config"
+
+    # flush ruleset 会清掉 hysteria 启动时自建的端口跳跃 redirect 表，
+    # 端口跳跃启用时需重启 hysteria 让其重建（crowdsec 表靠 bouncer 每 10s 自愈，无需干预）
+    if [[ -n "$(get_state "HYSTERIA2_PH_START" "")" ]] \
+        && systemctl is-active --quiet hysteria-server 2>/dev/null; then
+        log_step "重启 hysteria-server 以重建端口跳跃 redirect 表..."
+        systemctl restart hysteria-server
+    fi
 
     save_state "FIREWALL_BACKEND" "nftables"
     save_state "FIREWALL_NFT_CONFIG" "$config"
