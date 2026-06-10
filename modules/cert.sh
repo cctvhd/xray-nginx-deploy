@@ -681,9 +681,13 @@ get_domain_ini() {
     if [[ -f "$f" ]]; then
         echo "$f"
     else
-        # 回退到账号1，同时给出警告
+        local fallback="${CF_CONFIG_DIR}/cf_account_1.ini"
+        if [[ ! -f "$fallback" ]]; then
+            log_error "域名 ${root_domain} 无 ini 映射，回退文件也不存在: ${fallback}，请先配置 CF 账号"
+            return 1
+        fi
         log_warn "未找到 ${f}，回退到 cf_account_1.ini"
-        echo "${CF_CONFIG_DIR}/cf_account_1.ini"
+        echo "$fallback"
     fi
 }
 
@@ -1532,7 +1536,6 @@ load_cert_request_status() {
     local _section=""
     while IFS= read -r _line || [[ -n "$_line" ]]; do
         [[ -z "$_line" ]] && continue
-        [[ "$_line" == "#"* ]] && continue
 
         case "$_line" in
             "# --- CERT_SUCCESS_ROOTS ---")
@@ -1552,6 +1555,8 @@ load_cert_request_status() {
             "# --- END FAILED_CF_ACCOUNTS ---")
                 _section=""; continue ;;
         esac
+
+        [[ "$_line" == "#"* ]] && continue
 
         case "$_section" in
             SUCCESS) CERT_SUCCESS_ROOTS+=("$_line") ;;
@@ -2118,45 +2123,18 @@ add_domain_and_cert() {
     # 证书申请失败不应回滚已配置的域名（可后续单独重申）
     cert_txn_commit
 
-    # ── 为所有新域名申请证书 ────────────────────────────────
-    for domain in "${new_domains[@]}"; do
-        local root_domain
-        root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-        log_info "申请证书: *.${root_domain}"
-
-        local _ini_base
-        _ini_base=$(domain_to_ini_name "$root_domain")
-        local ini_file="${CF_CONFIG_DIR}/domain_${_ini_base}.ini"
-        local certbot_output certbot_rc
-
-        if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
-            log_info "证书已存在，跳过申请: *.${root_domain}"
-            continue
-        fi
-
-        if certbot_output=$(certbot certonly \
-            --dns-cloudflare \
-            --dns-cloudflare-credentials "$ini_file" \
-            --dns-cloudflare-propagation-seconds 30 \
-            -d "${root_domain}" \
-            -d "*.${root_domain}" \
-            --email "admin@${root_domain}" \
-            --agree-tos \
-            --non-interactive \
-            --expand 2>&1); then
-            certbot_rc=0
-        else
-            certbot_rc=$?
-        fi
-
-        if [[ $certbot_rc -eq 0 && -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
-            log_info "证书申请成功: *.${root_domain}"
-        else
-            log_error "证书申请失败（退出码: ${certbot_rc}）"
-            while IFS= read -r line; do echo "  $line"; done <<< "$certbot_output"
-            log_warn "请检查域名 DNS 解析和 CF API Token 权限"
-        fi
-    done
+    # ── 为所有新域名申请证书（复用 request_certificates，含重试/限流检测/状态跟踪）──
+    if [[ ${#new_domains[@]} -gt 0 ]]; then
+        local _saved_all=("${ALL_DOMAINS[@]}")
+        local _root _seen_roots=()
+        ALL_DOMAINS=()
+        for domain in "${new_domains[@]}"; do
+            _root=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+            [[ " ${_seen_roots[*]} " != *" ${_root} "* ]] && ALL_DOMAINS+=("$_root") && _seen_roots+=("$_root")
+        done
+        request_certificates
+        ALL_DOMAINS=("${_saved_all[@]}")
+    fi
 
     # 自动配置续期
     setup_auto_renew
