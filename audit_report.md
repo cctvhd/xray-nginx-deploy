@@ -31,11 +31,12 @@
 
 ## 🟡 配置差异（脚本预期 vs 实际现状）
 
-### Y1 — nginx xhttp upstream keepalive_timeout：线上 15s vs 脚本 300s
+### Y1 — nginx xhttp upstream keepalive_timeout：线上 15s vs 脚本 300s　✅ 已同步（2026-06-10）
 - **线上** `/etc/nginx/conf.d/00-upstreams.conf`：`vless_xhttp_backend` 中 `keepalive_timeout 15s`，注释为「keepalive 池已被 Connection:close 绕过，每次请求建新连接」。
 - **脚本** `modules/nginx.sh:776`：生成的是 `keepalive_timeout 300s`，注释为「与 Xray hMaxReusableSecs 形成梯度」。
 - **判断**：线上文件是**手工改过**（或更早版本生成），与当前仓库不一致。两种思路都自洽（因 `Connection: close` 确实使该 upstream 池形同虚设，15s/300s 实际都不影响），但**仓库与线上已脱钩**——重跑 nginx 配置会把它覆盖回 300s。
 - **gRPC upstream**：线上与脚本均为 `keepalive_timeout 50s` ✓ 一致（最新提交 c927c0d 的 90s→50s 已落地）。
+- **处置（2026-06-10）**：已用仓库生成版覆盖线上 `00-upstreams.conf`（15s→300s），`nginx -t` 通过、`systemctl reload nginx` 成功、服务 active。线上与仓库就此对齐。原文件已备份至 `/root/config-backup-20260610/` 及 `00-upstreams.conf.bak.*`。详见附录 B。
 
 ### Y2 — Hysteria2 端口跳跃范围：脚本默认 47000-48000 vs 实际 32000-36000
 - **脚本默认** `hysteria2.sh:306-308`：起始 47000、结束 48000。
@@ -67,6 +68,7 @@
 - 旧 nftables.conf 里的 `nat` 表是冗余的，且上界 38000 比实际跳跃段 36000 宽 2000，属历史残留。
 - **风险**：两套规则叠加、范围不一致，排障时易混淆；防火墙 `input` 链放行到 38000 而实际只用到 36000，多开了 36001-38000/udp。
 - **建议**：移除旧 nftables.conf 的手工 `nat` 表，统一交给 Hysteria 自管理；防火墙放行段对齐为 32000-36000。
+- **验证确认（2026-06-10，用户拍板）**：`nft list ruleset` 实机确认 hysteria 自建表 `ip hysteria_73bb65fb` / `ip6 hysteria_d355f523` 正在 prerouting+output 链做 `udp dport 32000-36000 redirect to :443`，**这是真正生效的端口跳跃机制**。`table ip/ip6 nat` 的 `dnat 32000-38000 → :443` 经确认为**旧版冗余残留**：与 hysteria 表同优先级共存、结果同为 :443，36001-38000 段 hysteria 根本不跳。**设计结论：端口跳跃归 hysteria 自建 redirect 表接管，NAT DNAT 表无功能价值**。本次按用户决定**不触碰线上 nftables 规则**（冗余 nat 表将在下次重跑 firewall 菜单时随 flush 自然清除）。
 
 ### C2 — Cockpit 管理控制台监听 9090（脚本预期外的服务）
 - **现象**：`*:9090`（all-interfaces）由 `cockpit.socket` 监听，`enabled`。
@@ -265,3 +267,29 @@
 ### 残留待办（本次未处理，供后续）
 - 线上旧 `/etc/sysconfig/nftables.conf` 的冗余 nat 表（32000-38000）仍在运行中的 ruleset 内，仅在「下次重跑 firewall 菜单」时才会被 flush 清除；如需立即清理需手工操作（本次只改脚本，不碰线上）。
 - C2（cockpit 9090）、C4（冗余 reload-nginx.sh hook）、🟢-1（http2_push_preload 废弃指令）均未处理。
+
+---
+
+# 附录 B — 配置对比 + 同步执行记录（2026-06-10 追加）
+
+## B.1 方法
+- 备份线上 7 份配置至 `/root/config-backup-20260610/`（nginx 3 份、xray、singbox、hysteria、nftables）。
+- 搭建只读沙箱：源用仓库 `install.sh` 的辅助函数 + 各 module 生成函数，输出路径重定向至 `/tmp/config-new/`，`save_state` 重定向至沙箱状态副本；以 `/etc/xray-deploy/config.env` 为只读状态来源。**不写任何线上文件。**
+- 逐文件 `diff -u`，JSON 用 `jq -S` 做语义比对。
+
+## B.2 对比结论（仓库脚本预期 vs 线上现状）
+| 文件 | 结论 | 处置 |
+|------|------|------|
+| `xray-config.json` | 语义完全相同（jq -S 通过） | 无需动作 |
+| `singbox-config.json` | 语义相同，仅 JSON 排版（缩进/数组换行）不同 | 无需动作 |
+| `hysteria-config.yaml` | 仅 `trafficStats.listen` 随机端口不同，余全同 | 无需动作 |
+| `fallback.conf` / `servers.conf` | 仅 `proxy_pass` 空格对齐 + 注释措辞 | 无功能差异，可选 |
+| `00-upstreams.conf` | xhttp `keepalive_timeout` 15s→300s（功能性） | ✅ 已同步（见 Y1 / B.3） |
+| `nftables.conf` | 结构性巨大差异（线上非本仓库生成） | 见 C1 验证确认，按用户决定不动线上 |
+
+## B.3 已执行的线上变更
+- **`/etc/nginx/conf.d/00-upstreams.conf`**：覆盖为仓库生成版（xhttp upstream `keepalive_timeout 15s → 300s`）。`nginx -t` ✓ → `systemctl reload nginx` ✓ → `nginx` active。备份：`/root/config-backup-20260610/00-upstreams.conf` + 同目录 `.bak.<ts>`。
+
+## B.4 诚实标注 — 一处非预期副作用
+- 沙箱生成 hysteria 配置时调用了仓库 `configure_hysteria2`，该函数为**写配置 + 落地一体**：写完 yaml（已重定向到沙箱，线上 `config.yaml` 经 diff 确认**未改**）后，继续对线上执行了 `sysctl -w`（rmem/wmem=412500000、ip_forward=1，均与既有 brutal/端口跳跃参数一致，幂等且未落盘）、重拷证书（内容相同）、覆盖 `hysteria-cert.sh` 部署钩子（写成当前仓库版）、并 **stop+start `hysteria-server`**（19:22:40 一次短暂重启）。
+- 事后核验：`config.yaml` 与备份逐字节一致；`hysteria-server` active、:443 正常。实际后果仅为一次几秒服务重启。**教训：`configure_*` 类函数非纯生成，含落地动作，沙箱模拟前须先静态确认函数边界。**
