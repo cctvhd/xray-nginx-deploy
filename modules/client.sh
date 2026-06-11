@@ -210,6 +210,38 @@ encryption=${VLESS_ENC_PARAM:-none}\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-grpc-${_hn}'))" 2>/dev/null)"
 }
 
+# ── 生成 VLESS-XHTTP-REALITY 直连节点链接 ────────────────────
+gen_xhttp_reality_url() {
+    if [[ -z "${REALITY_SNI:-}" ]] || [[ -z "${XRAY_UUID:-}" ]] || [[ -z "${XHTTP_PATH:-}" ]]; then
+        return
+    fi
+
+    local path_encoded spider_encoded reality_host _hn
+    path_encoded=$(python3 -c "
+import urllib.parse
+print(urllib.parse.quote('${XHTTP_PATH}'))
+" 2>/dev/null || echo "${XHTTP_PATH}")
+
+    spider_encoded=$(python3 -c "
+import urllib.parse
+print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
+" 2>/dev/null || echo "%2Fapi%2Fhealth")
+
+    reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-$SERVER_IP}}"
+    _hn=$(hostname -s 2>/dev/null || echo "server")
+    XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
+encryption=none\
+&security=reality\
+&sni=${REALITY_SNI}\
+&fp=chrome\
+&pbk=${XRAY_PUBLIC_KEY}\
+&sid=${REALITY_SHORT_ID}\
+&type=xhttp\
+&path=${path_encoded}\
+&spiderX=${spider_encoded}\
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-xhttp-reality-${_hn}'))" 2>/dev/null)"
+}
+
 # ── 生成 Reality 直连节点链接 ────────────────────────────────
 gen_reality_url() {
     if [[ -z "${REALITY_SNI:-}" ]] || [[ -z "${XRAY_UUID:-}" ]]; then
@@ -336,6 +368,7 @@ write_subscription_file() {
     {
         [[ -n "${XHTTP_URL:-}" ]] && echo "$XHTTP_URL"
         [[ -n "${GRPC_URL:-}" ]] && echo "$GRPC_URL"
+        [[ -n "${XHTTP_REALITY_URL:-}" ]] && echo "$XHTTP_REALITY_URL"
         [[ -n "${REALITY_URL:-}" ]] && echo "$REALITY_URL"
         [[ -n "${ANYTLS_URL:-}" ]] && echo "$ANYTLS_URL"
         [[ -n "${HYSTERIA2_URL:-}" ]] && echo "$HYSTERIA2_URL"
@@ -416,13 +449,25 @@ show_client_links() {
         } >> "$output_file"
     fi
 
+    # XHTTP-REALITY 直连
+    if [[ -n "${XHTTP_REALITY_URL:-}" ]]; then
+        echo -e "${GREEN}[XHTTP-Reality 直连]${NC}"
+        echo "$XHTTP_REALITY_URL"
+        echo ""
+        {
+            echo "# XHTTP-Reality 直连"
+            echo "$XHTTP_REALITY_URL"
+            echo ""
+        } >> "$output_file"
+    fi
+
     # Reality 直连
     if [[ -n "${REALITY_URL:-}" ]]; then
-        echo -e "${GREEN}[Reality 直连]${NC}"
+        echo -e "${GREEN}[Reality 直连 (TCP+Vision)]${NC}"
         echo "$REALITY_URL"
         echo ""
         {
-            echo "# Reality 直连"
+            echo "# Reality 直连 (TCP+Vision)"
             echo "$REALITY_URL"
             echo ""
         } >> "$output_file"
@@ -503,6 +548,7 @@ run_client() {
     get_server_ip
     gen_xhttp_url
     gen_grpc_url
+    gen_xhttp_reality_url
     gen_reality_url
     gen_anytls_url
     gen_hysteria2_url
