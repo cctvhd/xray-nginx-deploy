@@ -243,100 +243,55 @@ _get_server_ipv6() {
 
 # ── 构建自有域名内部解析 ──────────────────────────────────────
 _build_own_domain_zones() {
-    local reality_domain anytls_domain cdn_str
-    reality_domain=$(get_state "REALITY_DOMAIN" "")
-    anytls_domain=$(get_state "ANYTLS_DOMAIN" "")
+    local cdn_str
     cdn_str=$(get_state "CDN_DOMAINS" "")
+
+    # 构建 CDN 域名集合（跳过本地解析）
+    local -A _cdn_set=()
+    if [[ -n "$cdn_str" ]]; then
+        local _d
+        for _d in $cdn_str; do
+            [[ -n "$_d" ]] && _cdn_set["$_d"]=1
+        done
+    fi
 
     local server_ipv4 server_ipv6
     server_ipv4=$(_get_server_ipv4)
     server_ipv6=$(_get_server_ipv6)
 
+    # 收集所有直连域名（去重）
+    local -a _direct_domains=()
+    local -A _seen=()
+    local _k _v
+    for _k in REALITY_DOMAIN ANYTLS_DOMAIN HYSTERIA2_DOMAIN NAIVE_DOMAIN; do
+        _v=$(get_state "$_k" "")
+        [[ -z "$_v" ]] && continue
+        [[ -n "${_cdn_set[$_v]:-}" ]] && continue   # CDN 域名跳过
+        [[ -n "${_seen[$_v]:-}" ]] && continue       # 去重
+        _seen["$_v"]=1
+        _direct_domains+=("$_v")
+    done
+
     echo "    # === 自有域名内部解析 ==="
-
-    # Reality 域名：static zone + A/AAAA 记录
-    if [[ -n "$reality_domain" ]]; then
-        echo "    local-zone: \"${reality_domain}.\" static"
-        if [[ -n "$server_ipv4" ]]; then
-            echo "    local-data: \"${reality_domain}. 300 IN A ${server_ipv4}\""
-        fi
-        if [[ -n "$server_ipv6" ]]; then
-            echo "    local-data: \"${reality_domain}. 300 IN AAAA ${server_ipv6}\""
-        fi
+    if [[ ${#_direct_domains[@]} -eq 0 && ${#_cdn_set[@]} -eq 0 ]]; then
+        echo "    # 暂无自有域名配置"
+        return
     fi
 
-    # AnyTLS 域名：static zone + A/AAAA 记录
-    if [[ -n "$anytls_domain" ]]; then
-        echo "    local-zone: \"${anytls_domain}.\" static"
-        if [[ -n "$server_ipv4" ]]; then
-            echo "    local-data: \"${anytls_domain}. 300 IN A ${server_ipv4}\""
-        fi
-        if [[ -n "$server_ipv6" ]]; then
-            echo "    local-data: \"${anytls_domain}. 300 IN AAAA ${server_ipv6}\""
-        fi
-    fi
-
-    local hy2_domain naive_domain
-    hy2_domain=$(get_state "HYSTERIA2_DOMAIN" "")
-    naive_domain=$(get_state "NAIVE_DOMAIN" "")
-
-    # Hysteria2 域名：static zone + A/AAAA 记录（CDN域名跳过）
-    if [[ -n "$hy2_domain" ]]; then
-        local is_cdn=0
-        if [[ -n "$cdn_str" ]]; then
-            local _cdn_arr=()
-            read -ra _cdn_arr <<< "$cdn_str"
-            for _d in "${_cdn_arr[@]}"; do
-                [[ "$_d" == "$hy2_domain" ]] && is_cdn=1 && break
-            done
-        fi
-        if [[ $is_cdn -eq 0 ]]; then
-            echo "    local-zone: \"${hy2_domain}.\" static"
-            if [[ -n "$server_ipv4" ]]; then
-                echo "    local-data: \"${hy2_domain}. 300 IN A ${server_ipv4}\""
-            fi
-            if [[ -n "$server_ipv6" ]]; then
-                echo "    local-data: \"${hy2_domain}. 300 IN AAAA ${server_ipv6}\""
-            fi
-        fi
-    fi
-
-    # NaiveProxy 域名：static zone + A/AAAA 记录（CDN域名跳过）
-    if [[ -n "$naive_domain" ]]; then
-        local is_cdn=0
-        if [[ -n "$cdn_str" ]]; then
-            local _cdn_arr=()
-            read -ra _cdn_arr <<< "$cdn_str"
-            for _d in "${_cdn_arr[@]}"; do
-                [[ "$_d" == "$naive_domain" ]] && is_cdn=1 && break
-            done
-        fi
-        if [[ $is_cdn -eq 0 ]]; then
-            echo "    local-zone: \"${naive_domain}.\" static"
-            if [[ -n "$server_ipv4" ]]; then
-                echo "    local-data: \"${naive_domain}. 300 IN A ${server_ipv4}\""
-            fi
-            if [[ -n "$server_ipv6" ]]; then
-                echo "    local-data: \"${naive_domain}. 300 IN AAAA ${server_ipv6}\""
-            fi
-        fi
-    fi
+    local _dom
+    for _dom in "${_direct_domains[@]}"; do
+        echo "    local-zone: \"${_dom}.\" static"
+        [[ -n "$server_ipv4" ]] && echo "    local-data: \"${_dom}. 300 IN A ${server_ipv4}\""
+        [[ -n "$server_ipv6" ]] && echo "    local-data: \"${_dom}. 300 IN AAAA ${server_ipv6}\""
+    done
 
     # CDN 域名：只标注注释，不做本地解析
-    if [[ -n "$cdn_str" ]]; then
-        local cdn_domains=()
-        read -ra cdn_domains <<< "$cdn_str"
+    if [[ ${#_cdn_set[@]} -gt 0 ]]; then
         echo ""
         echo "    # === CDN 域名（不做本地解析，走上游 CDN）==="
-        local cdn_d
-        for cdn_d in "${cdn_domains[@]}"; do
-            [[ -z "$cdn_d" ]] && continue
-            echo "    # CDN 域名: ${cdn_d}"
+        for _dom in "${!_cdn_set[@]}"; do
+            echo "    # CDN 域名: ${_dom}"
         done
-    fi
-
-    if [[ -z "$reality_domain" && -z "$anytls_domain" && -z "$hy2_domain" && -z "$naive_domain" && -z "$cdn_str" ]]; then
-        echo "    # 暂无自有域名配置"
     fi
 }
 
@@ -411,7 +366,10 @@ ${iface_ipv6}
 
     # === DNSSEC ===
     # chroot: "" 确保路径从系统根目录解析，不受 directory 影响
-    auto-trust-anchor-file: "/var/lib/unbound/root.key"
+    # auto-trust-anchor-file 已禁用：AlmaLinux/RHEL 上 root.key 初始化
+    # 不可靠，启用后 DNSSEC 验证失败会导致全部查询返回 SERVFAIL。
+    # 如需 DNSSEC 请手动执行: unbound-anchor -a /var/lib/unbound/root.key
+    # auto-trust-anchor-file: "/var/lib/unbound/root.key"
     root-hints: "/etc/unbound/root.hints"
 
     # === 过期缓存容错 ===
@@ -425,7 +383,7 @@ ${iface_ipv6}
     chroot: ""
     pidfile: "/run/unbound.pid"
     use-systemd: yes
-    module-config: "validator iterator"
+    module-config: "iterator"
 
     # === 加载扩展配置 ===
     include: "/etc/unbound/conf.d/*.conf"
