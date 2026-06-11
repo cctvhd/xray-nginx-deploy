@@ -34,6 +34,7 @@ load_existing_params() {
     NAIVE_PASS=$(get_state "NAIVE_PASS")
     NAIVE_PROBE_LINK=$(get_state "NAIVE_PROBE_LINK")
     SUBSCRIPTION_PATH=$(get_state "SUBSCRIPTION_PATH")
+    VLESS_ENC_CLIENT=$(get_state "VLESS_ENC_CLIENT")
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
@@ -108,6 +109,15 @@ for inb in c['inbounds']:
             fi
         fi
 
+        # VLESS Encryption：state 缺失时从 config.json 的 decryption Seed 推导 Client
+        if [[ -z "${VLESS_ENC_CLIENT:-}" ]]; then
+            local enc_seed
+            enc_seed=$(grep -oP '"decryption":\s*"mlkem768x25519plus\.[^"]+' "$xray_config" | head -1 | grep -oP '[^.]+$' || true)
+            if [[ -n "${enc_seed:-}" ]]; then
+                VLESS_ENC_CLIENT=$(xray mlkem768 -i "${enc_seed}" 2>/dev/null | grep -i "client" | awk '{print $NF}' || true)
+            fi
+        fi
+
         # gRPC 域名从 nginx 配置读取
         if [[ -z "${GRPC_DOMAIN:-}" ]]; then
             GRPC_DOMAIN=$(grep -oP 'server_name\s+\K\S+' \
@@ -140,6 +150,12 @@ for inb in c['inbounds']:
     fi
 
     XHTTP_PADDING="${XHTTP_PADDING:-100-300}"
+
+    # CDN 节点分享链接的 encryption 参数（字符均为 URI 安全字符，无需编码）
+    VLESS_ENC_PARAM=""
+    if [[ -n "${VLESS_ENC_CLIENT:-}" ]]; then
+        VLESS_ENC_PARAM="mlkem768x25519plus.native.0rtt.${VLESS_ENC_CLIENT}"
+    fi
 }
 
 # ── 获取服务器IP ─────────────────────────────────────────────
@@ -165,7 +181,7 @@ print(urllib.parse.quote('${XHTTP_PATH}'))
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_URL="vless://${XRAY_UUID}@${XHTTP_DOMAIN}:443?\
-encryption=none\
+encryption=${VLESS_ENC_PARAM:-none}\
 &security=tls\
 &sni=${XHTTP_DOMAIN}\
 &fp=chrome\
@@ -184,7 +200,7 @@ gen_grpc_url() {
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
     GRPC_URL="vless://${XRAY_UUID}@${GRPC_DOMAIN}:443?\
-encryption=none\
+encryption=${VLESS_ENC_PARAM:-none}\
 &security=tls\
 &sni=${GRPC_DOMAIN}\
 &fp=chrome\
@@ -467,6 +483,7 @@ show_client_links() {
         echo "# ============================================================"
         echo "UUID:            ${XRAY_UUID:-}"
         echo "公钥(PublicKey): ${XRAY_PUBLIC_KEY:-}"
+        echo "VLESS Encryption(CDN 节点 encryption 填): ${VLESS_ENC_PARAM:-none}"
         echo "xhttp路径:       ${XHTTP_PATH:-}"
         echo "xhttp域名:       ${XHTTP_DOMAIN:-}"
         echo "gRPC域名:        ${GRPC_DOMAIN:-}"

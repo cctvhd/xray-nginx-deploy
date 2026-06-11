@@ -73,6 +73,34 @@ generate_xray_params() {
         log_info "生成新密钥对"
     fi
 
+    # ── VLESS Encryption（ML-KEM-768 后量子认证，用于 CDN 入站端到端加密）──
+    local saved_enc_seed
+    saved_enc_seed=$(get_state "VLESS_ENC_SEED" "")
+    if ! xray mlkem768 &>/dev/null; then
+        VLESS_ENC_SEED=""
+        VLESS_ENC_CLIENT=""
+        log_warn "当前 Xray 内核不支持 mlkem768，CDN 入站 VLESS Encryption 已禁用（decryption=none）"
+    elif [[ -n "${saved_enc_seed}" ]]; then
+        VLESS_ENC_SEED="${saved_enc_seed}"
+        VLESS_ENC_CLIENT=$(get_state "VLESS_ENC_CLIENT" "")
+        if [[ -z "${VLESS_ENC_CLIENT}" ]]; then
+            VLESS_ENC_CLIENT=$(xray mlkem768 -i "${VLESS_ENC_SEED}" | grep -i "client" | awk '{print $NF}')
+            save_state "VLESS_ENC_CLIENT" "${VLESS_ENC_CLIENT}"
+            log_warn "从 Seed 重新推导 ML-KEM-768 Client"
+        fi
+        log_info "复用已有 VLESS Encryption 密钥"
+    else
+        local mlkem_out
+        mlkem_out=$(xray mlkem768)
+        VLESS_ENC_SEED=$(echo "$mlkem_out" | grep -i "seed" | awk '{print $NF}')
+        VLESS_ENC_CLIENT=$(echo "$mlkem_out" | grep -i "client" | awk '{print $NF}')
+        # 与 XHTTP_PATH 同理：立即写入 state，保证 client.sh 等
+        # 后续步骤无论执行顺序都能读到同一份密钥
+        save_state "VLESS_ENC_SEED"   "${VLESS_ENC_SEED}"
+        save_state "VLESS_ENC_CLIENT" "${VLESS_ENC_CLIENT}"
+        log_info "生成新 VLESS Encryption 密钥（ML-KEM-768）"
+    fi
+
     local saved_path
     saved_path=$(get_state "XHTTP_PATH" "")
     if [[ -n "${saved_path}" ]]; then
@@ -350,6 +378,13 @@ generate_xray_config() {
     done
     sid_json="${sid_json%,}"
 
+    # CDN 入站 VLESS Encryption：TLS 在 nginx/CDN 终结，启用后 CDN 无法明文窥探；
+    # reality-direct 保持 none（REALITY 已端到端加密，叠加属冗余）
+    local vless_decryption="none"
+    if [[ -n "${VLESS_ENC_SEED:-}" ]]; then
+        vless_decryption="mlkem768x25519plus.native.600s.${VLESS_ENC_SEED}"
+    fi
+
     local warp_outbound
     warp_outbound=$(_build_warp_outbound_json)
 
@@ -439,7 +474,7 @@ generate_xray_config() {
             "protocol": "vless",
             "settings": {
                 "clients":     [{"id": "${XRAY_UUID}"}],
-                "decryption":  "none"
+                "decryption":  "${vless_decryption}"
             },
             "streamSettings": {
                 "network":  "xhttp",
@@ -480,7 +515,7 @@ generate_xray_config() {
             "protocol": "vless",
             "settings": {
                 "clients":    [{"id": "${XRAY_UUID}"}],
-                "decryption": "none"
+                "decryption": "${vless_decryption}"
             },
             "streamSettings": {
                 "network":  "grpc",
@@ -630,4 +665,8 @@ run_xray() {
     echo "  私钥:         ${XRAY_PRIVATE_KEY}"
     echo "  xhttp路径:    ${XHTTP_PATH}"
     echo "  Reality dest: ${REALITY_DEST}"
+    if [[ -n "${VLESS_ENC_CLIENT:-}" ]]; then
+        echo "  VLESS Encryption（CDN 节点客户端 encryption 填）:"
+        echo "    mlkem768x25519plus.native.0rtt.${VLESS_ENC_CLIENT}"
+    fi
 }
