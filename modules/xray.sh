@@ -303,6 +303,32 @@ collect_reality_params() {
         log_warn "请确认该路径在目标网站返回 200，否则流量特征异常"
     fi
 
+    # ── 选择 XHTTP-Reality 专用 SNI ────────────────────────────
+    # serverNames[0] 留给 TCP+Vision（REALITY_SNI），
+    # 从剩余条目里选一个给 XHTTP-Reality（8325）
+    XHTTP_REALITY_SNI=""
+    if (( ${#REALITY_SERVER_NAMES[@]} > 1 )); then
+        echo ""
+        echo "请选择 XHTTP-Reality 直连节点使用的伪装 SNI："
+        echo "  （与 TCP+Vision 使用不同 SNI，nginx 据此分流到不同端口）"
+        local _idx=1
+        for sn in "${REALITY_SERVER_NAMES[@]:1}"; do
+            echo "  ${_idx}. ${sn}"
+            (( _idx++ ))
+        done
+        echo "  （默认 1：${REALITY_SERVER_NAMES[1]}）"
+        read -rp "请选择 [1-$(( ${#REALITY_SERVER_NAMES[@]} - 1 ))，默认1]: " _sni_choice
+        local _sni_idx=$(( ${_sni_choice:-1} - 1 ))
+        # 越界则回退到 1
+        if (( _sni_idx < 0 || _sni_idx >= ${#REALITY_SERVER_NAMES[@]} - 1 )); then
+            _sni_idx=0
+        fi
+        XHTTP_REALITY_SNI="${REALITY_SERVER_NAMES[$(( _sni_idx + 1 ))]}"
+        log_info "XHTTP-Reality SNI 设为: ${XHTTP_REALITY_SNI}"
+    else
+        log_warn "serverNames 只有一个条目，XHTTP-Reality 节点不可用（与 TCP+Vision 共用同一 SNI 无法分流）"
+    fi
+
     log_info "Reality dest:        ${REALITY_DEST}"
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
 }
@@ -372,10 +398,9 @@ generate_xray_config() {
     done
     sn_json="${sn_json%,}"
 
-    # XHTTP-Reality 专用 SNI：取 serverNames[1]（与 TCP+Vision 的 [0] 区分）
-    # 若只有一个 SNI 则为空，gen_xhttp_reality_url 会跳过生成
-    XHTTP_REALITY_SNI="${REALITY_SERVER_NAMES[1]:-}"
-    save_state "XHTTP_REALITY_SNI" "${XHTTP_REALITY_SNI}"
+    # XHTTP_REALITY_SNI 由 collect_reality_params() 交互式设置并已赋值
+    # 此处只做持久化
+    save_state "XHTTP_REALITY_SNI" "${XHTTP_REALITY_SNI:-}"
 
     local sid_json=""
     for sid in "${REALITY_SHORT_IDS[@]}"; do
