@@ -1910,10 +1910,18 @@ add_cf_account() {
     fi
     cf_token="$PROMPT_CF_TOKEN_RESULT"
 
-    cat > "$ini_file" << INI
+    # 若该 token 已存在于其他 ini，直接复用，避免同内容重复文件
+    local _dup_src
+    _dup_src=$(find_cf_token_owner_file "$cf_token" "$ini_file" || true)
+    if [[ -n "$_dup_src" ]]; then
+        cp "$_dup_src" "$ini_file"
+        log_info "Token 已存在于 $(basename "$_dup_src")，复用为 ${filebase}.ini"
+    else
+        cat > "$ini_file" << INI
 # Cloudflare API Token — ${cf_root}
 dns_cloudflare_api_token = ${cf_token}
 INI
+    fi
     chmod 600 "$ini_file"
 
     rebuild_cf_ini_files
