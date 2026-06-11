@@ -372,6 +372,11 @@ generate_xray_config() {
     done
     sn_json="${sn_json%,}"
 
+    # XHTTP-Reality 专用 SNI：取 serverNames[1]（与 TCP+Vision 的 [0] 区分）
+    # 若只有一个 SNI 则为空，gen_xhttp_reality_url 会跳过生成
+    XHTTP_REALITY_SNI="${REALITY_SERVER_NAMES[1]:-}"
+    save_state "XHTTP_REALITY_SNI" "${XHTTP_REALITY_SNI}"
+
     local sid_json=""
     for sid in "${REALITY_SHORT_IDS[@]}"; do
         sid_json+="\"${sid}\","

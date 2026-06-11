@@ -15,6 +15,7 @@ load_existing_params() {
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     REALITY_SNI=$(get_state "REALITY_SNI")
+    XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
     REALITY_SHORT_ID=$(get_state "REALITY_SHORT_ID")
     REALITY_SPIDER_X=$(get_state "REALITY_SPIDER_X")
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
@@ -212,33 +213,28 @@ encryption=${VLESS_ENC_PARAM:-none}\
 
 # ── 生成 VLESS-XHTTP-REALITY 直连节点链接 ────────────────────
 gen_xhttp_reality_url() {
-    if [[ -z "${REALITY_SNI:-}" ]] || [[ -z "${XRAY_UUID:-}" ]] || [[ -z "${XHTTP_PATH:-}" ]]; then
+    if [[ -z "${XHTTP_REALITY_SNI:-}" ]] || [[ -z "${XRAY_UUID:-}" ]] || [[ -z "${XHTTP_PATH:-}" ]]; then
         return
     fi
 
-    local path_encoded spider_encoded reality_host _hn
+    local path_encoded reality_host _hn
     path_encoded=$(python3 -c "
 import urllib.parse
 print(urllib.parse.quote('${XHTTP_PATH}'))
 " 2>/dev/null || echo "${XHTTP_PATH}")
 
-    spider_encoded=$(python3 -c "
-import urllib.parse
-print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
-" 2>/dev/null || echo "%2Fapi%2Fhealth")
-
     reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-$SERVER_IP}}"
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
-encryption=none\
-&security=reality\
-&sni=${REALITY_SNI}\
+path=${path_encoded}\
+&mode=auto\
+&type=xhttp\
+&encryption=none\
 &fp=chrome\
 &pbk=${XRAY_PUBLIC_KEY}\
 &sid=${REALITY_SHORT_ID}\
-&type=xhttp\
-&path=${path_encoded}\
-&spiderX=${spider_encoded}\
+&security=reality\
+&sni=${XHTTP_REALITY_SNI}\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-xhttp-reality-${_hn}'))" 2>/dev/null)"
 }
 

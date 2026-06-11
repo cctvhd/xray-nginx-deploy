@@ -722,7 +722,12 @@ generate_sni_map() {
         for sn in "${REALITY_SERVER_NAMES[@]}"; do
             [[ -n "$sn" ]] || continue
             [[ -n "${seen_sni[$sn]:-}" ]] && continue
-            echo "        ${sn}     127.0.0.1:8320;"
+            # XHTTP_REALITY_SNI（serverNames[1]）单独路由到 8325
+            if [[ -n "${XHTTP_REALITY_SNI:-}" && "$sn" == "${XHTTP_REALITY_SNI}" ]]; then
+                echo "        ${sn}     127.0.0.1:8325;"
+            else
+                echo "        ${sn}     127.0.0.1:8320;"
+            fi
             seen_sni["$sn"]=1
         done
         had_output=1
