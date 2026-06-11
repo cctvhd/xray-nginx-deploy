@@ -355,7 +355,13 @@ collect_reality_params() {
             _sni_idx=0
         fi
         XHTTP_REALITY_SNI="${REALITY_SERVER_NAMES[$(( _sni_idx + 1 ))]}"
-        log_info "XHTTP-Reality SNI 设为: ${XHTTP_REALITY_SNI}"
+        # 防呆：不允许与 TCP+Vision SNI（[0]）相同
+        if [[ "${XHTTP_REALITY_SNI}" == "${REALITY_SERVER_NAMES[0]}" ]]; then
+            log_warn "所选 SNI 与 TCP+Vision 相同，已自动清空——XHTTP-Reality 节点不可用"
+            XHTTP_REALITY_SNI=""
+        else
+            log_info "XHTTP-Reality SNI 设为: ${XHTTP_REALITY_SNI}"
+        fi
     else
         log_warn "serverNames 只有一个条目，XHTTP-Reality 节点不可用（与 TCP+Vision 共用同一 SNI 无法分流）"
     fi
