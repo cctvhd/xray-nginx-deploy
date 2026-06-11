@@ -637,7 +637,8 @@ mkdir -p /var/log/xray
     fi
 
     configure_xray_service_limits
-    systemctl enable --now xray
+    systemctl enable xray
+    systemctl restart xray
 
     sleep 2
     if systemctl is-active --quiet xray; then
