@@ -185,79 +185,110 @@ collect_reality_params() {
 
         # ── 美国 / 北美 ──────────────────────────────────────
         1)
+            local -a _us_labels=(
+                "solanolibrary.com:443（洛杉矶公共图书馆）"
+                "www.siliconvalley.com:443（硅谷媒体）"
+                "business.ca.gov:443（加州政府）"
+                "openclaw.ai:443（AI 平台）"
+                "www.oxy.edu:443（奥克西登特学院）"
+                "film.ca.gov:443（加州电影委员会）"
+                "www.lapl.org:443（洛杉矶公共图书馆官网）"
+            )
+            local -a _us_dests=(
+                "solanolibrary.com:443"
+                "www.siliconvalley.com:443"
+                "business.ca.gov:443"
+                "openclaw.ai:443"
+                "www.oxy.edu:443"
+                "film.ca.gov:443"
+                "www.lapl.org:443"
+            )
+            local -a _us_servernames=(
+                "solanolibrary.com openclaw.ai www.lapl.org www.siliconvalley.com www.oxy.edu business.ca.gov film.ca.gov"
+                "www.siliconvalley.com solanolibrary.com www.oxy.edu business.ca.gov openclaw.ai film.ca.gov"
+                "business.ca.gov film.ca.gov solanolibrary.com www.oxy.edu openclaw.ai"
+                "openclaw.ai solanolibrary.com www.lapl.org www.siliconvalley.com www.oxy.edu"
+                "www.oxy.edu solanolibrary.com openclaw.ai business.ca.gov film.ca.gov"
+                "film.ca.gov business.ca.gov solanolibrary.com openclaw.ai www.oxy.edu"
+                "www.lapl.org solanolibrary.com openclaw.ai www.siliconvalley.com www.oxy.edu"
+            )
             echo ""
             echo "美国 / 北美伪装目标："
-            echo "  1. solanolibrary.com:443（洛杉矶公共图书馆）"
-            echo "  2. www.siliconvalley.com:443（硅谷媒体）"
-            echo "  3. business.ca.gov:443（加州政府）"
-            read -rp "请选择 [1-3，默认1]: " dest_choice
-            case "${dest_choice:-1}" in
-                1) REALITY_DEST="solanolibrary.com:443"
-                   REALITY_SERVER_NAMES=("solanolibrary.com" "openclaw.ai"
-                                         "www.lapl.org" "www.siliconvalley.com"
-                                         "www.oxy.edu" "business.ca.gov" "film.ca.gov") ;;
-                2) REALITY_DEST="www.siliconvalley.com:443"
-                   REALITY_SERVER_NAMES=("www.siliconvalley.com" "solanolibrary.com"
-                                         "www.oxy.edu" "business.ca.gov") ;;
-                3) REALITY_DEST="business.ca.gov:443"
-                   REALITY_SERVER_NAMES=("business.ca.gov" "film.ca.gov"
-                                         "solanolibrary.com" "www.oxy.edu") ;;
-            esac
+            local _i
+            for (( _i=0; _i<${#_us_labels[@]}; _i++ )); do
+                echo "  $(( _i+1 )). ${_us_labels[$_i]}"
+            done
+            read -rp "请选择 [1-${#_us_labels[@]}，默认1]: " dest_choice
+            local _di=$(( ${dest_choice:-1} - 1 ))
+            (( _di < 0 || _di >= ${#_us_dests[@]} )) && _di=0
+            REALITY_DEST="${_us_dests[$_di]}"
+            read -ra REALITY_SERVER_NAMES <<< "${_us_servernames[$_di]}"
             ;;
 
         # ── 欧洲 ─────────────────────────────────────────────
         2)
+            local -a _eu_labels=(
+                "ethz.ch:443（瑞士联邦理工学院）"
+                "www.ecb.europa.eu:443（欧洲中央银行）"
+                "opendata.cern.ch:443（欧洲核子研究中心）"
+                "yandex.com.tr:443（Yandex 土耳其）"
+                "www.mpg.de:443（马克斯普朗克学会）"
+                "sentinels.copernicus.eu:443（哥白尼计划）"
+            )
+            local -a _eu_dests=(
+                "ethz.ch:443"
+                "www.ecb.europa.eu:443"
+                "opendata.cern.ch:443"
+                "yandex.com.tr:443"
+                "www.mpg.de:443"
+                "sentinels.copernicus.eu:443"
+            )
+            local -a _eu_servernames=(
+                "ethz.ch m.ethz.ch debian.ethz.ch cuni.cz mff.cuni.cz www.mpg.de developer.trumpf.com"
+                "www.ecb.europa.eu api.ecb.europa.eu sentinels.copernicus.eu ethz.ch www.mpg.de"
+                "opendata.cern.ch ethz.ch m.ethz.ch www.mpg.de api.aalto.fi www.nic.funet.fi"
+                "yandex.com.tr ethz.ch www.ecb.europa.eu opendata.cern.ch"
+                "www.mpg.de developer.trumpf.com ethz.ch m.ethz.ch debian.ethz.ch cuni.cz mff.cuni.cz"
+                "sentinels.copernicus.eu www.ecb.europa.eu api.ecb.europa.eu opendata.cern.ch ethz.ch"
+            )
             echo ""
             echo "欧洲伪装目标："
-            echo "  1. ethz.ch:443（瑞士联邦理工学院）"
-            echo "  2. www.ecb.europa.eu:443（欧洲中央银行）"
-            echo "  3. opendata.cern.ch:443（欧洲核子研究中心）"
-            echo "  4. yandex.com.tr:443（Yandex 土耳其）"
-            echo "  5. www.mpg.de:443（马克斯普朗克学会）"
-            echo "  6. sentinels.copernicus.eu:443（哥白尼计划）"
-            read -rp "请选择 [1-6，默认1]: " dest_choice
-            case "${dest_choice:-1}" in
-                1) REALITY_DEST="ethz.ch:443"
-                   REALITY_SERVER_NAMES=("ethz.ch" "m.ethz.ch" "debian.ethz.ch"
-                                         "cuni.cz" "mff.cuni.cz"
-                                         "www.mpg.de" "developer.trumpf.com") ;;
-                2) REALITY_DEST="www.ecb.europa.eu:443"
-                   REALITY_SERVER_NAMES=("www.ecb.europa.eu" "api.ecb.europa.eu"
-                                         "sentinels.copernicus.eu"
-                                         "ethz.ch" "www.mpg.de") ;;
-                3) REALITY_DEST="opendata.cern.ch:443"
-                   REALITY_SERVER_NAMES=("opendata.cern.ch"
-                                         "ethz.ch" "m.ethz.ch"
-                                         "www.mpg.de" "api.aalto.fi"
-                                         "www.nic.funet.fi") ;;
-                4) REALITY_DEST="yandex.com.tr:443"
-                   REALITY_SERVER_NAMES=("yandex.com.tr"
-                                         "ethz.ch" "www.ecb.europa.eu"
-                                         "opendata.cern.ch") ;;
-                5) REALITY_DEST="www.mpg.de:443"
-                   REALITY_SERVER_NAMES=("www.mpg.de" "developer.trumpf.com"
-                                         "ethz.ch" "m.ethz.ch" "debian.ethz.ch"
-                                         "cuni.cz" "mff.cuni.cz") ;;
-                6) REALITY_DEST="sentinels.copernicus.eu:443"
-                   REALITY_SERVER_NAMES=("sentinels.copernicus.eu"
-                                         "www.ecb.europa.eu" "api.ecb.europa.eu"
-                                         "opendata.cern.ch" "ethz.ch") ;;
-            esac
+            local _i
+            for (( _i=0; _i<${#_eu_labels[@]}; _i++ )); do
+                echo "  $(( _i+1 )). ${_eu_labels[$_i]}"
+            done
+            read -rp "请选择 [1-${#_eu_labels[@]}，默认1]: " dest_choice
+            local _di=$(( ${dest_choice:-1} - 1 ))
+            (( _di < 0 || _di >= ${#_eu_dests[@]} )) && _di=0
+            REALITY_DEST="${_eu_dests[$_di]}"
+            read -ra REALITY_SERVER_NAMES <<< "${_eu_servernames[$_di]}"
             ;;
 
         # ── 亚洲 ─────────────────────────────────────────────
         3)
+            local -a _as_labels=(
+                "www.lovelive-anime.jp:443（日本动画）"
+                "www.nintendo.co.jp:443（任天堂日本）"
+            )
+            local -a _as_dests=(
+                "www.lovelive-anime.jp:443"
+                "www.nintendo.co.jp:443"
+            )
+            local -a _as_servernames=(
+                "www.lovelive-anime.jp www.nintendo.co.jp"
+                "www.nintendo.co.jp www.lovelive-anime.jp"
+            )
             echo ""
             echo "亚洲伪装目标："
-            echo "  1. www.lovelive-anime.jp:443（日本）"
-            echo "  2. www.nintendo.co.jp:443（任天堂日本）"
-            read -rp "请选择 [1-2，默认1]: " dest_choice
-            case "${dest_choice:-1}" in
-                1) REALITY_DEST="www.lovelive-anime.jp:443"
-                   REALITY_SERVER_NAMES=("www.lovelive-anime.jp") ;;
-                2) REALITY_DEST="www.nintendo.co.jp:443"
-                   REALITY_SERVER_NAMES=("www.nintendo.co.jp" "www.lovelive-anime.jp") ;;
-            esac
+            local _i
+            for (( _i=0; _i<${#_as_labels[@]}; _i++ )); do
+                echo "  $(( _i+1 )). ${_as_labels[$_i]}"
+            done
+            read -rp "请选择 [1-${#_as_labels[@]}，默认1]: " dest_choice
+            local _di=$(( ${dest_choice:-1} - 1 ))
+            (( _di < 0 || _di >= ${#_as_dests[@]} )) && _di=0
+            REALITY_DEST="${_as_dests[$_di]}"
+            read -ra REALITY_SERVER_NAMES <<< "${_as_servernames[$_di]}"
             ;;
 
         # ── 自定义 ───────────────────────────────────────────
