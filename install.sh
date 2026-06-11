@@ -1080,6 +1080,7 @@ REALITY_SNI=''
 REALITY_SERVER_NAMES=''
 REALITY_SHORT_ID=''
 REALITY_SPIDER_X=''
+XHTTP_REALITY_SNI=''
 
 SINGBOX_PASSWORD=''
 
@@ -1138,6 +1139,7 @@ ENV
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XRAY_PADDING=$(get_state "XRAY_PADDING")
+    XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
 
     # ── BUG FIX：恢复 REALITY_SERVER_NAMES 数组 ──────────────
     # 原代码只保存了 REALITY_SNI（第一个元素），导致 do_conf_nginx
@@ -1774,6 +1776,7 @@ do_conf_xray() {
     save_state "GRPC_SERVICE_NAME"     "${GRPC_SERVICE_NAME:-}"
     save_state "REALITY_DEST"          "${REALITY_DEST:-}"
     save_state "REALITY_SNI"           "${REALITY_SERVER_NAMES[0]:-}"
+    save_state "XHTTP_REALITY_SNI"     "${XHTTP_REALITY_SNI:-}"
     # ── BUG FIX：保存完整 serverNames 数组供 nginx 生成 SNI map 使用 ──
     save_state "REALITY_SERVER_NAMES"  "${REALITY_SERVER_NAMES[*]:-}"
     save_state "REALITY_SHORT_ID"      "${REALITY_SHORT_IDS[1]:-}"
@@ -3190,6 +3193,7 @@ run_full_install_flow() {
     save_state "GRPC_SERVICE_NAME"    "${GRPC_SERVICE_NAME:-}"
     save_state "REALITY_DEST"         "${REALITY_DEST:-}"
     save_state "REALITY_SNI"          "${REALITY_SERVER_NAMES[0]:-}"
+    save_state "XHTTP_REALITY_SNI"    "${XHTTP_REALITY_SNI:-}"
     save_state "REALITY_SERVER_NAMES" "${REALITY_SERVER_NAMES[*]:-}"
     save_state "REALITY_SHORT_IDS" "${REALITY_SHORT_IDS[*]:-}"
     save_state "REALITY_SHORT_ID"     "${REALITY_SHORT_IDS[1]:-}"
@@ -3318,6 +3322,7 @@ do_reconf_xray() {
 	save_state "XRAY_PRIVATE_KEY"     ""
 	save_state "REALITY_DEST"         ""
 	save_state "REALITY_SNI"          ""
+	save_state "XHTTP_REALITY_SNI"    ""
 	save_state "REALITY_SERVER_NAMES" ""
 	save_state "REALITY_SHORT_ID"     ""
 	save_state "REALITY_SHORT_IDS"    ""
