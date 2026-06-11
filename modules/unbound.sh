@@ -344,8 +344,10 @@ ${iface_ipv6}
     so-reuseport: yes
     msg-cache-size: ${msg_cache}
     rrset-cache-size: ${rrset_cache}
+    msg-cache-slabs: ${threads}
+    rrset-cache-slabs: ${threads}
     cache-max-ttl: 86400
-    cache-min-ttl: 300
+    cache-min-ttl: 600
     prefetch: yes
     prefetch-key: yes
     outgoing-range: 8192
@@ -372,10 +374,11 @@ ${iface_ipv6}
     # auto-trust-anchor-file: "/var/lib/unbound/root.key"
     root-hints: "/etc/unbound/root.hints"
 
-    # === 过期缓存容错 ===
+    # === 过期缓存容错（RFC 8767 stale-while-revalidate）===
     serve-expired: yes
-    serve-expired-ttl: 1800
-    serve-expired-client-timeout: 120
+    serve-expired-ttl: 86400
+    serve-expired-client-timeout: 1800
+    serve-expired-reply-ttl: 30
 
     # === 系统参数 ===
     username: "unbound"
@@ -388,6 +391,10 @@ ${iface_ipv6}
     # === 加载扩展配置 ===
     include: "/etc/unbound/conf.d/*.conf"
 
+    # === 上游 DNS（DNS-over-TLS）===
+    # tls-system-cert 使用系统 CA 包认证上游证书，防止 ISP 窥探 DNS
+    tls-system-cert: yes
+
 # === 远程控制 ===
 remote-control:
     control-enable: yes
@@ -395,6 +402,14 @@ remote-control:
     control-interface: ::1
     control-port: 8953
     control-use-cert: no
+
+forward-zone:
+    name: "."
+    forward-tls-upstream: yes
+    forward-addr: 1.1.1.1@853#cloudflare-dns.com
+    forward-addr: 1.0.0.1@853#cloudflare-dns.com
+    forward-addr: 8.8.8.8@853#dns.google
+    forward-addr: 8.8.4.4@853#dns.google
 MAIN_EOF
 
     chown root:unbound /etc/unbound/unbound.conf 2>/dev/null || true
