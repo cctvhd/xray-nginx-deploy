@@ -521,12 +521,11 @@ generate_xray_config() {
                 "network":  "grpc",
                 "security": "none",
                 "grpcSettings": {
-                    "serviceName":          "grpc.Service",
-                    "multiMode":            true,
-                    "idle_timeout":         60,
-                    "health_check_timeout": 20,
-                    "permit_without_stream": false,
-                    "initial_windows_size":  4194304
+                    "serviceName":           "${GRPC_SERVICE_NAME}",
+                    "multiMode":             false,
+                    "idle_timeout":          60,
+                    "health_check_timeout":  20,
+                    "permit_without_stream": false
                 }
             },
             "sniffing": {
@@ -556,7 +555,7 @@ generate_xray_config() {
                         "xver": 0
                     },
                     {
-                        "path": "/grpc.Service",
+                        "path": "/${GRPC_SERVICE_NAME}",
                         "dest": "127.0.0.1:8350",
                         "xver": 0
                     },

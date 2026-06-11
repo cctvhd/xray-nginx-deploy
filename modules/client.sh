@@ -205,7 +205,7 @@ encryption=${VLESS_ENC_PARAM:-none}\
 &sni=${GRPC_DOMAIN}\
 &fp=chrome\
 &type=grpc\
-&serviceName=grpc.Service\
+&serviceName=${GRPC_SERVICE_NAME}\
 &mode=gun\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-grpc-${_hn}'))" 2>/dev/null)"
 }

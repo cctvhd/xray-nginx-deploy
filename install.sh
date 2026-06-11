@@ -450,11 +450,12 @@ _preflight_check_xhttp_path() {
             "fallback 站点和 _fake 路径都被吞掉，业务异常" \
             "删除 state 中 XHTTP_PATH 后重跑配置 Xray"
     fi
-    if [[ "${XHTTP_PATH}" == /grpc.Service* ]]; then
+    local _grpc_svc="${GRPC_SERVICE_NAME:-grpc.Service}"
+    if [[ "${XHTTP_PATH}" == /${_grpc_svc}* ]]; then
         _preflight_fail \
             "Check 3: XHTTP_PATH 与 gRPC 路径冲突" \
-            "XHTTP_PATH=${XHTTP_PATH} 以 /grpc.Service 开头" \
-            "同域名场景下 nginx 最长前缀匹配会让 location /grpc.Service 抢走 xhttp 流量" \
+            "XHTTP_PATH=${XHTTP_PATH} 以 /${_grpc_svc} 开头" \
+            "同域名场景下 nginx 最长前缀匹配会让 location /${_grpc_svc} 抢走 xhttp 流量" \
             "删除 state 中 XHTTP_PATH 后重跑配置 Xray"
     fi
     if (( ${#XHTTP_PATH} < 8 )); then
@@ -1068,6 +1069,7 @@ ALL_DOMAINS=''
 CDN_DOMAINS=''
 DIRECT_DOMAINS=''
 XHTTP_PATH=''
+GRPC_SERVICE_NAME=''
 
 XRAY_UUID=''
 XRAY_PUBLIC_KEY=''
@@ -1130,6 +1132,7 @@ ENV
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     XHTTP_PATH=$(get_state "XHTTP_PATH")
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
     XRAY_UUID=$(get_state "XRAY_UUID")
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
@@ -1491,8 +1494,9 @@ do_inst_cert() {
     save_state "ALL_DOMAINS"    "${ALL_DOMAINS[*]:-}"
     save_state "CDN_DOMAINS"    "${CDN_DOMAINS[*]:-}"
     save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
-    save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
-    save_state "INST_CERT"      "1"
+    save_state "XHTTP_PATH"          "${XHTTP_PATH:-}"
+    save_state "GRPC_SERVICE_NAME"   "${GRPC_SERVICE_NAME:-}"
+    save_state "INST_CERT"           "1"
 
     XHTTP_DOMAIN="${XHTTP_DOMAIN:-}"
     GRPC_DOMAIN="${GRPC_DOMAIN:-}"
@@ -1672,6 +1676,15 @@ do_conf_nginx() {
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    if [[ -z "${GRPC_SERVICE_NAME}" ]]; then
+        GRPC_SERVICE_NAME="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+        save_state "GRPC_SERVICE_NAME" "${GRPC_SERVICE_NAME}"
+        log_info "生成 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    else
+        log_info "复用已有 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    fi
+
     if ! preflight_config_check "do_conf_nginx"; then
         done_return
         return
@@ -1734,6 +1747,15 @@ do_conf_xray() {
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    if [[ -z "${GRPC_SERVICE_NAME}" ]]; then
+        GRPC_SERVICE_NAME="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+        save_state "GRPC_SERVICE_NAME" "${GRPC_SERVICE_NAME}"
+        log_info "生成 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    else
+        log_info "复用已有 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    fi
+
     if ! preflight_config_check "do_conf_xray"; then
         done_return
         return
@@ -1748,6 +1770,7 @@ do_conf_xray() {
     save_state "XRAY_PUBLIC_KEY"       "${XRAY_PUBLIC_KEY:-}"
     save_state "XRAY_PRIVATE_KEY"      "${XRAY_PRIVATE_KEY:-}"
     save_state "XHTTP_PATH"            "${XHTTP_PATH:-}"
+    save_state "GRPC_SERVICE_NAME"     "${GRPC_SERVICE_NAME:-}"
     save_state "REALITY_DEST"          "${REALITY_DEST:-}"
     save_state "REALITY_SNI"           "${REALITY_SERVER_NAMES[0]:-}"
     # ── BUG FIX：保存完整 serverNames 数组供 nginx 生成 SNI map 使用 ──
@@ -3110,8 +3133,9 @@ run_full_install_flow() {
     save_state "ALL_DOMAINS"    "${ALL_DOMAINS[*]:-}"
     save_state "CDN_DOMAINS"    "${CDN_DOMAINS[*]:-}"
     save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
-    save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
-    save_state "INST_CERT"      "1"
+    save_state "XHTTP_PATH"          "${XHTTP_PATH:-}"
+    save_state "GRPC_SERVICE_NAME"   "${GRPC_SERVICE_NAME:-}"
+    save_state "INST_CERT"           "1"
 
 
 
@@ -3123,6 +3147,15 @@ run_full_install_flow() {
         log_info "生成 XHTTP_PATH: ${XHTTP_PATH}"
     else
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
+    fi
+
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    if [[ -z "${GRPC_SERVICE_NAME}" ]]; then
+        GRPC_SERVICE_NAME="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+        save_state "GRPC_SERVICE_NAME" "${GRPC_SERVICE_NAME}"
+        log_info "生成 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    else
+        log_info "复用已有 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
     fi
 
     load_module warp
@@ -3153,6 +3186,7 @@ run_full_install_flow() {
     save_state "XRAY_PUBLIC_KEY"      "${XRAY_PUBLIC_KEY:-}"
     save_state "XRAY_PRIVATE_KEY"     "${XRAY_PRIVATE_KEY:-}"
     save_state "XHTTP_PATH"           "${XHTTP_PATH:-}"
+    save_state "GRPC_SERVICE_NAME"    "${GRPC_SERVICE_NAME:-}"
     save_state "REALITY_DEST"         "${REALITY_DEST:-}"
     save_state "REALITY_SNI"          "${REALITY_SERVER_NAMES[0]:-}"
     save_state "REALITY_SERVER_NAMES" "${REALITY_SERVER_NAMES[*]:-}"
