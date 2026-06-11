@@ -848,7 +848,7 @@ listen 127.0.0.1:8350;
         keepalive_timeout       ${LATENCY_PROXY_TIMEOUT}s;
     }
 
-    location /grpc.Service {
+    location /${GRPC_SERVICE_NAME} {
         gzip off;
         grpc_pass            grpc://vless_grpc_backend;
         grpc_set_header      Host \$host;
@@ -922,7 +922,7 @@ generate_servers_conf() {
             grpc_merged_location=$(cat << CONF
 
     # 同域名合并：gRPC location 并入 xhttp server 块（按 path 分流）
-    location /grpc.Service {
+    location /${GRPC_SERVICE_NAME} {
         gzip       off;
         access_log off;
         limit_req  zone=websocket burst=100 nodelay;
@@ -1128,7 +1128,7 @@ server {
         rewrite ^ /_fake last;
     }
 
-    location /grpc.Service {
+    location /${GRPC_SERVICE_NAME} {
         gzip       off;
         access_log off;
         limit_req  zone=websocket burst=100 nodelay;
