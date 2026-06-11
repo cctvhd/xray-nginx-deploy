@@ -482,11 +482,11 @@ generate_xray_config() {
                 "xhttpSettings": {
                     "path": "${XHTTP_PATH}",
                     "host": "${XHTTP_DOMAIN:-}",
+                    "mode": "auto",
                     "extra": {
-                        "enc":                    "packet",
                         "xPaddingBytes":          "${x_padding}",
                         "scStreamUpServerSecs":   "20-80",
-                        "headers":                {"User-Agent": "chrome"},
+                        "headers":                {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36"},
                         "xmux": {
                             "maxConcurrency":   "${LATENCY_XMUX_CONCURRENCY}",
                             "maxConnections":   0,
@@ -551,7 +551,7 @@ generate_xray_config() {
                 "fallbacks":  [
                     {
                         "path": "${XHTTP_PATH}",
-                        "dest": "127.0.0.1:8350",
+                        "dest": "127.0.0.1:8325",
                         "xver": 0
                     },
                     {
@@ -584,6 +584,33 @@ generate_xray_config() {
                     "tcpKeepAliveInterval": 30,
                     "tcpMptcp":             true,
                     "tcpNoDelay":           true
+                }
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": false
+            }
+        },
+
+        {
+            "tag":      "vless-xhttp-reality",
+            "listen":   "127.0.0.1",
+            "port":     8325,
+            "protocol": "vless",
+            "settings": {
+                "clients":    [{"id": "${XRAY_UUID}"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network":  "xhttp",
+                "security": "none",
+                "xhttpSettings": {
+                    "path": "${XHTTP_PATH}",
+                    "mode": "auto",
+                    "extra": {
+                        "xPaddingBytes": "${x_padding}"
+                    }
                 }
             },
             "sniffing": {

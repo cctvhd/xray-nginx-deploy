@@ -476,6 +476,7 @@ _preflight_check_internal_ports() {
         [8330]="sing-box anytls"
         [8340]="caddy-naive"
         [8320]="xray reality-direct"
+        [8325]="xray vless-xhttp-reality"
         [8350]="nginx fallback"
         [8360]="nginx middle->anytls"
         [8370]="nginx middle->naive"
@@ -3278,6 +3279,11 @@ do_reconf_nginx() {
 		if ! grep -q '"port":\s*8320' /usr/local/etc/xray/config.json && \
 		   ! grep -q '"port": 8320'   /usr/local/etc/xray/config.json; then
 			log_warn "检测到端口不一致：Xray config.json 中未找到 Reality inbound 端口 8320"
+			mismatch=1
+		fi
+		if ! grep -q '"port":\s*8325' /usr/local/etc/xray/config.json && \
+		   ! grep -q '"port": 8325'   /usr/local/etc/xray/config.json; then
+			log_warn "检测到端口不一致：Xray config.json 中未找到 XHTTP-Reality inbound 端口 8325"
 			mismatch=1
 		fi
 	fi
