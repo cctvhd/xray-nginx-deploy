@@ -484,10 +484,10 @@ _preflight_check_internal_ports() {
         [8390]="nginx grpc ssl"
         [8400]="nginx SNI trap"
     )
-    if (( ${#_internal_ports[@]} != 11 )); then
+    if (( ${#_internal_ports[@]} != 12 )); then
         _preflight_fail \
             "Check 4a: 内部端口表数量异常" \
-            "期望 11 个端口，实际 ${#_internal_ports[@]} 个 —— 可能某两个常量被改成同值" \
+            "期望 12 个端口，实际 ${#_internal_ports[@]} 个 —— 可能某两个常量被改成同值" \
             "nginx upstream / proxy_pass 会指向错误后端，整个栈不可用" \
             "检查 modules/{nginx,xray,singbox,naive}.sh 中的端口常量"
     fi
