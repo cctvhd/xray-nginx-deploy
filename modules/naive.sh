@@ -165,15 +165,37 @@ install_naive() {
     fp_module=$(_get_forwardproxy_module)
     log_info "forwardproxy module: ${fp_module}"
 
-    log_info "开始编译 Caddy + forwardproxy（首次编译需下载依赖，请耐心等待）..."
-    local build_tmpdir
+    log_info "开始编译 Caddy + forwardproxy（首次编译需下载依赖，约需 3-10 分钟，请勿中断）..."
+    log_warn "编译期间请勿按 Ctrl+C 或关闭 SSH 连接"
+
+    local build_tmpdir build_log
     build_tmpdir=$(mktemp -d)
+    build_log="${build_tmpdir}/build.log"
 
     log_info "编译命令: xcaddy build --with ${fp_module}=github.com/klzgrad/forwardproxy@naive --output ${build_tmpdir}/caddy"
-    if ! xcaddy build \
+
+    # setsid 将编译进程从终端会话脱离，防止 SSH 断开或 Ctrl+C 中断编译
+    # 同时 trap SIGINT 阻止信号传递给子进程
+    trap '' INT
+    setsid xcaddy build \
             --with "${fp_module}=github.com/klzgrad/forwardproxy@naive" \
-            --output "${build_tmpdir}/caddy"; then
-        log_error "xcaddy 编译失败"
+            --output "${build_tmpdir}/caddy" 2>&1 | tee "${build_log}" &
+    local build_pid=$!
+    wait "$build_pid"
+    local build_rc=$?
+    trap - INT
+
+    if [[ $build_rc -ne 0 ]]; then
+        log_error "xcaddy 编译失败（exit=${build_rc}）"
+        log_error "编译日志末尾："
+        tail -20 "${build_log}" >&2 || true
+        # 检查内存，给出提示
+        local avail_mb
+        avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+        if (( avail_mb < 512 )); then
+            log_warn "可用内存仅 ${avail_mb}MB，Go 编译建议至少 1GB 可用内存"
+            log_warn "可先释放内存或增加 swap 后重试：fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+        fi
         rm -rf "$build_tmpdir"
         exit 1
     fi
