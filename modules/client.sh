@@ -227,7 +227,7 @@ print(urllib.parse.quote('${XHTTP_PATH}'))
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
 path=${path_encoded}\
-&mode=auto\
+&mode=stream-one\
 &type=xhttp\
 &encryption=none\
 &fp=chrome\
