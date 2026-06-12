@@ -346,6 +346,8 @@ ${iface_ipv6}
     rrset-cache-size: ${rrset_cache}
     msg-cache-slabs: ${threads}
     rrset-cache-slabs: ${threads}
+    key-cache-slabs: ${threads}
+    infra-cache-slabs: ${threads}
     cache-max-ttl: 86400
     cache-min-ttl: 600
     prefetch: yes
