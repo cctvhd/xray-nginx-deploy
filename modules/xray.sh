@@ -671,7 +671,7 @@ generate_xray_config() {
             },
             "streamSettings": {
                 "network":  "xhttp",
-                "security": "none",
+                "security": "reality",
                 "xhttpSettings": {
                     "path": "${XHTTP_PATH}",
                     "mode": "stream-one",
@@ -679,6 +679,19 @@ generate_xray_config() {
                         "xPaddingBytes":        "${x_padding}",
                         "scStreamUpServerSecs": "20-80"
                     }
+                },
+                "realitySettings": {
+                    "show":        false,
+                    "dest":        "${XHTTP_REALITY_SNI}:443",
+                    "xver":        0,
+                    "serverNames": ["${XHTTP_REALITY_SNI}"],
+                    "privateKey":  "${XRAY_PRIVATE_KEY}",
+                    "shortIds":    [${sid_json}]
+                },
+                "sockopt": {
+                    "acceptProxyProtocol": true,
+                    "tcpMptcp":            true,
+                    "tcpNoDelay":          true
                 }
             },
             "sniffing": {
