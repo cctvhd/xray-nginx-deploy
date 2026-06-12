@@ -674,9 +674,10 @@ generate_xray_config() {
                 "security": "none",
                 "xhttpSettings": {
                     "path": "${XHTTP_PATH}",
-                    "mode": "auto",
+                    "mode": "stream-one",
                     "extra": {
-                        "xPaddingBytes": "${x_padding}"
+                        "xPaddingBytes":        "${x_padding}",
+                        "scStreamUpServerSecs": "20-80"
                     }
                 }
             },
