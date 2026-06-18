@@ -63,9 +63,3 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
-
-## 严格禁止事项
-
-- **永远不要** `git add`、`git commit`、`git push` `server-audit/` 目录下的任何文件
-- `server-audit/` 包含服务器敏感审计数据，必须始终保持在 `.gitignore` 中
-- 执行任何 git 操作前，先确认 `server-audit/` 不在暂存区
