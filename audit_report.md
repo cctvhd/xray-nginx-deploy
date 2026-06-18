@@ -293,3 +293,207 @@
 ## B.4 诚实标注 — 一处非预期副作用
 - 沙箱生成 hysteria 配置时调用了仓库 `configure_hysteria2`，该函数为**写配置 + 落地一体**：写完 yaml（已重定向到沙箱，线上 `config.yaml` 经 diff 确认**未改**）后，继续对线上执行了 `sysctl -w`（rmem/wmem=412500000、ip_forward=1，均与既有 brutal/端口跳跃参数一致，幂等且未落盘）、重拷证书（内容相同）、覆盖 `hysteria-cert.sh` 部署钩子（写成当前仓库版）、并 **stop+start `hysteria-server`**（19:22:40 一次短暂重启）。
 - 事后核验：`config.yaml` 与备份逐字节一致；`hysteria-server` active、:443 正常。实际后果仅为一次几秒服务重启。**教训：`configure_*` 类函数非纯生成，含落地动作，沙箱模拟前须先静态确认函数边界。**
+
+---
+
+# 附录 C — cert.sh 代码审查 + 线上现状对比（2026-06-10 追加）
+
+> 审查范围：`modules/cert.sh`（2615行）+ `/etc/cloudflare/` 所有文件 + `/etc/letsencrypt/renewal/*.conf`
+> 目标：确认已发现的代码 Bug 是否在线上已触发，以及修复前后是否需要手动干预线上状态。
+
+---
+
+## C.1 域名证书现状表
+
+| 协议变量 | 完整域名 | 根域 | 证书有效期 | renewal 使用的 ini | ini token（前8位） |
+|---|---|---|---|---|---|
+| XHTTP_DOMAIN | lit.roadtrip.gq | roadtrip.gq | ✅ 2026-07-27（46天） | cf_account_1.ini | cfut_Fv1… |
+| GRPC_DOMAIN | lt.roadtrip.gq | roadtrip.gq | ✅ 2026-07-27（同上） | cf_account_1.ini | cfut_Fv1… |
+| REALITY_DOMAIN | lu.usa-al.cf | usa-al.cf | ✅ 2026-07-27（46天） | cf_account_2.ini | cfat_1lI… |
+| ANYTLS_DOMAIN | lt.usa-al.cf | usa-al.cf | ✅ 2026-07-27（同上） | cf_account_2.ini | cfat_1lI… |
+| NAIVE_DOMAIN | lt.roadfog.tk | roadfog.tk | ✅ 2026-08-27（77天） | domain_roadfog_tk.ini | cfat_5mj… |
+| HYSTERIA2_DOMAIN | lt.roadfog.tk | roadfog.tk | ✅ 同上 | domain_roadfog_tk.ini | cfat_5mj… |
+
+**三套根域证书全部有效，续期凭证路径与实际文件一致，无断链。**
+
+### ini 文件归属关系
+
+| ini 文件 | token（前8位） | renewal conf 引用 | 对应同内容新格式文件 | 状态 |
+|---|---|---|---|---|
+| cf_account_1.ini | cfut_Fv1… | roadtrip.gq.conf ✅ | roadtrip_gq.ini（同token）| 旧格式命名，续期正常 |
+| cf_account_2.ini | cfat_1lI… | usa-al.cf.conf ✅ | usa-al_cf.ini（同token）| 旧格式命名，续期正常 |
+| domain_roadfog_tk.ini | cfat_5mj… | roadfog.tk.conf ✅ | roadfog.ini（同token）| 新格式命名，续期正常 |
+| roadtrip_gq.ini | cfut_Fv1… | 无 | — | 废文件（内容同cf_account_1，renewal未引用）|
+| usa-al_cf.ini | cfat_1lI… | 无 | — | 废文件（内容同cf_account_2，renewal未引用）|
+| roadfog.ini | cfat_5mj… | 无 | — | 废文件（内容同domain_roadfog_tk，renewal未引用）|
+| zhongning_cf.ini | cfut_HF2… | 无 | — | **孤立文件**，见 C.3 |
+
+---
+
+## C.2 Bug 线上影响分析
+
+### Bug 1 — load_cert_request_status 永远加载空数组
+
+**代码位置**：`cert.sh:1535`
+
+问题根因：解析循环先把所有 `#` 开头的行 `continue` 跳过，导致同样以 `#` 开头的
+section 标记（`# --- CERT_SUCCESS_ROOTS ---` 等）永远无法被下方的 `case` 匹配到，
+四个状态数组每次 load 都是空的。对比 `load_domain_config`（第 781 行）写法正确：
+`case` 检查在 `#` 跳过之前。
+
+**线上实证**：`/etc/cloudflare/cert_request_status.conf` 当前仍是旧格式
+（`declare -a CERT_SUCCESS_ROOTS=([0]="roadtrip.gq" [1]="usa-al.cf")`），
+说明新版 `save_cert_request_status` 从未在本机成功写出新格式文件；
+而 `load_cert_request_status` 对旧格式同样解析失败（旧格式无 section 标记，
+变量行也因 `declare -a` 不符合简单 `KEY=VALUE` 格式而被跳过）。
+实际结果：`FAILED_CF_ACCOUNTS` 永远为空，`setup_cf_accounts` 里
+「只重配失败账号」的提示从未出现。
+
+**实际影响**：纯交互体验退化，不影响证书申请、续期、服务运行。
+
+**线上状态是否需要修正**：不需要。旧格式文件内容与实际证书状态吻合（两个域名
+申请成功），无错误状态需纠正。修复代码后，下次执行任意证书操作时
+`save_cert_request_status` 自然写出新格式，之后 `load` 即可正常读取。
+
+---
+
+### Bug 2 — get_domain_ini 静默回退到可能不存在的文件
+
+**代码位置**：`cert.sh:684-687`
+
+```
+log_warn "未找到 ${f}，回退到 cf_account_1.ini"
+echo "${CF_CONFIG_DIR}/cf_account_1.ini"   # 不检查该文件是否实际存在
+```
+
+**线上实证**：三个根域均有正确的 `domain_<root>.ini` 映射文件，
+`get_domain_ini` 的主路径全部命中，回退分支从未被触发。
+
+**潜在风险**：若未来迁移完成后删除旧 `cf_account_N.ini`，再对一个缺少
+`domain_*.ini` 映射的域名调用 `get_domain_ini`，将静默传递不存在的路径给
+certbot，报错定位困难。
+
+**线上状态是否需要修正**：不需要，当前所有路径正常命中。
+
+---
+
+### Bug 3 — add_domain_and_cert 的 certbot 调用是残缺副本
+
+**代码位置**：`cert.sh:2137-2158`
+
+`add_domain_and_cert`（选项3"新增域名"）末尾的 certbot 调用是
+`request_certificates`（第 1694-1754 行）的简化抄写版，缺少：
+- 3 次重试逻辑
+- 限流检测（`rate_limit_hint`）
+- `CERT_*_ROOTS` / `FAILED_CF_ACCOUNTS` 状态跟踪
+
+**实际影响**：通过选项3新增域名时，若证书申请失败，失败状态不被记录，
+下次执行 `setup_cf_accounts` 不会提示重配该账号。当前未有通过选项3添加
+失败的未跟踪域名，线上状态无遗留错误。
+
+---
+
+## C.3 孤立文件 zhongning_cf.ini
+
+| 属性 | 值 |
+|---|---|
+| 路径 | /etc/cloudflare/zhongning_cf.ini |
+| token 前缀 | cfut_HF2… |
+| 与其他 ini token 重复 | 否（唯一 token）|
+| 对应 renewal conf | 无 |
+| 对应 domain_*.ini | 无 |
+| 对应 DOMAIN_REGISTRY 中的域名 | 无 |
+| 对应线上证书 | 无 |
+
+结论：该文件持有一个独立的 Cloudflare API Token，在当前部署中没有任何证书、
+续期配置或域名与之关联。极可能是早期测试或已废弃域名（zhongning.cf 系列）
+遗留的账号凭证。建议确认该域名/账号是否废弃后手动删除，本次审查不自动删除。
+
+---
+
+## C.4 修复方案建议
+
+### 优先级
+
+| 优先级 | 问题 | 线上影响 | 修复复杂度 |
+|---|---|---|---|
+| P1 | Bug 1：load_cert_request_status section 解析失效 | 低（仅丢失失败账号提示）| 低（3行调整）|
+| P2 | Bug 2：get_domain_ini 静默回退 | 无（当前未触发）| 低（加文件存在检查）|
+| P3 | Bug 3：add_domain_and_cert certbot 调用是残缺副本 | 中（无重试/无限流检测/不记录状态）| 中（提取公共函数）|
+| P4 | 废文件清理（roadtrip_gq / usa-al_cf / roadfog .ini）| 无 | 低（手动 rm）|
+| P5 | 孤立凭证 zhongning_cf.ini | 无 | 需用户确认后删除 |
+
+### P1 修复内容
+
+将 `#` 注释跳过移到 `case` 语句之后，与 `load_domain_config` 写法对齐：
+
+```diff
+ while IFS= read -r _line || [[ -n "$_line" ]]; do
+     [[ -z "$_line" ]] && continue
+-    [[ "$_line" == "#"* ]] && continue
+
+     case "$_line" in
+         "# --- CERT_SUCCESS_ROOTS ---")  _section="SUCCESS"; continue ;;
+         "# --- END CERT_SUCCESS_ROOTS ---")  _section=""; continue ;;
+         "# --- CERT_EXISTING_ROOTS ---")  _section="EXISTING"; continue ;;
+         "# --- END CERT_EXISTING_ROOTS ---")  _section=""; continue ;;
+         "# --- CERT_FAILED_ROOTS ---")  _section="FAILED"; continue ;;
+         "# --- END CERT_FAILED_ROOTS ---")  _section=""; continue ;;
+         "# --- FAILED_CF_ACCOUNTS ---")  _section="CF"; continue ;;
+         "# --- END FAILED_CF_ACCOUNTS ---")  _section=""; continue ;;
+     esac
+
++    [[ "$_line" == "#"* ]] && continue
+```
+
+修复后无需手动修改线上状态文件，下次执行证书操作时自然覆写为新格式。
+
+### P2 修复内容
+
+```diff
+     log_warn "未找到 ${f}，回退到 cf_account_1.ini"
+-    echo "${CF_CONFIG_DIR}/cf_account_1.ini"
++    local fallback="${CF_CONFIG_DIR}/cf_account_1.ini"
++    if [[ ! -f "$fallback" ]]; then
++        log_error "回退文件也不存在: ${fallback}，请先配置 CF 账号"
++        return 1
++    fi
++    echo "$fallback"
+```
+
+### P3 修复内容
+
+`add_domain_and_cert` 末尾的 certbot 循环（第 2122-2159 行）替换为复用
+`request_certificates`，只需临时将 `ALL_DOMAINS` 设为新增根域列表后调用：
+
+```bash
+local _saved_all=("${ALL_DOMAINS[@]}")
+ALL_DOMAINS=()
+local _seen_roots=()
+for domain in "${new_domains[@]}"; do
+    local root_domain
+    root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+    [[ " ${_seen_roots[*]} " != *" ${root_domain} "* ]] && ALL_DOMAINS+=("$root_domain") && _seen_roots+=("$root_domain")
+done
+request_certificates
+ALL_DOMAINS=("${_saved_all[@]}")
+```
+
+### P4/P5 线上手动清理（用户确认后执行）
+
+```bash
+# P4：废文件（token 与 cf_account_N 完全相同，renewal conf 未引用）
+rm /etc/cloudflare/roadtrip_gq.ini
+rm /etc/cloudflare/usa-al_cf.ini
+rm /etc/cloudflare/roadfog.ini
+
+# P5：孤立凭证（需先确认 zhongning.cf 相关域名已废弃）
+rm /etc/cloudflare/zhongning_cf.ini
+```
+
+### 线上不需要手动干预的理由
+
+1. 三张证书全部有效，renewal conf 引用的 ini 文件全部存在且 token 正确
+2. Bug 1 状态文件内容与实际证书状态吻合，修复代码后自然覆写，无错误状态需纠正
+3. Bug 2 回退路径从未触发，当前所有根域均有正确的 ini 映射
+4. Bug 3 残缺 certbot 调用仅在「选项3新增域名」场景触发，当前未有未跟踪的失败域名

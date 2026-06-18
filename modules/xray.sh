@@ -439,6 +439,87 @@ generate_xray_config() {
     # 此处只做持久化
     save_state "XHTTP_REALITY_SNI" "${XHTTP_REALITY_SNI:-}"
 
+    # ── 防偷流量：reality-direct ──────────────────────────────────
+    # 有自有域名（REALITY_DOMAIN 已设置）：
+    #   dest → 本地 nginx 8321（由 nginx 模块生成，携带真实证书 + 伪装网站）
+    #   serverNames 仅含自有域名，非 Xray 访客直接看到本地网站，无外部流量可偷
+    # 无自有域名（仅公共 SNI）：
+    #   dest → dokodemo 4431 → 路由决定：serverNames 内的域名 direct，其余 block
+    local _reality_direct_dest _reality_direct_sn
+    local _dokodemo_reality_routing="" _dokodemo_reality_inbound=""
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        _reality_direct_dest="127.0.0.1:8321"
+        _reality_direct_sn="\"${REALITY_DOMAIN}\""
+    else
+        local _rdest_host="${REALITY_DEST%%:*}"
+        local _rdest_port="${REALITY_DEST##*:}"
+        _reality_direct_dest="127.0.0.1:4431"
+        _reality_direct_sn="${sn_json}"
+        _dokodemo_reality_routing='            {
+                "type":        "field",
+                "inboundTag":  ["dokodemo-reality"],
+                "domain":      ['"${sn_json}"'],
+                "outboundTag": "direct"
+            },
+            {
+                "type":        "field",
+                "inboundTag":  ["dokodemo-reality"],
+                "outboundTag": "block"
+            },'
+        _dokodemo_reality_inbound=',
+        {
+            "tag":      "dokodemo-reality",
+            "listen":   "127.0.0.1",
+            "port":     4431,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "'"${_rdest_host}"'",
+                "port":    '"${_rdest_port}"',
+                "network": "tcp"
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["tls"],
+                "routeOnly":    true
+            }
+        }'
+    fi
+
+    # ── 防偷流量：vless-xhttp-reality ────────────────────────────
+    # 始终使用公共域名作为 SNI（XHTTP_REALITY_SNI），不拥有该域名的证书，
+    # 必须用 dokodemo 过滤：只允许转发到对应公共域名，其余一律 block
+    local _dokodemo_xhttp_routing="" _dokodemo_xhttp_inbound=""
+    if [[ -n "${XHTTP_REALITY_SNI:-}" ]]; then
+        _dokodemo_xhttp_routing='            {
+                "type":        "field",
+                "inboundTag":  ["dokodemo-xhttp-reality"],
+                "domain":      ["'"${XHTTP_REALITY_SNI}"'"],
+                "outboundTag": "direct"
+            },
+            {
+                "type":        "field",
+                "inboundTag":  ["dokodemo-xhttp-reality"],
+                "outboundTag": "block"
+            },'
+        _dokodemo_xhttp_inbound=',
+        {
+            "tag":      "dokodemo-xhttp-reality",
+            "listen":   "127.0.0.1",
+            "port":     4432,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "'"${XHTTP_REALITY_SNI}"'",
+                "port":    443,
+                "network": "tcp"
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["tls"],
+                "routeOnly":    true
+            }
+        }'
+    fi
+
     local sid_json=""
     for sid in "${REALITY_SHORT_IDS[@]}"; do
         sid_json+="\"${sid}\","
@@ -509,6 +590,8 @@ generate_xray_config() {
     "routing": {
         "domainStrategy": "IPIfNonMatch",
         "rules": [
+${_dokodemo_reality_routing}
+${_dokodemo_xhttp_routing}
             {
                 "type":        "field",
                 "ip":          ["127.0.0.1"],
@@ -637,9 +720,9 @@ generate_xray_config() {
                 "security": "reality",
                 "realitySettings": {
                     "show":        false,
-                    "dest":        "${REALITY_DEST}",
+                    "dest":        "${_reality_direct_dest}",
                     "xver":        0,
-                    "serverNames": [${sn_json}],
+                    "serverNames": [${_reality_direct_sn}],
                     "privateKey":  "${XRAY_PRIVATE_KEY}",
                     "shortIds":    [${sid_json}],
                     "spiderX":     "${REALITY_SPIDER_X}"
@@ -682,7 +765,7 @@ generate_xray_config() {
                 },
                 "realitySettings": {
                     "show":        false,
-                    "dest":        "${XHTTP_REALITY_SNI}:443",
+                    "dest":        "127.0.0.1:4432",
                     "xver":        0,
                     "serverNames": ["${XHTTP_REALITY_SNI}"],
                     "privateKey":  "${XRAY_PRIVATE_KEY}",
@@ -699,7 +782,7 @@ generate_xray_config() {
                 "destOverride": ["http", "tls", "quic"],
                 "metadataOnly": false
             }
-        }
+        }${_dokodemo_reality_inbound}${_dokodemo_xhttp_inbound}
     ],
 
     "outbounds": [

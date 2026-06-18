@@ -252,6 +252,19 @@ map "\$from_cf:\$http_cf_connecting_ip" \$final_real_ip {
     "~^1:.+"   \$http_cf_connecting_ip;
     default    \$remote_addr;
 }
+
+# ── 媒体文件扩展名检测 ─────────────────────────────────────────────────
+# 非 CF 流量访问媒体文件时应直接返回文件，而非跳转 /_fake 伪装页
+map \$uri \$is_media_ext {
+    ~*\.(mp4|mp3|ogg|m4a|wav|webm|flac|aac)(\?.*)?$  1;
+    default                                            0;
+}
+
+# ── 伪装页跳转判断：仅对非 CF 流量 + 非媒体文件触发 ─────────────────
+map "\${from_cf}_\${is_media_ext}" \$redirect_to_fake {
+    "0_0"   1;
+    default 0;
+}
 CONF
 
     log_info "Cloudflare 真实IP配置生成完成"
@@ -921,6 +934,14 @@ generate_servers_conf() {
         cert_path=$(get_state "CERT_PATH_${xhttp_root//./_}" "")
         [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${xhttp_root}"
 
+        # 确保 xhttp 域名的 webroot 存在；首次缺失时从 html/ 复制 index.html
+        mkdir -p "/var/www/${XHTTP_DOMAIN}"
+        if [[ ! -f "/var/www/${XHTTP_DOMAIN}/index.html" ]] && \
+           [[ -f "/var/www/html/index.html" ]]; then
+            install -m 644 /var/www/html/index.html "/var/www/${XHTTP_DOMAIN}/index.html"
+            log_info "已初始化 /var/www/${XHTTP_DOMAIN}/index.html"
+        fi
+
         # 同域名合并：xhttp 与 gRPC 共用同一域名时，gRPC location 并入此 server 块
         local grpc_merged_location=""
         if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" == "${XHTTP_DOMAIN}" ]]; then
@@ -986,7 +1007,7 @@ server {
     resolver_timeout 5s;
     server_tokens off;
 
-    if (\$from_cf = 0) {
+    if (\$redirect_to_fake) {
         rewrite ^ /_fake last;
     }
 
@@ -1056,7 +1077,7 @@ ${grpc_merged_location}
 
     location /_fake {
         internal;
-        root      /var/www/html;
+        root      /var/www/${XHTTP_DOMAIN};
         index     index.html;
         try_files /index.html =200;
  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
@@ -1070,7 +1091,7 @@ ${grpc_merged_location}
     }
 
     location / {
-        root  /var/www/html;
+        root  /var/www/${XHTTP_DOMAIN};
         index index.html;
  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
  add_header X-Content-Type-Options nosniff always;
@@ -1102,6 +1123,14 @@ CONF
         cert_path=$(get_state "CERT_PATH_${grpc_root//./_}" "")
         [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${grpc_root}"
 
+        # 确保 gRPC 域名的 webroot 存在；首次缺失时从 html/ 复制 index.html
+        mkdir -p "/var/www/${GRPC_DOMAIN}"
+        if [[ ! -f "/var/www/${GRPC_DOMAIN}/index.html" ]] && \
+           [[ -f "/var/www/html/index.html" ]]; then
+            install -m 644 /var/www/html/index.html "/var/www/${GRPC_DOMAIN}/index.html"
+            log_info "已初始化 /var/www/${GRPC_DOMAIN}/index.html"
+        fi
+
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
 # ===================================================================
@@ -1129,7 +1158,7 @@ server {
     resolver_timeout 5s;
     server_tokens off;
 
-    if (\$from_cf = 0) {
+    if (\$redirect_to_fake) {
         rewrite ^ /_fake last;
     }
 
@@ -1209,6 +1238,49 @@ server {
             access_log off;
         }
         try_files \$uri \$uri/ /index.html;
+    }
+}
+CONF
+    fi
+
+    # Reality dest 伪装站（8321）：仅在使用自有域名时生成
+    # xray 的 realitySettings.dest 指向此处，Reality 从本地真实证书读取指纹
+    # 非 Xray 访客直接看到伪装网站，天然无外部流量可偷
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        local reality_root reality_cert_path
+        reality_root=$(get_root_domain "${REALITY_DOMAIN}")
+        reality_cert_path=$(get_state "CERT_PATH_${reality_root//./_}" "")
+        [[ -z "$reality_cert_path" ]] && reality_cert_path="/etc/letsencrypt/live/${reality_root}"
+
+        mkdir -p "/var/www/${REALITY_DOMAIN}"
+
+        cat >> /etc/nginx/conf.d/servers.conf << CONF
+
+# ===================================================================
+# Reality dest 伪装站 ${REALITY_DOMAIN}（8321）
+# 不加 proxy_protocol（Reality xver=0 直连）
+# ===================================================================
+server {
+    listen 127.0.0.1:8321 ssl;
+    server_name ${REALITY_DOMAIN};
+
+    ssl_certificate     ${reality_cert_path}/fullchain.pem;
+    ssl_certificate_key ${reality_cert_path}/privkey.pem;
+    include /etc/nginx/ssl/common.conf;
+
+    root        /var/www/${REALITY_DOMAIN};
+    index       index.html;
+    server_tokens off;
+    access_log  off;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "public, max-age=3600" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Content-Security-Policy "default-src 'self' fonts.googleapis.com fonts.gstatic.com; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' fonts.googleapis.com; font-src 'self' fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';" always;
     }
 }
 CONF

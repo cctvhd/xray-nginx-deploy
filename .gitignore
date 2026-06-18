@@ -1,2 +1,4 @@
 server-audit/
 *.bak
+.claude/
+.understand-anything/
