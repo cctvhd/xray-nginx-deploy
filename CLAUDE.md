@@ -63,3 +63,24 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 ---
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
+
+---
+
+## 项目当前状态（2026-06-18，commit ebbe261）
+
+### 已完成
+- `modules/naive.sh`：Caddyfile 禁 h3（`servers { protocols h1 h2 }`）、证书直引用 letsencrypt、certaccess 组权限、certbot hook 改 reload
+- `modules/nginx.sh`：`generate_cf_realip_conf()` 补 `is_media_ext` + `redirect_to_fake` map；xhttp/gRPC server block webroot 改为 `/var/www/${DOMAIN}`，`if ($from_cf = 0)` 改为 `if ($redirect_to_fake)`；生成时自动 `mkdir` 并复制 `index.html`
+- `modules/xray.sh`：Reality dest 防偷流量（有域名 → nginx 8321，无域名 → dokodemo 4431）；xhttp-reality 防偷流量（dokodemo 4432）
+- `.gitignore`：补充排除 `.claude/` 和 `.understand-anything/`
+
+### 待续任务
+1. **`generate_fake_site()`**：改为欧洲档案馆主题完整 HTML（与现部署一致），去掉大媒体文件引用，改用脚本从 `/var/www/Example/` 或远程下载
+2. **媒体文件打包**：将 `/var/www/Example/` 下的 mp3/mp4 压缩后随仓库分发（或提供下载脚本），供下次部署时自动拉取
+3. **North America 模板命名**：`/var/www/Example/North America/` 下的 HTML 文件名硬编码（`cia_index.html`、`la_index.html`），决定是否统一改为 `index.html` 或按域名动态命名
+4. **Reality dest 8321 webroot**：`/var/www/${REALITY_DOMAIN}/` 目前脚本只建目录不写 index.html，需要与 generate_fake_site 对齐
+
+### 严格禁止事项
+- **永远不要** `git add`、`git commit`、`git push` `server-audit/` 目录下的任何文件
+- `server-audit/` 包含服务器敏感审计数据，必须始终保持在 `.gitignore` 中
+- 执行任何 git 操作前，先确认 `server-audit/` 不在暂存区
