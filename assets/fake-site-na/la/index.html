@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>California Indigenous Heritage | Full Digital Archive</title>
+    <style>
+        :root {
+            --oak-leaf: #556b2f;
+            --charcoal: #1a1a1a;
+            --ochre: #b07219;
+            --clay: #a0522d;
+            --bone: #f5f5f2;
+            --timeline-gold: #c2a46d;
+        }
+
+        body {
+            font-family: 'Hoefler Text', Georgia, serif;
+            line-height: 1.8;
+            margin: 0;
+            background-color: var(--bone);
+            /* subtle noise via SVG data URI — no external dependency */
+            background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
+            color: var(--charcoal);
+            scroll-behavior: smooth;
+        }
+
+        .exhibit-header {
+            height: 70vh;
+            background:
+                linear-gradient(rgba(0,0,0,0.52), rgba(0,0,0,0.38)),
+                linear-gradient(160deg, #2d4820 0%, #4a6a30 45%, #6a8a50 80%, #8aaa70 100%);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            color: white;
+            text-align: center;
+        }
+
+        .header-content h1 {
+            font-size: clamp(2.4rem, 6vw, 4rem);
+            margin: 0;
+            font-weight: normal;
+            letter-spacing: -1px;
+        }
+        .header-content p {
+            font-family: sans-serif;
+            letter-spacing: 4px;
+            text-transform: uppercase;
+            font-size: 0.9rem;
+            margin-bottom: 14px;
+        }
+
+        nav {
+            padding: 1.2rem;
+            background: rgba(255,255,255,0.96);
+            display: flex;
+            justify-content: center;
+            gap: 30px;
+            border-bottom: 1px solid #e0e0e0;
+            position: sticky;
+            top: 0;
+            z-index: 1000;
+            backdrop-filter: blur(5px);
+            flex-wrap: wrap;
+        }
+
+        nav a {
+            text-decoration: none;
+            color: var(--charcoal);
+            font-weight: 600;
+            font-family: sans-serif;
+            font-size: 0.7rem;
+            letter-spacing: 1px;
+            transition: color 0.3s;
+        }
+        nav a:hover { color: var(--ochre); }
+
+        .container { max-width: 900px; margin: 0 auto; padding: 4rem 2rem; }
+
+        .section { margin-bottom: 7rem; }
+        h2 {
+            font-size: clamp(2rem, 5vw, 2.8rem);
+            border-bottom: 2px solid var(--ochre);
+            padding-bottom: 10px;
+            margin-bottom: 2rem;
+            font-weight: normal;
+            color: var(--clay);
+        }
+
+        .card {
+            background: white;
+            padding: 2.5rem;
+            box-shadow: 0 10px 30px rgba(0,0,0,0.03);
+            border-radius: 2px;
+            border: 1px solid #eee;
+        }
+
+        .timeline-box p { margin: 20px 0; padding-left: 10px; }
+        .timeline-box b {
+            color: #6b4f3a;
+            font-family: sans-serif;
+            text-transform: uppercase;
+            font-size: 0.85rem;
+            letter-spacing: 1px;
+        }
+
+        /* Territory map placeholder */
+        .map-placeholder {
+            width: 100%;
+            margin-top: 20px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            background: linear-gradient(135deg, #f0ece4 0%, #e8e0d0 100%);
+            padding: 60px 20px;
+            text-align: center;
+            color: #888;
+            font-family: sans-serif;
+            font-size: 0.82rem;
+            letter-spacing: 0.12em;
+            text-transform: uppercase;
+        }
+
+        footer {
+            background: var(--charcoal);
+            color: #777;
+            padding: 4rem 2rem;
+            text-align: center;
+            font-family: sans-serif;
+            letter-spacing: 2px;
+        }
+
+        .fade { animation: fadeIn 1.5s; }
+        @keyframes fadeIn { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+
+        @media (max-width: 640px) {
+            .exhibit-header { height: 55vh; }
+            .container { padding: 2.5rem 1.2rem; }
+            .card { padding: 1.5rem; }
+            nav { gap: 14px; padding: 0.9rem; }
+            h2 { font-size: 1.8rem; }
+        }
+    </style>
+</head>
+<body>
+
+<header class="exhibit-header">
+    <div class="header-content">
+        <p>A Digital Archive of First Landscapes</p>
+        <h1>California Circles</h1>
+    </div>
+</header>
+
+<nav>
+    <a href="#landscape">LANDSCAPE</a>
+    <a href="#map">TERRITORY</a>
+    <a href="#burning">CULTURAL BURNING</a>
+    <a href="#timeline">HISTORY</a>
+    <a href="#refs">REFERENCES</a>
+</nav>
+
+<div class="container">
+
+    <section id="landscape" class="section fade">
+        <h2>Ancestral Landscapes</h2>
+        <div class="card">
+            <p>California is a mosaic of Indigenous stewardship. Long before European mapping, the land was a managed garden of oaks, rivers, and coastal sanctuaries. We recognize the <b>Ohlone</b>, <b>Tongva</b>, <b>Pomo</b>, and <b>Chumash</b>&mdash;not as figures of the past, but as living guardians of the future.</p>
+        </div>
+    </section>
+
+    <section id="map" class="section fade">
+        <h2>Territorial Map</h2>
+        <div class="card">
+            <p style="font-size: 1.2rem; color: var(--clay); font-style: italic;">
+                The traditional homelands of the Pomo people are located in Northern California.
+            </p>
+            <div class="map-placeholder">
+                California Indigenous Territories<br>
+                <span style="font-size:0.7rem; opacity:0.6; display:block; margin-top:8px;">Interactive map · Approximate distribution prior to large-scale colonization</span>
+            </div>
+            <p style="margin-top:15px; font-size:0.9rem; color:#555;">
+                This map shows the approximate distribution of Indigenous groups in California prior to large-scale colonization. Source: Native Land Digital, native-land.ca
+            </p>
+        </div>
+    </section>
+
+    <section id="burning" class="section fade">
+        <h2>Cultural Burning</h2>
+        <div class="card" style="border-left: 4px solid var(--clay);">
+            <p>Fire is a gift. For generations, California tribes used intentional &ldquo;Good Fire&rdquo; to rejuvenate the land, clear invasive brush, and ensure the health of basket-weaving materials. Today, <b>Traditional Ecological Knowledge (TEK)</b> is essential in healing our wildfire-prone landscape.</p>
+        </div>
+    </section>
+
+    <section id="timeline" class="section fade">
+        <h2>Historical Timeline</h2>
+        <div class="card">
+            <div class="timeline-box" style="border-left:3px solid var(--timeline-gold); padding-left:15px;">
+                <p><b>Pre-Contact Era</b><br>
+                Sophisticated ecological management, inter-tribal trade networks, and vibrant ceremonial life.</p>
+                <p><b>1769&ndash;1840s</b><br>
+                The Mission Period: Spanish colonization introduces forced relocation and labor systems.</p>
+                <p><b>1848&ndash;1870s</b><br>
+                Gold Rush: A period of state-sanctioned violence and mass land seizure.</p>
+                <p><b>1900&ndash;Present</b><br>
+                The Era of Revitalization: Sovereign rights, language nesting, and cultural return.</p>
+            </div>
+        </div>
+    </section>
+
+    <section id="refs" class="section fade">
+        <h2>Footnotes &amp; References</h2>
+        <div class="card" style="font-family: sans-serif; font-size: 0.9rem; color: #555;">
+            <p>1. Kroeber, A. L. (1925). <i>Handbook of the Indians of California</i>.</p>
+            <p>2. Native Land Digital, Indigenous Territories Map Project. <a href="https://native-land.ca" target="_blank" rel="noopener" style="color:var(--ochre);">native-land.ca</a></p>
+            <p>3. Pritzker, B. (2000). <i>A Native American Encyclopedia</i>.</p>
+            <p>4. California Indian Museum and Cultural Center (CIMCC).</p>
+        </div>
+    </section>
+
+</div>
+
+<footer>
+    <p>CALIFORNIA CIRCLE EXHIBIT | 2026</p>
+    <p style="font-size: 0.7rem; opacity: 0.5; margin-top: 15px;">WE HONOR THE ORIGINAL STEWARDS OF THE GOLDEN STATE</p>
+</footer>
+
+</body>
+</html>
