@@ -219,6 +219,21 @@ collect_hardware_info() {
     esac
     log_info "磁盘类型已设为: ${HW_DISK_TYPE}"
 
+    # ── 服务器地区（同时决定 Reality dest 列表和伪装网页主题）──
+    echo ""
+    echo "服务器地区（格式：地区前缀[/网页主题子目录]）："
+    echo "  eu      = 欧洲（默认，波罗的海档案馆主题，Reality 选欧洲 dest）"
+    echo "  na/cia  = 北美 · CIA 区域主题，Reality 选北美 dest"
+    echo "  na/la   = 北美 · 加州原住民主题，Reality 选北美 dest"
+    echo "  as      = 亚洲（Reality 选亚洲 dest，网页回落欧洲主题）"
+    echo "  新增北美主题：在 assets/fake-site-na/ 下建子目录放 index.html 即可"
+    local input_region
+    read -rp "地区 [当前: ${HW_REGION:-eu}，直接回车保持]: " input_region
+    if [[ -n "$input_region" ]]; then
+        HW_REGION="$input_region"
+    fi
+    log_info "地区已设为: ${HW_REGION:-eu}"
+
     # ── 确认最终值 ───────────────────────────────────────────
     echo ""
     log_info "═══ 最终硬件参数 ════════════════════════"
@@ -227,6 +242,7 @@ collect_hardware_info() {
     log_info "  磁盘类型   : ${HW_DISK_TYPE}"
     log_info "  网络栈     : ${HW_DUAL_STACK}"
     log_info "  带宽       : ${HW_BANDWIDTH}"
+    log_info "  地区模板   : ${HW_REGION:-（欧洲默认）}"
     log_info "════════════════════════════════════════"
     echo ""
 }

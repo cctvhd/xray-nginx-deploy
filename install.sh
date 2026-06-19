@@ -1055,6 +1055,7 @@ HW_MEM_GB=''
 HW_BANDWIDTH=''
 HW_DUAL_STACK=''
 HW_DISK_TYPE=''
+HW_REGION=''
 UNBOUND_SERVICE_NAME=''
 
 XRAY_PADDING=''
@@ -1126,6 +1127,7 @@ ENV
     HW_BANDWIDTH=$(get_state "HW_BANDWIDTH")
     HW_DUAL_STACK=$(get_state "HW_DUAL_STACK")
     HW_DISK_TYPE=$(get_state "HW_DISK_TYPE")
+    HW_REGION=$(get_state "HW_REGION")
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
     XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
@@ -1345,7 +1347,7 @@ show_status() {
     if [[ -n "${HW_CPU_CORES:-}" ]]; then
         echo ""
         echo "  [硬件]"
-        echo "    CPU: ${HW_CPU_CORES} | MEM: ${HW_MEM_GB}GB | BW: ${HW_BANDWIDTH} | STACK: ${HW_DUAL_STACK} | DISK: ${HW_DISK_TYPE}"
+        echo "    CPU: ${HW_CPU_CORES} | MEM: ${HW_MEM_GB}GB | BW: ${HW_BANDWIDTH} | STACK: ${HW_DUAL_STACK} | DISK: ${HW_DISK_TYPE} | REGION: ${HW_REGION:-eu}"
     fi
 
     echo ""
@@ -1419,6 +1421,7 @@ save_system_optimization_state() {
     save_state "HW_BANDWIDTH"  "${HW_BANDWIDTH}"
     save_state "HW_DUAL_STACK" "${HW_DUAL_STACK}"
     save_state "HW_DISK_TYPE"  "${HW_DISK_TYPE}"
+    save_state "HW_REGION"     "${HW_REGION:-}"
     save_state "XRAY_PADDING"  "${XRAY_PADDING:-128-2048}"
     save_state "INST_SYSTEM"   "1"
 }
@@ -1476,7 +1479,7 @@ do_inst_nginx() {
 
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
+    generate_fake_site "/var/www/html"
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -1695,9 +1698,9 @@ do_conf_nginx() {
 
     load_module nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
+    generate_fake_site "/var/www/html"
     if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
+        generate_fake_site "/var/www/${GRPC_DOMAIN}"
     fi
     generate_cf_realip_conf
     generate_ssl_conf
@@ -3122,7 +3125,7 @@ run_full_install_flow() {
     load_module nginx
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
+    generate_fake_site "/var/www/html"
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -3203,9 +3206,9 @@ run_full_install_flow() {
     # nginx 在 xray 之后生成，确保 REALITY_SERVER_NAMES 已保存
     load_module nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
+    generate_fake_site "/var/www/html"
     if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
+        generate_fake_site "/var/www/${GRPC_DOMAIN}"
     fi
     generate_cf_realip_conf
     generate_ssl_conf

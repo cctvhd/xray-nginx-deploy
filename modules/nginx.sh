@@ -142,34 +142,235 @@ generate_trap_cert() {
 # ── 生成伪装站页面 ───────────────────────────────────────────
 generate_fake_site() {
     local dir="$1"
-    local title="$2"
 
-    cat > "${dir}/index.html" << HTML
+    local _mod_dir
+    _mod_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local _assets="${_mod_dir}/../assets"
+
+    # 已安装部署时 assets 跟随 install.sh 复制到 /etc/xray-deploy/assets/
+    local _assets_installed="/etc/xray-deploy/assets"
+
+    # 解析 HW_REGION 格式：na/cia → prefix=na subdir=cia；eu → prefix=eu subdir=""
+    local _region="${HW_REGION:-}"
+    local _prefix _subdir
+    if [[ "$_region" == */* ]]; then
+        _prefix="${_region%%/*}"
+        _subdir="${_region#*/}"
+    else
+        _prefix="$_region"
+        _subdir=""
+    fi
+
+    local _template=""
+
+    # 北美：在 assets/fake-site-na/{subdir}/ 下找对应主题
+    if [[ "$_prefix" == "na" && -n "$_subdir" ]]; then
+        for _f in \
+            "${_assets}/fake-site-na/${_subdir}/index.html" \
+            "${_assets_installed}/fake-site-na/${_subdir}/index.html"; do
+            if [[ -f "$_f" ]]; then _template="$_f"; break; fi
+        done
+        if [[ -z "$_template" ]]; then
+            log_warn "generate_fake_site: 未找到地区模板 fake-site-na/${_subdir}/index.html，回落至欧洲主题"
+        fi
+    fi
+
+    # 欧洲/亚洲/默认：统一用欧洲档案馆主题
+    if [[ -z "$_template" ]]; then
+        for _f in \
+            "${_assets}/fake-site-eu.html" \
+            "${_assets_installed}/fake-site-eu.html" \
+            "/var/www/Example/lietuva-heritage (1).html"; do
+            if [[ -f "$_f" ]]; then _template="$_f"; break; fi
+        done
+    fi
+
+    if [[ -n "$_template" ]]; then
+        install -m 644 "$_template" "${dir}/index.html"
+        log_info "已安装伪装页面: ${dir}/index.html  (来源: $_template)"
+        return
+    fi
+
+    # 尝试从远程下载欧洲主题
+    if command -v curl >/dev/null 2>&1; then
+        if curl -fsSL "${BASE_URL}/assets/fake-site-eu.html" \
+                -o "${dir}/index.html" 2>/dev/null; then
+            chmod 644 "${dir}/index.html"
+            log_info "已从远程下载伪装页面: ${dir}/index.html"
+            return
+        fi
+    fi
+
+    # 最终回退：按地区自动生成主题伪装页
+    log_warn "generate_fake_site: 无模板文件可用，自动生成 ${_prefix:-eu} 主题页"
+    case "${_prefix:-eu}" in
+
+        na)
+    cat > "${dir}/index.html" << 'HTML'
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${title}</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 40px;
-               background: #f5f5f5; color: #333; }
-        .container { max-width: 800px; margin: 0 auto; background: white;
-                     padding: 40px; border-radius: 8px;
-                     box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #2c3e50; }
-        p  { line-height: 1.6; color: #666; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pacific Research Library — Digital Collections</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Georgia,'Times New Roman',serif;background:#f8f6f2;color:#1a1a1a}
+header{background:#1c3a5e;color:#fff;padding:20px 40px;border-bottom:4px solid #c8a84b}
+header h1{font-size:1.5rem;letter-spacing:.04em}
+header p{font-size:.82rem;color:#a8bfd0;margin-top:4px}
+nav{background:#24507a;padding:0 40px;display:flex;gap:24px}
+nav a{color:#d0e4f0;text-decoration:none;font-size:.8rem;padding:10px 0;letter-spacing:.06em;text-transform:uppercase}
+nav a:hover{color:#fff}
+.hero{background:linear-gradient(135deg,#1c3a5e,#24507a);color:#fff;padding:60px 40px}
+.hero h2{font-size:1.9rem;max-width:580px;line-height:1.3;font-weight:normal}
+.hero p{margin-top:14px;color:#b8d0e4;max-width:500px;line-height:1.7;font-size:.92rem}
+main{max-width:1060px;margin:40px auto;padding:0 40px;display:grid;grid-template-columns:2fr 1fr;gap:28px}
+.card{background:#fff;border:1px solid #ddd;padding:22px;border-radius:3px}
+.card h3{color:#1c3a5e;margin-bottom:8px;font-size:.95rem}
+.card p{font-size:.87rem;color:#555;line-height:1.65}
+footer{background:#111;color:#666;text-align:center;padding:18px;font-size:.78rem;margin-top:40px}
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>Welcome to ${title}</h1>
-        <p>This server is running nginx.</p>
-        <p>If you see this page, the web server is successfully installed and working.</p>
+<header>
+  <h1>Pacific Research Library</h1>
+  <p>Digital Collections &amp; Archives &middot; Established 1924</p>
+</header>
+<nav><a href="#">Collections</a><a href="#">Research</a><a href="#">Digital Archive</a><a href="#">About</a><a href="#">Contact</a></nav>
+<div class="hero">
+  <h2>Preserving Knowledge for Future Generations</h2>
+  <p>Access over 2.4 million digitized documents, photographs, maps and recordings from regional collections dating back to the 18th century.</p>
+</div>
+<main>
+  <div>
+    <div class="card" style="margin-bottom:18px">
+      <h3>Featured: Pacific Coast Survey Records 1847&ndash;1920</h3>
+      <p>Newly digitized survey records documenting early settlement patterns, land grants, and environmental change along the Pacific Coast are now available for public research access.</p>
     </div>
+    <div class="card">
+      <h3>Digital Archive Search</h3>
+      <p>Search our complete catalog of digitized materials including manuscripts, photographs, oral history recordings, and government documents.</p>
+    </div>
+  </div>
+  <div>
+    <div class="card" style="margin-bottom:18px">
+      <h3>Library Hours</h3>
+      <p>Mon&ndash;Fri: 9:00 AM &ndash; 6:00 PM<br>Saturday: 10:00 AM &ndash; 4:00 PM<br>Sunday: Closed</p>
+    </div>
+    <div class="card">
+      <h3>Research Assistance</h3>
+      <p>Reference librarians available for genealogy research, historical inquiries, and archival requests.</p>
+    </div>
+  </div>
+</main>
+<footer>&copy; 2024 Pacific Research Library &middot; All Rights Reserved</footer>
 </body>
 </html>
 HTML
+            ;;
+
+        as)
+    cat > "${dir}/index.html" << 'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Asia-Pacific Research Network — Open Data Portal</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,'Segoe UI',sans-serif;background:#f4f6fa;color:#1a1f2e}
+header{background:#1a2a4a;color:#fff;padding:15px 48px;display:flex;justify-content:space-between;align-items:center}
+header h1{font-size:1.05rem;font-weight:500;letter-spacing:.02em}
+nav a{color:#90a8c8;text-decoration:none;font-size:.8rem;margin-left:24px}
+nav a:hover{color:#fff}
+.hero{background:linear-gradient(135deg,#1a2a4a,#0d3060);color:#fff;padding:52px 48px}
+.hero h2{font-size:1.75rem;font-weight:400;max-width:540px;line-height:1.4}
+.hero p{margin-top:14px;color:#90a8c8;max-width:460px;line-height:1.7;font-size:.88rem}
+.stats{display:flex;gap:40px;margin-top:30px}
+.stat span{display:block;font-size:1.7rem;font-weight:700;color:#4a9eff}
+.stat small{font-size:.76rem;color:#7090b0}
+main{max-width:1060px;margin:36px auto;padding:0 48px;display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+.card{background:#fff;border-radius:5px;padding:22px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.card h3{font-size:.9rem;color:#1a2a4a;margin-bottom:7px}
+.card p{font-size:.84rem;color:#5a6a8a;line-height:1.62}
+footer{background:#1a2a4a;color:#4a6a8a;text-align:center;padding:18px;font-size:.76rem;margin-top:40px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Asia-Pacific Research Network</h1>
+  <nav><a href="#">Datasets</a><a href="#">Publications</a><a href="#">Projects</a><a href="#">About</a></nav>
+</header>
+<div class="hero">
+  <h2>Open Science Data Portal</h2>
+  <p>A collaborative research infrastructure providing open access to datasets, publications and tools across the Asia-Pacific scientific community.</p>
+  <div class="stats">
+    <div class="stat"><span>18,400+</span><small>Datasets</small></div>
+    <div class="stat"><span>340</span><small>Member Institutions</small></div>
+    <div class="stat"><span>28</span><small>Countries</small></div>
+  </div>
+</div>
+<main>
+  <div class="card"><h3>Climate &amp; Environment</h3><p>Long-term observational records, satellite imagery archives and environmental monitoring data from across the Pacific region.</p></div>
+  <div class="card"><h3>Biodiversity</h3><p>Species occurrence records, ecological surveys and conservation status data aggregated from member research stations.</p></div>
+  <div class="card"><h3>Social Sciences</h3><p>Longitudinal survey data, demographic studies and urban development research from partner universities and institutes.</p></div>
+  <div class="card"><h3>Marine Research</h3><p>Oceanographic measurements, coral reef monitoring data and fisheries research from Pacific Ocean observation networks.</p></div>
+</main>
+<footer>&copy; 2024 Asia-Pacific Research Network &middot; Open Data Initiative</footer>
+</body>
+</html>
+HTML
+            ;;
+
+        # eu 及其他未知前缀均使用欧洲学术档案主题
+        *)
+    cat > "${dir}/index.html" << 'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nordic Heritage Institute — Digital Repository</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Palatino Linotype',Palatino,Georgia,serif;background:#0f1a14;color:#e0ddd0;min-height:100vh}
+header{background:linear-gradient(180deg,#000,#0f1a14);border-bottom:1px solid rgba(180,140,40,.3);padding:26px 60px;display:flex;justify-content:space-between;align-items:center}
+.logo h1{font-size:1.35rem;letter-spacing:.08em;color:#e8d890}
+.logo p{font-size:.72rem;letter-spacing:.2em;text-transform:uppercase;color:#8a9a84;margin-top:4px}
+nav a{color:#8a9a84;text-decoration:none;font-size:.76rem;letter-spacing:.1em;text-transform:uppercase;margin-left:30px}
+nav a:hover{color:#e8d890}
+.banner{padding:76px 60px;background:radial-gradient(ellipse at 30% 50%,#162410,#0f1a14 70%);border-bottom:1px solid rgba(180,140,40,.12)}
+.banner h2{font-size:2.1rem;color:#e8d890;max-width:560px;line-height:1.28;font-weight:normal}
+.banner p{margin-top:18px;color:#a0b090;line-height:1.8;max-width:480px;font-size:.92rem}
+main{max-width:980px;margin:56px auto;padding:0 60px;display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+.card{border:1px solid rgba(180,140,40,.18);padding:22px;background:rgba(255,255,255,.02)}
+.card h3{color:#c8a040;font-size:.82rem;letter-spacing:.1em;text-transform:uppercase;margin-bottom:10px;font-weight:normal}
+.card p{font-size:.86rem;color:#909880;line-height:1.7}
+footer{border-top:1px solid rgba(180,140,40,.12);text-align:center;padding:22px;font-size:.72rem;color:#4a5a44;letter-spacing:.08em;margin-top:60px}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><h1>Nordic Heritage Institute</h1><p>Digital Repository &amp; Cultural Archives</p></div>
+  <nav><a href="#">Collections</a><a href="#">Research</a><a href="#">Publications</a><a href="#">About</a></nav>
+</header>
+<div class="banner">
+  <h2>Preserving the Living Memory of the North</h2>
+  <p>A curated digital archive of folk traditions, oral histories, and cultural heritage from the Nordic and Baltic regions, spanning eight centuries of documented history.</p>
+</div>
+<main>
+  <div class="card"><h3>Manuscripts</h3><p>Over 140,000 digitized manuscript pages from monastic and civic archives, spanning the 13th to 20th centuries.</p></div>
+  <div class="card"><h3>Folk Music</h3><p>Audio recordings of traditional songs and instrumental pieces collected through fieldwork expeditions from 1948 to the present.</p></div>
+  <div class="card"><h3>Oral Histories</h3><p>Transcribed and recorded testimonies documenting community life, seasonal traditions, and historical memory across the region.</p></div>
+</main>
+<footer>NORDIC HERITAGE INSTITUTE &middot; DIGITAL REPOSITORY &middot; MMXXIV</footer>
+</body>
+</html>
+HTML
+            ;;
+    esac
 }
 
 # ── 生成 cloudflare_real_ip.conf ─────────────────────────────
@@ -1253,6 +1454,9 @@ CONF
         [[ -z "$reality_cert_path" ]] && reality_cert_path="/etc/letsencrypt/live/${reality_root}"
 
         mkdir -p "/var/www/${REALITY_DOMAIN}"
+        if [[ ! -f "/var/www/${REALITY_DOMAIN}/index.html" ]]; then
+            generate_fake_site "/var/www/${REALITY_DOMAIN}"
+        fi
 
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
@@ -1395,7 +1599,7 @@ run_nginx() {
     log_step "========== Nginx 安装配置 =========="
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
+    generate_fake_site "/var/www/html"
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf

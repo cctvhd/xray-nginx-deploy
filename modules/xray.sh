@@ -173,15 +173,28 @@ collect_reality_params() {
     log_step "配置 Reality 伪装参数"
     echo ""
 
-    echo "请选择服务器所在地区："
-    echo "  1. 美国 / 北美"
-    echo "  2. 欧洲"
-    echo "  3. 亚洲"
-    echo "  4. 自定义"
-    echo ""
-    read -rp "请选择地区 [1-4，默认1]: " region_choice
+    # 从 HW_REGION 前缀自动推断地区，避免重复手动选择
+    local region_choice
+    local _hw_prefix="${HW_REGION%%/*}"
+    case "$_hw_prefix" in
+        na) region_choice=1
+            log_info "从 HW_REGION=${HW_REGION} 自动选择地区：美国/北美" ;;
+        eu) region_choice=2
+            log_info "从 HW_REGION=${HW_REGION} 自动选择地区：欧洲" ;;
+        as) region_choice=3
+            log_info "从 HW_REGION=${HW_REGION} 自动选择地区：亚洲" ;;
+        *)
+            echo "请选择服务器所在地区："
+            echo "  1. 美国 / 北美"
+            echo "  2. 欧洲"
+            echo "  3. 亚洲"
+            echo "  4. 自定义"
+            echo ""
+            read -rp "请选择地区 [1-4，默认2]: " region_choice
+            ;;
+    esac
 
-    case "${region_choice:-1}" in
+    case "${region_choice:-2}" in
 
         # ── 美国 / 北美 ──────────────────────────────────────
         1)
