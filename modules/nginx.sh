@@ -189,6 +189,21 @@ generate_fake_site() {
     if [[ -n "$_template" ]]; then
         install -m 644 "$_template" "${dir}/index.html"
         log_info "已安装伪装页面: ${dir}/index.html  (来源: $_template)"
+
+        # 若模板目录下有 Music/ 子目录，一并复制（如 usa1 含 MP3 文件）
+        local _tmpl_dir
+        _tmpl_dir="$(dirname "$_template")"
+        if [[ -d "${_tmpl_dir}/Music" ]]; then
+            cp -r "${_tmpl_dir}/Music" "${dir}/Music"
+            find "${dir}/Music" -type f -exec chmod 644 {} \;
+            log_info "已复制音乐文件: ${dir}/Music/"
+        # 也查 Example 对应子目录（本地已有音乐文件时）
+        elif [[ -n "$_subdir" && -d "/var/www/Example/North America/${_subdir}/Music" ]]; then
+            cp -r "/var/www/Example/North America/${_subdir}/Music" "${dir}/Music"
+            find "${dir}/Music" -type f -exec chmod 644 {} \;
+            log_info "已从 Example 复制音乐文件: ${dir}/Music/"
+        fi
+
         return
     fi
 
