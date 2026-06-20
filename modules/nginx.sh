@@ -111,6 +111,7 @@ create_nginx_dirs() {
 
 	# 删除 nginx 官方包自带的默认 server 块，避免与自定义配置冲突
 	rm -f /etc/nginx/conf.d/default.conf
+	rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
 log_info "目录结构创建完成"
 }
 
@@ -1145,13 +1146,8 @@ generate_servers_conf() {
         cert_path=$(get_state "CERT_PATH_${xhttp_root//./_}" "")
         [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${xhttp_root}"
 
-        # 确保 xhttp 域名的 webroot 存在；首次缺失时从 html/ 复制 index.html
         mkdir -p "/var/www/${XHTTP_DOMAIN}"
-        if [[ ! -f "/var/www/${XHTTP_DOMAIN}/index.html" ]] && \
-           [[ -f "/var/www/html/index.html" ]]; then
-            install -m 644 /var/www/html/index.html "/var/www/${XHTTP_DOMAIN}/index.html"
-            log_info "已初始化 /var/www/${XHTTP_DOMAIN}/index.html"
-        fi
+        generate_fake_site "/var/www/${XHTTP_DOMAIN}"
 
         # 同域名合并：xhttp 与 gRPC 共用同一域名时，gRPC location 并入此 server 块
         local grpc_merged_location=""
@@ -1334,13 +1330,8 @@ CONF
         cert_path=$(get_state "CERT_PATH_${grpc_root//./_}" "")
         [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${grpc_root}"
 
-        # 确保 gRPC 域名的 webroot 存在；首次缺失时从 html/ 复制 index.html
         mkdir -p "/var/www/${GRPC_DOMAIN}"
-        if [[ ! -f "/var/www/${GRPC_DOMAIN}/index.html" ]] && \
-           [[ -f "/var/www/html/index.html" ]]; then
-            install -m 644 /var/www/html/index.html "/var/www/${GRPC_DOMAIN}/index.html"
-            log_info "已初始化 /var/www/${GRPC_DOMAIN}/index.html"
-        fi
+        generate_fake_site "/var/www/${GRPC_DOMAIN}"
 
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
@@ -1464,9 +1455,7 @@ CONF
         [[ -z "$reality_cert_path" ]] && reality_cert_path="/etc/letsencrypt/live/${reality_root}"
 
         mkdir -p "/var/www/${REALITY_DOMAIN}"
-        if [[ ! -f "/var/www/${REALITY_DOMAIN}/index.html" ]]; then
-            generate_fake_site "/var/www/${REALITY_DOMAIN}"
-        fi
+        generate_fake_site "/var/www/${REALITY_DOMAIN}"
 
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
