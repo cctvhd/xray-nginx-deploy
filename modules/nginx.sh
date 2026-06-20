@@ -533,9 +533,9 @@ cat > "$TMP_CF_CONF" << HEREDOC
 set_real_ip_from 127.0.0.1;
 set_real_ip_from ::1;
 
-$(echo "$CF_IPV4" | sed 's/^/set_real_ip_from /;s/$/;/')
+$(echo "$CF_IPV4" | grep -v '^[[:space:]]*$' | sed 's/^/set_real_ip_from /;s/$/;/')
 
-$(echo "$CF_IPV6" | sed 's/^/set_real_ip_from /;s/$/;/')
+$(echo "$CF_IPV6" | grep -v '^[[:space:]]*$' | sed 's/^/set_real_ip_from /;s/$/;/')
 
 real_ip_header    proxy_protocol;
 real_ip_recursive on;
@@ -544,14 +544,24 @@ geo \$remote_addr \$from_cf {
     default 0;
     127.0.0.1 0;
     ::1 0;
-$(echo "$CF_IPV4" | sed 's/^/    /;s/$/ 1;/')
-$(echo "$CF_IPV6" | sed 's/^/    /;s/$/ 1;/')
+$(echo "$CF_IPV4" | grep -v '^[[:space:]]*$' | sed 's/^/    /;s/$/ 1;/')
+$(echo "$CF_IPV6" | grep -v '^[[:space:]]*$' | sed 's/^/    /;s/$/ 1;/')
 }
 
 map "\$from_cf:\$http_cf_connecting_ip" \$final_real_ip {
     "1:"       \$remote_addr;
     "~^1:.+"   \$http_cf_connecting_ip;
     default    \$remote_addr;
+}
+
+map \$uri \$is_media_ext {
+    ~*\.(mp4|mp3|ogg|m4a|wav|webm|flac|aac)(\?.*)?$  1;
+    default                                            0;
+}
+
+map "\${from_cf}_\${is_media_ext}" \$redirect_to_fake {
+    "0_0"   1;
+    default 0;
 }
 HEREDOC
 
