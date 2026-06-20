@@ -871,6 +871,12 @@ load_module() {
     local remote_url="${BASE_URL}/modules/${module}.sh"
     local first_line
 
+    # 本地文件比缓存新时（git pull 后）优先使用本地版本
+    if [[ -f "$cached_path" && -f "$local_path" && "$local_path" -nt "$cached_path" ]]; then
+        cp "$local_path" "$cached_path"
+        chmod 600 "$cached_path"
+    fi
+
     if [[ -f "$cached_path" ]]; then
         first_line=$(head -n 1 "$cached_path" 2>/dev/null || true)
         if [[ -z "$first_line" ]] || { [[ "$first_line" != '#!'* ]] && [[ "$first_line" != '#' ]]; }; then
@@ -927,11 +933,18 @@ sync_modules() {
     local ok=0 fail=0
     for module in "${ALL_MODULES[@]}"; do
         local cached_path="${LOCAL_MODULES_DIR}/${module}.sh"
+        local local_path="${MODULES_DIR}/${module}.sh"
         local remote_url="${BASE_URL}/modules/${module}.sh"
         echo -n "  ${module}.sh ... "
-        if curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
+        # 优先从本地 git clone 目录复制（更快且不依赖网络）
+        if [[ -f "$local_path" ]]; then
+            cp "$local_path" "$cached_path"
             chmod 600 "$cached_path"
-            echo -e "${GREEN}OK${NC}"
+            echo -e "${GREEN}OK (local)${NC}"
+            (( ok++ )) || true
+        elif curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
+            chmod 600 "$cached_path"
+            echo -e "${GREEN}OK (remote)${NC}"
             (( ok++ )) || true
         else
             echo -e "${RED}失败${NC}"
