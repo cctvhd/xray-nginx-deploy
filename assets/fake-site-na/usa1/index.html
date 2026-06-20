@@ -19,10 +19,10 @@
             line-height: 1.8;
             margin: 0;
             background-color: var(--bone);
-            /* subtle noise via SVG data URI — no external dependency */
             background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.75' numOctaves='4' stitchTiles='stitch'/%3E%3C/filter%3E%3Crect width='200' height='200' filter='url(%23n)' opacity='0.025'/%3E%3C/svg%3E");
             color: var(--charcoal);
             scroll-behavior: smooth;
+            padding-bottom: 80px;
         }
 
         .exhibit-header {
@@ -105,7 +105,6 @@
             letter-spacing: 1px;
         }
 
-        /* Territory map placeholder */
         .map-placeholder {
             width: 100%;
             margin-top: 20px;
@@ -121,6 +120,32 @@
             text-transform: uppercase;
         }
 
+        #audio-console {
+            position: fixed;
+            bottom: 0;
+            width: 100%;
+            background: rgba(26,26,26,0.98);
+            color: #ccc;
+            padding: 15px 0;
+            z-index: 2000;
+            border-top: 3px solid var(--ochre);
+            font-family: sans-serif;
+        }
+
+        .console-inner {
+            max-width: 900px;
+            margin: 0 auto;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            padding: 0 20px;
+            gap: 16px;
+        }
+
+        .track-info { font-size: 0.75rem; letter-spacing: 1px; flex-shrink: 0; }
+        #track-title { color: white; font-weight: bold; }
+        audio { height: 30px; filter: invert(90%); flex: 1; min-width: 0; }
+
         footer {
             background: var(--charcoal);
             color: #777;
@@ -135,10 +160,13 @@
 
         @media (max-width: 640px) {
             .exhibit-header { height: 55vh; }
+            body { padding-bottom: 100px; }
             .container { padding: 2.5rem 1.2rem; }
             .card { padding: 1.5rem; }
             nav { gap: 14px; padding: 0.9rem; }
             h2 { font-size: 1.8rem; }
+            .console-inner { flex-direction: column; align-items: flex-start; gap: 8px; }
+            audio { width: 100%; }
         }
     </style>
 </head>
@@ -176,7 +204,7 @@
             </p>
             <div class="map-placeholder">
                 California Indigenous Territories<br>
-                <span style="font-size:0.7rem; opacity:0.6; display:block; margin-top:8px;">Interactive map · Approximate distribution prior to large-scale colonization</span>
+                <span style="font-size:0.7rem; opacity:0.6; display:block; margin-top:8px;">Interactive map &middot; Approximate distribution prior to large-scale colonization</span>
             </div>
             <p style="margin-top:15px; font-size:0.9rem; color:#555;">
                 This map shows the approximate distribution of Indigenous groups in California prior to large-scale colonization. Source: Native Land Digital, native-land.ca
@@ -219,10 +247,57 @@
 
 </div>
 
+<!-- 音频控制台：Music/ 目录不存在时自动隐藏 -->
+<div id="audio-console">
+    <div class="console-inner">
+        <div class="track-info">
+            NOW PLAYING: <span id="track-title">Spirit of the Wind</span>
+        </div>
+        <audio id="museum-player" controls>
+            <source id="audio-src" src="/Music/captain_sleepy-spirit-of-the-wind-ambient-native-american-music-285418.mp3" type="audio/mpeg">
+        </audio>
+    </div>
+</div>
+
 <footer>
     <p>CALIFORNIA CIRCLE EXHIBIT | 2026</p>
     <p style="font-size: 0.7rem; opacity: 0.5; margin-top: 15px;">WE HONOR THE ORIGINAL STEWARDS OF THE GOLDEN STATE</p>
 </footer>
+
+<script>
+    const playlist = [
+        { title: "BENEATH THE BUFFALO SKY",     file: "captain_sleepy-beneath-the-buffalo-sky-ambient-native-american-music-285414.mp3" },
+        { title: "SACRED EARTH DREAMS",          file: "captain_sleepy-sacred-earth-dreams-ambient-native-american-music-285420.mp3" },
+        { title: "SPIRIT OF THE WIND",           file: "captain_sleepy-spirit-of-the-wind-ambient-native-american-music-285418.mp3" },
+        { title: "WOLF MOON RISING",             file: "captain_sleepy-wolf-moon-rising-ambient-native-american-music-285412.mp3" },
+        { title: "TRIBUTE TO NATIVE AMERICANS",  file: "luminouspresence-a-tribute-to-native-americans-212272.mp3" }
+    ];
+
+    var currentTrack = 0;
+    var player       = document.getElementById('museum-player');
+    var source       = document.getElementById('audio-src');
+    var titleDisplay = document.getElementById('track-title');
+    var consoleEl    = document.getElementById('audio-console');
+
+    // Music/ 目录不存在时首次加载出错 → 隐藏控制台
+    player.addEventListener('error', function() {
+        consoleEl.style.display = 'none';
+    }, { once: true });
+
+    player.onended = function() {
+        currentTrack = (currentTrack + 1) % playlist.length;
+        loadTrack(currentTrack);
+        player.play().catch(function(){});
+    };
+
+    function loadTrack(index) {
+        source.src = '/Music/' + playlist[index].file;
+        titleDisplay.innerText = playlist[index].title;
+        player.load();
+    }
+
+    loadTrack(0);
+</script>
 
 </body>
 </html>

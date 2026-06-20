@@ -222,11 +222,12 @@ collect_hardware_info() {
     # ── 服务器地区（同时决定 Reality dest 列表和伪装网页主题）──
     echo ""
     echo "服务器地区（格式：地区前缀[/网页主题子目录]）："
-    echo "  eu      = 欧洲（默认，波罗的海档案馆主题，Reality 选欧洲 dest）"
-    echo "  na/cia  = 北美 · CIA 区域主题，Reality 选北美 dest"
-    echo "  na/la   = 北美 · 加州原住民主题，Reality 选北美 dest"
-    echo "  as      = 亚洲（Reality 选亚洲 dest，网页回落欧洲主题）"
-    echo "  新增北美主题：在 assets/fake-site-na/ 下建子目录放 index.html 即可"
+    echo "  eu       = 欧洲（默认，波罗的海档案馆主题，Reality 选欧洲 dest）"
+    echo "  na/usa   = 北美 · Stillwater 旅行博客主题，Reality 选北美 dest"
+    echo "  na/usa1  = 北美 · 加州原住民档案主题（含本地 MP3），Reality 选北美 dest"
+    echo "  na/html  = 北美 · 学术期刊主题，Reality 选北美 dest"
+    echo "  as       = 亚洲（Reality 选亚洲 dest，网页回落欧洲主题）"
+    echo "  新增主题：在 assets/fake-site-na/ 下建子目录放 index.html 即可"
     local input_region
     read -rp "地区 [当前: ${HW_REGION:-eu}，直接回车保持]: " input_region
     if [[ -n "$input_region" ]]; then
