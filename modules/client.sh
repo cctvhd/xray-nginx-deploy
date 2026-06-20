@@ -338,7 +338,8 @@ print(urllib.parse.quote('${NAIVE_PASS}', safe=''))
 # ── 生成机场风格订阅文件 ─────────────────────────────────────
 write_subscription_file() {
     local sub_domain="${XHTTP_DOMAIN:-${GRPC_DOMAIN:-}}"
-    local sub_dir="/var/www/html"
+    # 订阅文件必须放在对应域名的 webroot 下，nginx try_files 才能正确服务
+    local sub_dir="/var/www/${sub_domain}"
     local machine_name sub_name sub_prefix
 
     SUBSCRIPTION_URL=""
@@ -358,6 +359,10 @@ write_subscription_file() {
     fi
 
     mkdir -p "$sub_dir"
+    # 清理旧位置（之前错误地写到 /var/www/html/）
+    if [[ "$sub_dir" != "/var/www/html" ]]; then
+        rm -f "/var/www/html${SUBSCRIPTION_PATH}" 2>/dev/null || true
+    fi
     local sub_file="${sub_dir}${SUBSCRIPTION_PATH}"
     local tmp_links
     tmp_links=$(mktemp)
