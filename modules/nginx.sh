@@ -207,10 +207,15 @@ generate_fake_site() {
         return
     fi
 
-    # 尝试从远程下载欧洲主题
+    # 尝试从远程下载对应主题
     if command -v curl >/dev/null 2>&1; then
-        if curl -fsSL "${BASE_URL}/assets/fake-site-eu.html" \
-                -o "${dir}/index.html" 2>/dev/null; then
+        local _remote_html=""
+        if [[ "$_prefix" == "na" && -n "$_subdir" ]]; then
+            _remote_html="${BASE_URL}/assets/fake-site-na/${_subdir}/index.html"
+        else
+            _remote_html="${BASE_URL}/assets/fake-site-eu.html"
+        fi
+        if curl -fsSL "$_remote_html" -o "${dir}/index.html" 2>/dev/null; then
             chmod 644 "${dir}/index.html"
             log_info "已从远程下载伪装页面: ${dir}/index.html"
             return
