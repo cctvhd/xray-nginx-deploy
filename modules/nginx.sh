@@ -92,6 +92,7 @@ create_nginx_dirs() {
         /etc/nginx/ssl
         /var/log/nginx
         /var/www/html
+        /var/www/trap
         /var/cache/nginx
         /etc/nginx/certs
     )
@@ -1133,7 +1134,7 @@ listen 127.0.0.1:8350;
     }
 
     location / {
-        root      /var/www/html;
+        root      /var/www/${REALITY_DOMAIN:-${XHTTP_DOMAIN:-html}};
         index     index.html;
         try_files \$uri \$uri/ /index.html;
  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
@@ -1569,7 +1570,7 @@ server {
     gzip_types          text/plain text/css application/json application/javascript
                         text/xml application/xml application/xml+rss text/javascript
                         image/svg+xml;
-    root                /var/www/html;
+    root                /var/www/trap;
     index               index.html;
 
     location / {
@@ -1635,7 +1636,7 @@ run_nginx() {
     log_step "========== Nginx 安装配置 =========="
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" 3
+    generate_fake_site "/var/www/trap" 2
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
