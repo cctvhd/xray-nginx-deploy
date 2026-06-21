@@ -1403,7 +1403,7 @@ _ensure_wgcf() {
 
 done_return() {
     echo ""
-    read -rp "按回车返回主菜单..." _
+    read -rp "按回车返回主菜单..." _ || true
 }
 
 run_menu_action() {
