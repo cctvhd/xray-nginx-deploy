@@ -158,15 +158,27 @@ generate_fake_site() {
     local _template=""
 
     # 北美：按 slot 自动轮换分配不同主题，每个域名外观各异
+    # 顺序固定：已知主题按此优先级排列，新增主题追加到末尾（字母序）
     if [[ "$_prefix" == "na" ]]; then
-        local -a _na_dirs=()
+        local -a _known_order=(usa usa1 html)
         local _na_base=""
         for _nb in "${_assets}/fake-site-na" "${_assets_installed}/fake-site-na"; do
             if [[ -d "$_nb" ]]; then _na_base="$_nb"; break; fi
         done
+
+        # 构建有序列表：先按 _known_order 挑存在的，再追加未知的（字母序）
+        local -a _na_dirs=()
+        local _d
+        for _d in "${_known_order[@]}"; do
+            [[ -f "${_na_base}/${_d}/index.html" ]] && _na_dirs+=("$_d")
+        done
         if [[ -n "$_na_base" ]]; then
-            while IFS= read -r -d '' _d; do
-                [[ -f "${_d}/index.html" ]] && _na_dirs+=("$(basename "$_d")")
+            while IFS= read -r -d '' _extra; do
+                _extra="$(basename "$_extra")"
+                [[ -f "${_na_base}/${_extra}/index.html" ]] || continue
+                local _known=0
+                for _d in "${_known_order[@]}"; do [[ "$_d" == "$_extra" ]] && _known=1 && break; done
+                [[ $_known -eq 0 ]] && _na_dirs+=("$_extra")
             done < <(find "$_na_base" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
         fi
 
