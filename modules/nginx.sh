@@ -180,7 +180,7 @@ generate_fake_site() {
         fi
 
         if [[ -z "$_template" ]]; then
-            log_warn "generate_fake_site: 未找到北美模板，回落至欧洲主题"
+            log_warn "generate_fake_site: 未找到本地北美模板，将尝试远程下载"
         fi
     fi
 
