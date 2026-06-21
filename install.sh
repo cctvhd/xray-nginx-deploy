@@ -1492,7 +1492,7 @@ do_inst_nginx() {
 
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html"
+    generate_fake_site "/var/www/html" 3
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -1711,10 +1711,7 @@ do_conf_nginx() {
 
     load_module nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html"
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        generate_fake_site "/var/www/${GRPC_DOMAIN}"
-    fi
+    generate_fake_site "/var/www/html" 3
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -3138,7 +3135,7 @@ run_full_install_flow() {
     load_module nginx
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html"
+    generate_fake_site "/var/www/html" 3
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -3219,10 +3216,7 @@ run_full_install_flow() {
     # nginx 在 xray 之后生成，确保 REALITY_SERVER_NAMES 已保存
     load_module nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html"
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        generate_fake_site "/var/www/${GRPC_DOMAIN}"
-    fi
+    generate_fake_site "/var/www/html" 3
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
