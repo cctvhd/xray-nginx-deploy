@@ -143,6 +143,7 @@ generate_trap_cert() {
 # ── 生成伪装站页面 ───────────────────────────────────────────
 generate_fake_site() {
     local dir="$1"
+    local _slot="${2:-0}"
 
     local _mod_dir
     _mod_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -151,28 +152,35 @@ generate_fake_site() {
     # 已安装部署时 assets 跟随 install.sh 复制到 /etc/xray-deploy/assets/
     local _assets_installed="/etc/xray-deploy/assets"
 
-    # 解析 HW_REGION 格式：na/cia → prefix=na subdir=cia；eu → prefix=eu subdir=""
-    local _region="${HW_REGION:-}"
-    local _prefix _subdir
-    if [[ "$_region" == */* ]]; then
-        _prefix="${_region%%/*}"
-        _subdir="${_region#*/}"
-    else
-        _prefix="$_region"
-        _subdir=""
-    fi
+    # 只取前缀：na/xxx 和 na 均视为 na
+    local _prefix="${HW_REGION%%/*}"
 
     local _template=""
 
-    # 北美：在 assets/fake-site-na/{subdir}/ 下找对应主题
-    if [[ "$_prefix" == "na" && -n "$_subdir" ]]; then
-        for _f in \
-            "${_assets}/fake-site-na/${_subdir}/index.html" \
-            "${_assets_installed}/fake-site-na/${_subdir}/index.html"; do
-            if [[ -f "$_f" ]]; then _template="$_f"; break; fi
+    # 北美：按 slot 自动轮换分配不同主题，每个域名外观各异
+    if [[ "$_prefix" == "na" ]]; then
+        local -a _na_dirs=()
+        local _na_base=""
+        for _nb in "${_assets}/fake-site-na" "${_assets_installed}/fake-site-na"; do
+            if [[ -d "$_nb" ]]; then _na_base="$_nb"; break; fi
         done
+        if [[ -n "$_na_base" ]]; then
+            while IFS= read -r -d '' _d; do
+                [[ -f "${_d}/index.html" ]] && _na_dirs+=("$(basename "$_d")")
+            done < <(find "$_na_base" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+        fi
+
+        if [[ ${#_na_dirs[@]} -gt 0 ]]; then
+            local _subdir="${_na_dirs[$(( _slot % ${#_na_dirs[@]} ))]}"
+            for _f in \
+                "${_assets}/fake-site-na/${_subdir}/index.html" \
+                "${_assets_installed}/fake-site-na/${_subdir}/index.html"; do
+                if [[ -f "$_f" ]]; then _template="$_f"; break; fi
+            done
+        fi
+
         if [[ -z "$_template" ]]; then
-            log_warn "generate_fake_site: 未找到地区模板 fake-site-na/${_subdir}/index.html，回落至欧洲主题"
+            log_warn "generate_fake_site: 未找到北美模板，回落至欧洲主题"
         fi
     fi
 
@@ -197,11 +205,6 @@ generate_fake_site() {
             cp -r "${_tmpl_dir}/Music" "${dir}/Music"
             find "${dir}/Music" -type f -exec chmod 644 {} \;
             log_info "已复制音乐文件: ${dir}/Music/"
-        # 也查 Example 对应子目录（本地已有音乐文件时）
-        elif [[ -n "$_subdir" && -d "/var/www/Example/North America/${_subdir}/Music" ]]; then
-            cp -r "/var/www/Example/North America/${_subdir}/Music" "${dir}/Music"
-            find "${dir}/Music" -type f -exec chmod 644 {} \;
-            log_info "已从 Example 复制音乐文件: ${dir}/Music/"
         fi
 
         return
@@ -210,8 +213,10 @@ generate_fake_site() {
     # 尝试从远程下载对应主题
     if command -v curl >/dev/null 2>&1; then
         local _remote_html=""
-        if [[ "$_prefix" == "na" && -n "$_subdir" ]]; then
-            _remote_html="${BASE_URL}/assets/fake-site-na/${_subdir}/index.html"
+        if [[ "$_prefix" == "na" ]]; then
+            local -a _known_na=(usa usa1 html)
+            local _remote_subdir="${_known_na[$(( _slot % ${#_known_na[@]} ))]}"
+            _remote_html="${BASE_URL}/assets/fake-site-na/${_remote_subdir}/index.html"
         else
             _remote_html="${BASE_URL}/assets/fake-site-eu.html"
         fi
@@ -1167,7 +1172,7 @@ generate_servers_conf() {
         [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${xhttp_root}"
 
         mkdir -p "/var/www/${XHTTP_DOMAIN}"
-        generate_fake_site "/var/www/${XHTTP_DOMAIN}"
+        generate_fake_site "/var/www/${XHTTP_DOMAIN}" 0
 
         # 同域名合并：xhttp 与 gRPC 共用同一域名时，gRPC location 并入此 server 块
         local grpc_merged_location=""
@@ -1351,7 +1356,7 @@ CONF
         [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${grpc_root}"
 
         mkdir -p "/var/www/${GRPC_DOMAIN}"
-        generate_fake_site "/var/www/${GRPC_DOMAIN}"
+        generate_fake_site "/var/www/${GRPC_DOMAIN}" 1
 
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
@@ -1475,7 +1480,7 @@ CONF
         [[ -z "$reality_cert_path" ]] && reality_cert_path="/etc/letsencrypt/live/${reality_root}"
 
         mkdir -p "/var/www/${REALITY_DOMAIN}"
-        generate_fake_site "/var/www/${REALITY_DOMAIN}"
+        generate_fake_site "/var/www/${REALITY_DOMAIN}" 2
 
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
@@ -1618,7 +1623,7 @@ run_nginx() {
     log_step "========== Nginx 安装配置 =========="
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html"
+    generate_fake_site "/var/www/html" 3
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
