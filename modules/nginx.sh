@@ -91,7 +91,6 @@ create_nginx_dirs() {
         /etc/nginx/conf.d
         /etc/nginx/ssl
         /var/log/nginx
-        /var/www/html
         /var/www/trap
         /var/cache/nginx
         /etc/nginx/certs
@@ -1595,19 +1594,12 @@ CONF
     cat >> /etc/nginx/conf.d/servers.conf << CONF
 
 # ===================================================================
-# HTTP → HTTPS 重定向 & ACME 验证
+# HTTP → HTTPS 重定向（证书用 DNS-Cloudflare，无需 webroot 验证）
 # ===================================================================
 server {
     listen 80;
     listen [::]:80;
     server_name ${all_domain_names};
-
-    location ^~ /.well-known/acme-challenge/ {
-        root          /var/www/html;
-        try_files     \$uri =404;
-        access_log    off;
-        log_not_found off;
-    }
 
     location / {
         return 301 https://\$host\$request_uri;
