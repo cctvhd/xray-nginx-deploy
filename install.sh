@@ -812,9 +812,20 @@ load_domain_state() {
     XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+    # 自愈：DOMAIN_PRIMARY_XRAY_REALITY 是权威来源，state 丢失时自动修复
+    if [[ -z "${REALITY_DOMAIN:-}" ]]; then
+        local _primary_reality
+        _primary_reality=$(get_state "DOMAIN_PRIMARY_XRAY_REALITY" "")
+        if [[ -n "${_primary_reality}" ]]; then
+            REALITY_DOMAIN="${_primary_reality}"
+            save_state "REALITY_DOMAIN" "${_primary_reality}"
+        fi
+    fi
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+    XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
+    XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
 }
 
 # ── 读取延迟档位参数 → 设置协议生成变量 ────────────────────
