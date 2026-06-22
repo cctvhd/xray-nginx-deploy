@@ -48,7 +48,6 @@ load_existing_params() {
             XHTTP_PATH=$(grep -oP '"path":\s*"\K[^"]+' "$xray_config" | head -1)
         [[ -n "${XHTTP_DOMAIN:-}" ]] || \
             XHTTP_DOMAIN=$(grep -oP '"host":\s*"\K[^"]+' "$xray_config" | head -1)
-        REALITY_DEST=$(grep -oP '"dest":\s*"\K[^"]+' "$xray_config" | head -1 || true)
         XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1 || true)
         XHTTP_EXTRA_JSON=$(python3 -c "
 import json
