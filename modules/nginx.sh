@@ -977,6 +977,15 @@ generate_sni_map() {
         had_output=1
     fi
 
+    # XHTTP-Reality 自有域名 → 8325（xhttp-reality inbound）
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" && -z "${seen_sni[${XHTTP_REALITY_DOMAIN}]:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        echo "        # -- xhttp-reality 自有域名 → 8325 -------------------"
+        echo "        ${XHTTP_REALITY_DOMAIN}     127.0.0.1:8325;"
+        seen_sni["${XHTTP_REALITY_DOMAIN}"]=1
+        had_output=1
+    fi
+
     # Reality 所有 serverNames（包括公共域名）全部指向 9443
     # 确保客户端用任意 serverName 连接时都能命中正确后端
     if [[ -n "${REALITY_SERVER_NAMES:-}" ]]; then
@@ -1509,6 +1518,50 @@ server {
     include /etc/nginx/ssl/common.conf;
 
     root        /var/www/${REALITY_DOMAIN};
+    index       index.html;
+    server_tokens off;
+    access_log  off;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "public, max-age=3600" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Content-Security-Policy "default-src 'self' fonts.googleapis.com fonts.gstatic.com; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' fonts.googleapis.com; font-src 'self' fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';" always;
+    }
+}
+CONF
+    fi
+
+    # XHTTP-Reality dest 伪装站（8326）：使用自有域名时生成
+    # xray 的 vless-xhttp-reality realitySettings.dest 指向此处
+    # 主题 slot 3：NA 地区 3 主题时回绕到 usa（与 XHTTP_DOMAIN 相同）；
+    # 如需独立主题，可在 assets/fake-site-na/ 新增第 4 个子目录
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+        local xhttp_reality_root xhttp_reality_cert_path
+        xhttp_reality_root=$(get_root_domain "${XHTTP_REALITY_DOMAIN}")
+        xhttp_reality_cert_path=$(get_state "CERT_PATH_${xhttp_reality_root//./_}" "")
+        [[ -z "$xhttp_reality_cert_path" ]] && xhttp_reality_cert_path="/etc/letsencrypt/live/${xhttp_reality_root}"
+
+        mkdir -p "/var/www/${XHTTP_REALITY_DOMAIN}"
+        generate_fake_site "/var/www/${XHTTP_REALITY_DOMAIN}" 3
+
+        cat >> /etc/nginx/conf.d/servers.conf << CONF
+
+# ===================================================================
+# XHTTP-Reality dest 伪装站 ${XHTTP_REALITY_DOMAIN}（8326）
+# ===================================================================
+server {
+    listen 127.0.0.1:8326 ssl;
+    server_name ${XHTTP_REALITY_DOMAIN};
+
+    ssl_certificate     ${xhttp_reality_cert_path}/fullchain.pem;
+    ssl_certificate_key ${xhttp_reality_cert_path}/privkey.pem;
+    include /etc/nginx/ssl/common.conf;
+
+    root        /var/www/${XHTTP_REALITY_DOMAIN};
     index       index.html;
     server_tokens off;
     access_log  off;

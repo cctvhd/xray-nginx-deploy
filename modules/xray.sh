@@ -379,6 +379,47 @@ collect_reality_params() {
         log_warn "serverNames 只有一个条目，XHTTP-Reality 节点不可用（与 TCP+Vision 共用同一 SNI 无法分流）"
     fi
 
+    # ── 选择 XHTTP-Reality 域名模式 ──────────────────────────────
+    # 有自有域名：dest → 本地 nginx 8326（真实证书 + 伪装站），更可控
+    # 无/公共 SNI：dest → dokodemo 4432 → 借用第三方域名（默认行为）
+    XHTTP_REALITY_DOMAIN=""
+    if [[ -n "${XHTTP_REALITY_SNI:-}" ]]; then
+        echo ""
+        echo "XHTTP-Reality 伪装域名模式："
+        echo "  1. 公共 SNI（${XHTTP_REALITY_SNI}）——借用第三方域名，无需自有证书（推荐）"
+        echo "  2. 自有域名——需拥有该域名证书，服务器自建伪装站"
+        read -rp "请选择 [1/2，默认1]: " _xhr_mode
+        if [[ "${_xhr_mode}" == "2" ]]; then
+            local -a _avail_direct=()
+            for _d in "${DIRECT_DOMAINS[@]:-}"; do
+                [[ "$_d" == "${REALITY_DOMAIN:-}"   ]] && continue
+                [[ "$_d" == "${XHTTP_DOMAIN:-}"    ]] && continue
+                [[ "$_d" == "${GRPC_DOMAIN:-}"     ]] && continue
+                [[ "$_d" == "${NAIVE_DOMAIN:-}"    ]] && continue
+                [[ "$_d" == "${ANYTLS_DOMAIN:-}"   ]] && continue
+                [[ "$_d" == "${HYSTERIA2_DOMAIN:-}" ]] && continue
+                _avail_direct+=("$_d")
+            done
+            if [[ ${#_avail_direct[@]} -gt 0 ]]; then
+                echo "可用自有域名："
+                local _di=1
+                for _d in "${_avail_direct[@]}"; do echo "  ${_di}. ${_d}"; (( _di++ )); done
+                echo "  ${_di}. 手动输入"
+                read -rp "请选择 [1-${_di}，默认1]: " _dom_choice
+                if [[ "${_dom_choice}" == "${_di}" ]]; then
+                    read -rp "输入域名: " XHTTP_REALITY_DOMAIN
+                else
+                    local _dom_idx=$(( ${_dom_choice:-1} - 1 ))
+                    (( _dom_idx < 0 || _dom_idx >= ${#_avail_direct[@]} )) && _dom_idx=0
+                    XHTTP_REALITY_DOMAIN="${_avail_direct[$_dom_idx]}"
+                fi
+            else
+                read -rp "输入 xhttp-reality 自有域名: " XHTTP_REALITY_DOMAIN
+            fi
+            [[ -n "${XHTTP_REALITY_DOMAIN}" ]] && log_info "XHTTP-Reality 自有域名: ${XHTTP_REALITY_DOMAIN}"
+        fi
+    fi
+
     log_info "Reality dest:        ${REALITY_DEST}"
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
 }
@@ -448,9 +489,10 @@ generate_xray_config() {
     done
     sn_json="${sn_json%,}"
 
-    # XHTTP_REALITY_SNI 由 collect_reality_params() 交互式设置并已赋值
-    # 此处只做持久化
-    save_state "XHTTP_REALITY_SNI" "${XHTTP_REALITY_SNI:-}"
+    # XHTTP_REALITY_SNI / XHTTP_REALITY_DOMAIN 由 collect_reality_params() 交互式设置并已赋值
+    # 此处只做持久化；两者互斥：设了 DOMAIN 则 SNI 不生效
+    save_state "XHTTP_REALITY_SNI"    "${XHTTP_REALITY_SNI:-}"
+    save_state "XHTTP_REALITY_DOMAIN" "${XHTTP_REALITY_DOMAIN:-}"
 
     # ── 防偷流量：reality-direct ──────────────────────────────────
     # 有自有域名（REALITY_DOMAIN 已设置）：
@@ -499,10 +541,17 @@ generate_xray_config() {
     fi
 
     # ── 防偷流量：vless-xhttp-reality ────────────────────────────
-    # 始终使用公共域名作为 SNI（XHTTP_REALITY_SNI），不拥有该域名的证书，
-    # 必须用 dokodemo 过滤：只允许转发到对应公共域名，其余一律 block
+    # 自有域名：dest → 本地 nginx 8326（真实证书 + 伪装站），无外部流量可偷
+    # 公共 SNI ：dest → dokodemo 4432 → 借用第三方域名（公共 SNI 不能用本地 nginx，
+    #            因为没有该域名的证书，TLS 指纹会与真实域名不符）
     local _dokodemo_xhttp_routing="" _dokodemo_xhttp_inbound=""
-    if [[ -n "${XHTTP_REALITY_SNI:-}" ]]; then
+    local _xhttp_reality_dest="" _xhttp_reality_sn=""
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+        _xhttp_reality_dest="127.0.0.1:8326"
+        _xhttp_reality_sn="\"${XHTTP_REALITY_DOMAIN}\""
+    elif [[ -n "${XHTTP_REALITY_SNI:-}" ]]; then
+        _xhttp_reality_dest="127.0.0.1:4432"
+        _xhttp_reality_sn="\"${XHTTP_REALITY_SNI}\""
         _dokodemo_xhttp_routing='            {
                 "type":        "field",
                 "inboundTag":  ["dokodemo-xhttp-reality"],
@@ -778,9 +827,9 @@ ${_dokodemo_xhttp_routing}
                 },
                 "realitySettings": {
                     "show":        false,
-                    "dest":        "127.0.0.1:4432",
+                    "dest":        "${_xhttp_reality_dest}",
                     "xver":        0,
-                    "serverNames": ["${XHTTP_REALITY_SNI}"],
+                    "serverNames": [${_xhttp_reality_sn}],
                     "privateKey":  "${XRAY_PRIVATE_KEY}",
                     "shortIds":    [${sid_json}]
                 },
