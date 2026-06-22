@@ -871,6 +871,27 @@ load_module() {
     local remote_url="${BASE_URL}/modules/${module}.sh"
     local first_line
 
+    # curl 模式（bash <(curl ...)）：MODULES_DIR 不是真实目录，强制从远程拉取最新模块
+    # 避免旧缓存掩盖修复；本地 git 开发模式不受影响
+    if [[ ! -d "${MODULES_DIR}" ]]; then
+        log_info "更新模块 ${module}.sh ..."
+        mkdir -p "$LOCAL_MODULES_DIR"
+        chmod 700 "$LOCAL_MODULES_DIR"
+        if curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
+            chmod 600 "$cached_path"
+            first_line=$(head -n 1 "$cached_path" 2>/dev/null || true)
+            if [[ -z "$first_line" ]] || { [[ "$first_line" != '#!'* ]] && [[ "$first_line" != '#' ]]; }; then
+                log_error "远程模块 ${module}.sh 首行安全检查失败"
+                rm -f "$cached_path"; exit 1
+            fi
+            source "$cached_path"
+        else
+            log_warn "下载失败，使用缓存..."
+            [[ -f "$cached_path" ]] && source "$cached_path"
+        fi
+        return
+    fi
+
     # 本地文件比缓存新时（git pull 后）优先使用本地版本
     if [[ -f "$cached_path" && -f "$local_path" && "$local_path" -nt "$cached_path" ]]; then
         cp "$local_path" "$cached_path"
