@@ -15,6 +15,7 @@ load_existing_params() {
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     REALITY_SNI=$(get_state "REALITY_SNI")
+    REALITY_DEST=$(get_state "REALITY_DEST")
     XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
     REALITY_SHORT_ID=$(get_state "REALITY_SHORT_ID")
     REALITY_SPIDER_X=$(get_state "REALITY_SPIDER_X")
@@ -226,11 +227,13 @@ import urllib.parse
 print(urllib.parse.quote('${XHTTP_PATH}'))
 " 2>/dev/null || echo "${XHTTP_PATH}")
 
-    # 自有域名：连接到该域名；公共 SNI：连接到服务器 IP（SNI 仅用于 TLS 握手）
+    # xhttp-reality 连接目标：优先用自有域名，其次用 reality-direct 域名，最后用 IP
     if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
         reality_host="${XHTTP_REALITY_DOMAIN}"
+    elif [[ "${REALITY_DEST:-}" == 127.0.0.1:* ]]; then
+        reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-${SERVER_IP}}}"
     else
-        reality_host="${REALITY_DOMAIN:-${SERVER_IP}}"
+        reality_host="${SERVER_IP}"
     fi
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
@@ -258,8 +261,13 @@ import urllib.parse
 print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
 " 2>/dev/null || echo "%2Fapi%2Fhealth")
 
-    # 自有域名：连接到该域名；公共 SNI 模式：连接到服务器 IP
-    local reality_host="${REALITY_DOMAIN:-${SERVER_IP}}"
+    # steal_oneself（dest 指向本地 nginx）：用自有域名；公共 SNI：用服务器 IP
+    local reality_host
+    if [[ "${REALITY_DEST:-}" == 127.0.0.1:* ]]; then
+        reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-${SERVER_IP}}}"
+    else
+        reality_host="${SERVER_IP}"
+    fi
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
     REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
