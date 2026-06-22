@@ -36,6 +36,8 @@ load_existing_params() {
     NAIVE_PROBE_LINK=$(get_state "NAIVE_PROBE_LINK")
     SUBSCRIPTION_PATH=$(get_state "SUBSCRIPTION_PATH")
     VLESS_ENC_CLIENT=$(get_state "VLESS_ENC_CLIENT")
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
@@ -213,7 +215,8 @@ encryption=${VLESS_ENC_PARAM:-none}\
 
 # ── 生成 VLESS-XHTTP-REALITY 直连节点链接 ────────────────────
 gen_xhttp_reality_url() {
-    if [[ -z "${XHTTP_REALITY_SNI:-}" ]] || [[ -z "${XRAY_UUID:-}" ]] || [[ -z "${XHTTP_PATH:-}" ]]; then
+    local _xhttp_r_sni="${XHTTP_REALITY_DOMAIN:-${XHTTP_REALITY_SNI:-}}"
+    if [[ -z "${_xhttp_r_sni}" ]] || [[ -z "${XRAY_UUID:-}" ]] || [[ -z "${XHTTP_PATH:-}" ]]; then
         return
     fi
 
@@ -223,7 +226,12 @@ import urllib.parse
 print(urllib.parse.quote('${XHTTP_PATH}'))
 " 2>/dev/null || echo "${XHTTP_PATH}")
 
-    reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-$SERVER_IP}}"
+    # 自有域名：连接到该域名；公共 SNI：连接到服务器 IP（SNI 仅用于 TLS 握手）
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+        reality_host="${XHTTP_REALITY_DOMAIN}"
+    else
+        reality_host="${REALITY_DOMAIN:-${SERVER_IP}}"
+    fi
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
 path=${path_encoded}\
@@ -234,7 +242,7 @@ path=${path_encoded}\
 &pbk=${XRAY_PUBLIC_KEY}\
 &sid=${REALITY_SHORT_ID}\
 &security=reality\
-&sni=${XHTTP_REALITY_SNI}\
+&sni=${_xhttp_r_sni}\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-xhttp-reality-${_hn}'))" 2>/dev/null)"
 }
 
@@ -250,7 +258,8 @@ import urllib.parse
 print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
 " 2>/dev/null || echo "%2Fapi%2Fhealth")
 
-    local reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-$SERVER_IP}}"
+    # 自有域名：连接到该域名；公共 SNI 模式：连接到服务器 IP
+    local reality_host="${REALITY_DOMAIN:-${SERVER_IP}}"
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
     REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
