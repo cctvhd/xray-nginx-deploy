@@ -986,21 +986,25 @@ generate_sni_map() {
         had_output=1
     fi
 
-    # Reality 所有 serverNames（包括公共域名）全部指向 9443
-    # 确保客户端用任意 serverName 连接时都能命中正确后端
+    # Reality 所有 serverNames（包括公共域名）全部路由到 8320
     if [[ -n "${REALITY_SERVER_NAMES:-}" ]]; then
         [[ $had_output -eq 0 ]] && echo "        # -- Reality serverNames 全部路由到 8320 ---------------"
         for sn in "${REALITY_SERVER_NAMES[@]}"; do
             [[ -n "$sn" ]] || continue
             [[ -n "${seen_sni[$sn]:-}" ]] && continue
-            # XHTTP_REALITY_SNI（serverNames[1]）单独路由到 8325
-            if [[ -n "${XHTTP_REALITY_SNI:-}" && "$sn" == "${XHTTP_REALITY_SNI}" ]]; then
-                echo "        ${sn}     127.0.0.1:8325;"
-            else
-                echo "        ${sn}     127.0.0.1:8320;"
-            fi
+            echo "        ${sn}     127.0.0.1:8320;"
             seen_sni["$sn"]=1
         done
+        had_output=1
+    fi
+
+    # XHTTP_REALITY_SNI 单独路由到 8325，无论是否在 REALITY_SERVER_NAMES 里
+    # 必须在 serverNames 循环之后处理，防止被 8320 抢先匹配
+    if [[ -n "${XHTTP_REALITY_SNI:-}" && -z "${seen_sni[${XHTTP_REALITY_SNI}]:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        echo "        # -- xhttp-reality 公共 SNI → 8325 --------------------"
+        echo "        ${XHTTP_REALITY_SNI}     127.0.0.1:8325;"
+        seen_sni["${XHTTP_REALITY_SNI}"]=1
         had_output=1
     fi
 
