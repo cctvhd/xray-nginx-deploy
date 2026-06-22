@@ -227,13 +227,13 @@ import urllib.parse
 print(urllib.parse.quote('${XHTTP_PATH}'))
 " 2>/dev/null || echo "${XHTTP_PATH}")
 
-    # xhttp-reality 连接目标：优先用自有域名，其次用 reality-direct 域名，最后用 IP
+    # xhttp-reality 连接目标：自有域名 → reality 域名 → 任意直连域名 → IP
     if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
         reality_host="${XHTTP_REALITY_DOMAIN}"
     elif [[ "${REALITY_DEST:-}" == 127.0.0.1:* ]]; then
         reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-${SERVER_IP}}}"
     else
-        reality_host="${SERVER_IP}"
+        reality_host="${REALITY_DOMAIN:-${ANYTLS_DOMAIN:-${SERVER_IP}}}"
     fi
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
@@ -261,12 +261,13 @@ import urllib.parse
 print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
 " 2>/dev/null || echo "%2Fapi%2Fhealth")
 
-    # steal_oneself（dest 指向本地 nginx）：用自有域名；公共 SNI：用服务器 IP
+    # steal_oneself：用自有 reality 域名
+    # 公共 SNI：优先用任意直连域名（DNS 解析到本机），避免裸 IP
     local reality_host
     if [[ "${REALITY_DEST:-}" == 127.0.0.1:* ]]; then
         reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-${SERVER_IP}}}"
     else
-        reality_host="${SERVER_IP}"
+        reality_host="${REALITY_DOMAIN:-${ANYTLS_DOMAIN:-${SERVER_IP}}}"
     fi
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
