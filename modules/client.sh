@@ -249,7 +249,11 @@ path=${path_encoded}\
 
 # ── 生成 Reality 直连节点链接 ────────────────────────────────
 gen_reality_url() {
-    if [[ -z "${REALITY_SNI:-}" ]] || [[ -z "${XRAY_UUID:-}" ]]; then
+    # 自建域名模式：Reality-direct 服务端 serverNames 只含 REALITY_DOMAIN（自助模式），
+    # 链接 sni 必须是 REALITY_DOMAIN 才会被接受；REALITY_SNI 仅公共-SNI 模式兜底。
+    # 直接拼 REALITY_SNI 会因 state 残留旧公共名（如 film.ca.gov）而生成死节点。
+    local reality_sni="${REALITY_DOMAIN:-${REALITY_SNI:-}}"
+    if [[ -z "${reality_sni}" ]] || [[ -z "${XRAY_UUID:-}" ]]; then
         return
     fi
 
@@ -266,7 +270,7 @@ print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
     REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
 encryption=none\
 &security=reality\
-&sni=${REALITY_SNI}\
+&sni=${reality_sni}\
 &fp=chrome\
 &pbk=${XRAY_PUBLIC_KEY}\
 &sid=${REALITY_SHORT_ID}\
@@ -552,10 +556,41 @@ show_client_links() {
     log_info "所有链接已保存到: $output_file"
 }
 
+# ── 发布订阅一致性自检 ──────────────────────────────────────
+# 防止"服务器凭据已轮换 / state 已重写，但 webroot 订阅仍是旧凭据"的静默分叉：
+# 对比 已发布订阅 / 当前 state / 已部署 xray config 的 vless UUID，不一致即告警。
+# 调用前需先 load_existing_params（依赖 XRAY_UUID / XHTTP_DOMAIN / SUBSCRIPTION_PATH）。
+check_subscription_consistency() {
+    [[ -n "${XRAY_UUID:-}" ]] || return 0
+    local sub_domain="${XHTTP_DOMAIN:-${GRPC_DOMAIN:-}}"
+    [[ -n "${sub_domain:-}" ]] || return 0
+    [[ -n "${SUBSCRIPTION_PATH:-}" ]] || return 0
+
+    # 1) state 与 已部署 xray config（防止 state 与线上分叉，生成出来照样连不上）
+    local deployed_uuid
+    deployed_uuid=$(grep -oP '"id":\s*"\K[^"]+' /usr/local/etc/xray/config.json 2>/dev/null | head -1 || true)
+    if [[ -n "${deployed_uuid}" && "${XRAY_UUID}" != "${deployed_uuid}" ]]; then
+        log_warn "state XRAY_UUID(${XRAY_UUID}) 与已部署 xray config(${deployed_uuid}) 不一致！生成链接可能仍连不上。"
+    fi
+
+    # 2) 已发布订阅 与 state（检测 webroot 残留旧订阅）
+    local sub_file="/var/www/${sub_domain}${SUBSCRIPTION_PATH}"
+    [[ -f "$sub_file" ]] || return 0
+    local published_uuid
+    published_uuid=$(base64 -d "$sub_file" 2>/dev/null | grep -oP 'vless://\K[0-9a-fA-F-]{36}' | head -1 || true)
+    if [[ -n "${published_uuid}" && "${published_uuid}" != "${XRAY_UUID}" ]]; then
+        log_warn "已发布订阅携带旧凭据 UUID ${published_uuid}，当前凭据为 ${XRAY_UUID}。"
+        log_warn "将在同一订阅 URL 覆盖为当前凭据——请让客户端【重新拉取】订阅！"
+    else
+        log_info "订阅自检通过：已发布订阅凭据与当前凭据一致 (UUID ${XRAY_UUID:0:8}…)。"
+    fi
+}
+
 # ── 模块入口 ─────────────────────────────────────────────────
 run_client() {
     log_step "========== 生成客户端链接 =========="
     load_existing_params
+    check_subscription_consistency
     get_server_ip
     gen_xhttp_url
     gen_grpc_url
