@@ -258,17 +258,24 @@ configure_hysteria2() {
     esac
 
     # TCP 共监听（参考 hy2.sh: 1531-1543）
-    echo ""
-    echo "是否同时监听 tcp/${HY2_PORT} 增强伪装?"
-    echo "  1. 启用 (默认，浏览器无 H3 时也能看到伪装内容)"
-    echo "  2. 跳过"
-    read -rp "输入序号 [1-2，默认 1]: " masq_tcp
-    if [[ -z "${masq_tcp}" ]] || [[ "${masq_tcp}" == "1" ]]; then
-        masquerade_tcp="true"
-        log_info "TCP 伪装监听: 启用 (端口 ${HY2_PORT})"
-    else
+    # Hysteria2 是 UDP 协议；若 nginx 已占用 TCP 端口则无法共绑，自动跳过
+    if ss -tlnp 2>/dev/null | grep -q ":${HY2_PORT} " || \
+       ss -tlnp 2>/dev/null | grep -q ":${HY2_PORT}$"; then
         masquerade_tcp="false"
-        log_info "TCP 伪装监听: 跳过"
+        log_info "TCP 伪装监听: 跳过（TCP ${HY2_PORT} 已被 nginx 占用，Hysteria2 仅用 UDP）"
+    else
+        echo ""
+        echo "是否同时监听 tcp/${HY2_PORT} 增强伪装?"
+        echo "  1. 启用 (默认，浏览器无 H3 时也能看到伪装内容)"
+        echo "  2. 跳过"
+        read -rp "输入序号 [1-2，默认 1]: " masq_tcp
+        if [[ -z "${masq_tcp}" ]] || [[ "${masq_tcp}" == "1" ]]; then
+            masquerade_tcp="true"
+            log_info "TCP 伪装监听: 启用 (端口 ${HY2_PORT})"
+        else
+            masquerade_tcp="false"
+            log_info "TCP 伪装监听: 跳过"
+        fi
     fi
 
     # ── 9. HTTP/3 屏蔽（参考 hy2.sh: 1545-1557）─────────────
@@ -344,7 +351,8 @@ configure_hysteria2() {
     mkdir -p /etc/hysteria
 
     local yaml="/etc/hysteria/config.yaml"
-    > "$yaml"
+    # 有意清空配置文件，后续以 >> 追加方式逐段写入
+    : > "$yaml"
 
     # listen（参考 hy2.sh: 1574-1580）
     if [[ "${portHoppingStatus}" == "true" ]]; then

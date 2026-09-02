@@ -166,6 +166,387 @@ rebuild_cf_ini_files() {
     done
 }
 
+# ════════════════════════════════════════════════════════════
+# 配置事务：cert_txn_begin / cert_txn_commit / _cert_txn_rollback
+#
+# 目标：collect_domains / setup_cf_accounts / add_domain_and_cert
+# 中途被打断时，把 /etc/cloudflare/ 和 /etc/xray-deploy/config.env
+# 完整恢复到事务开始前的状态。
+#
+# 用法：
+#   cert_txn_begin "<label>"   # 入口处
+#   ... 业务逻辑 ...
+#   cert_txn_commit            # 出口处（成功）
+#
+# trap 在 begin 时安装到 EXIT，自动处理 Ctrl+C / 异常退出 / return-with-error。
+# 嵌套调用（外层 → 内层）共用一个 snapshot：内层 begin 仅递增引用计数，
+# 内层 commit 仅递减，最外层 commit 才真正归档 snapshot 并卸 trap。
+# ════════════════════════════════════════════════════════════
+
+CERT_TXN_DEPTH=0
+CERT_TXN_BACKUP_DIR=""
+CERT_TXN_LABEL=""
+CERT_TXN_COMMITTED=0
+CERT_TXN_ARCHIVE_DIR="/etc/cloudflare/.txn-archive"
+CERT_TXN_ARCHIVE_KEEP=5
+
+cert_txn_begin() {
+    local label="${1:-cert-txn}"
+
+    # 嵌套：已在事务中只递增深度
+    if [[ $CERT_TXN_DEPTH -gt 0 ]]; then
+        CERT_TXN_DEPTH=$((CERT_TXN_DEPTH + 1))
+        return 0
+    fi
+
+    mkdir -p "$CF_CONFIG_DIR" 2>/dev/null || true
+    chmod 700 "$CF_CONFIG_DIR" 2>/dev/null || true
+
+    CERT_TXN_LABEL="$label"
+    CERT_TXN_COMMITTED=0
+    CERT_TXN_BACKUP_DIR="${CF_CONFIG_DIR}/.txn-$(date +%s)-$$"
+
+    if ! mkdir -p "$CERT_TXN_BACKUP_DIR"; then
+        log_warn "无法创建事务备份目录 ${CERT_TXN_BACKUP_DIR}，事务保护已禁用"
+        CERT_TXN_BACKUP_DIR=""
+        return 0
+    fi
+    chmod 700 "$CERT_TXN_BACKUP_DIR" 2>/dev/null || true
+
+    # 备份 /etc/cloudflare/ 下所有文件（排除自己 .txn-* / .txn-archive）
+    local f base
+    for f in "${CF_CONFIG_DIR}"/* "${CF_CONFIG_DIR}"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        case "$base" in
+            .txn-*|.txn-archive) continue ;;
+        esac
+        cp -a "$f" "${CERT_TXN_BACKUP_DIR}/" 2>/dev/null || true
+    done
+
+    # 备份 config.env
+    if [[ -f "$STATE_FILE" ]]; then
+        cp -a "$STATE_FILE" "${CERT_TXN_BACKUP_DIR}/__state_config.env" 2>/dev/null || true
+    fi
+
+    CERT_TXN_DEPTH=1
+    # 安装 trap：INT/TERM 抓 Ctrl+C 与 kill；EXIT 兜底脚本异常退出
+    # 业务层 return 1 时需要显式调用 _cert_txn_rollback（trap 不会因 return 触发）
+    trap '_cert_txn_rollback $?; exit 130' INT
+    trap '_cert_txn_rollback $?; exit 143' TERM
+    trap '_cert_txn_rollback $?' EXIT
+    log_info "事务已开启：${CERT_TXN_LABEL}（backup: $(basename "$CERT_TXN_BACKUP_DIR")）"
+}
+
+cert_txn_commit() {
+    if [[ $CERT_TXN_DEPTH -le 0 ]]; then
+        return 0
+    fi
+    CERT_TXN_DEPTH=$((CERT_TXN_DEPTH - 1))
+    [[ $CERT_TXN_DEPTH -gt 0 ]] && return 0
+
+    CERT_TXN_COMMITTED=1
+    trap - EXIT INT TERM
+
+    if [[ -n "$CERT_TXN_BACKUP_DIR" && -d "$CERT_TXN_BACKUP_DIR" ]]; then
+        mkdir -p "$CERT_TXN_ARCHIVE_DIR" 2>/dev/null || true
+        chmod 700 "$CERT_TXN_ARCHIVE_DIR" 2>/dev/null || true
+
+        if mv "$CERT_TXN_BACKUP_DIR" "${CERT_TXN_ARCHIVE_DIR}/" 2>/dev/null; then
+            # 仅保留最近 N 份
+            local archives count
+            mapfile -t archives < <(ls -1dt "${CERT_TXN_ARCHIVE_DIR}"/.txn-* 2>/dev/null || true)
+            count=${#archives[@]}
+            if (( count > CERT_TXN_ARCHIVE_KEEP )); then
+                local i
+                for ((i = CERT_TXN_ARCHIVE_KEEP; i < count; i++)); do
+                    rm -rf "${archives[$i]}"
+                done
+            fi
+        else
+            # 归档失败就直接删除（不影响业务）
+            rm -rf "$CERT_TXN_BACKUP_DIR"
+        fi
+    fi
+
+    log_info "事务已提交：${CERT_TXN_LABEL}"
+    CERT_TXN_BACKUP_DIR=""
+    CERT_TXN_LABEL=""
+}
+
+_cert_txn_rollback() {
+    local exit_code="${1:-0}"
+
+    # 已 commit 不回滚
+    if [[ "$CERT_TXN_COMMITTED" == "1" ]]; then
+        return 0
+    fi
+
+    # 没有有效 snapshot 也不回滚
+    if [[ -z "$CERT_TXN_BACKUP_DIR" || ! -d "$CERT_TXN_BACKUP_DIR" ]]; then
+        CERT_TXN_DEPTH=0
+        return 0
+    fi
+
+    log_warn "事务回滚：${CERT_TXN_LABEL}（exit=${exit_code}）→ 还原 ${CF_CONFIG_DIR}"
+
+    # 1. 删除事务开始后新增的文件
+    local f base
+    for f in "${CF_CONFIG_DIR}"/* "${CF_CONFIG_DIR}"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        case "$base" in
+            .txn-*|.txn-archive) continue ;;
+        esac
+        if [[ ! -e "${CERT_TXN_BACKUP_DIR}/${base}" ]]; then
+            rm -rf "$f"
+        fi
+    done
+
+    # 2. 还原 backup 中的文件到原位
+    for f in "${CERT_TXN_BACKUP_DIR}"/* "${CERT_TXN_BACKUP_DIR}"/.[!.]*; do
+        [[ -e "$f" ]] || continue
+        base=$(basename "$f")
+        [[ "$base" == "__state_config.env" ]] && continue
+        cp -a "$f" "${CF_CONFIG_DIR}/" 2>/dev/null || true
+    done
+
+    # 3. 还原 config.env
+    if [[ -f "${CERT_TXN_BACKUP_DIR}/__state_config.env" ]]; then
+        cp -a "${CERT_TXN_BACKUP_DIR}/__state_config.env" "$STATE_FILE" 2>/dev/null || true
+        chmod 600 "$STATE_FILE" 2>/dev/null || true
+    fi
+
+    log_info "回滚完成（snapshot 保留在 ${CERT_TXN_BACKUP_DIR}）"
+
+    # snapshot 留作事后审计，不删
+    CERT_TXN_DEPTH=0
+    CERT_TXN_BACKUP_DIR=""
+    CERT_TXN_LABEL=""
+    trap - EXIT INT TERM
+}
+
+# ── CF Token 验证（调用 Cloudflare API） ────────────────────
+# 用法: verify_cf_token <token> [<root_domain>]
+# 返回码:
+#   0 = Token 有效且（如给了根域名）能访问该 Zone
+#   1 = Token 无效（401 / success:false / 4xx）
+#   2 = 网络错误（curl 失败 / 超时 / 5xx / 空响应）
+#   3 = Token 有效，但无法访问指定根域名的 Zone（result 为空）
+verify_cf_token() {
+    local token="$1" root_domain="${2:-}"
+    local resp body http_code curl_rc
+
+    # ── 第一步：/user/tokens/verify ──
+    resp=$(curl -sS --max-time 5 \
+        -H "Authorization: Bearer ${token}" \
+        -w $'\n%{http_code}' \
+        "https://api.cloudflare.com/client/v4/user/tokens/verify" 2>/dev/null) || curl_rc=$?
+    curl_rc="${curl_rc:-0}"
+
+    if [[ "$curl_rc" -ne 0 || -z "$resp" ]]; then
+        return 2
+    fi
+
+    http_code=$(printf '%s\n' "$resp" | tail -n1)
+    body=$(printf '%s\n' "$resp" | sed '$d')
+
+    case "$http_code" in
+        200) ;;
+        5*)  return 2 ;;
+        *)   return 1 ;;
+    esac
+
+    if ! echo "$body" | grep -q '"success":[[:space:]]*true'; then
+        return 1
+    fi
+
+    # ── 第二步（可选）：Zone 权限校验 ──
+    [[ -z "$root_domain" ]] && return 0
+
+    curl_rc=0
+    resp=$(curl -sS --max-time 5 \
+        -H "Authorization: Bearer ${token}" \
+        -w $'\n%{http_code}' \
+        "https://api.cloudflare.com/client/v4/zones?name=${root_domain}" 2>/dev/null) || curl_rc=$?
+
+    if [[ "$curl_rc" -ne 0 || -z "$resp" ]]; then
+        return 2
+    fi
+
+    http_code=$(printf '%s\n' "$resp" | tail -n1)
+    body=$(printf '%s\n' "$resp" | sed '$d')
+
+    case "$http_code" in
+        200) ;;
+        5*)  return 2 ;;
+        *)   return 1 ;;
+    esac
+
+    if ! echo "$body" | grep -q '"success":[[:space:]]*true'; then
+        return 1
+    fi
+
+    # result 为空数组 → 该 Token 无权访问该根域名
+    if echo "$body" | grep -qE '"result"[[:space:]]*:[[:space:]]*\[[[:space:]]*\]'; then
+        return 3
+    fi
+
+    return 0
+}
+
+# ── 查找已使用该 Token 的账号文件（去重检测用） ─────────────
+# 用法: find_cf_token_owner_file <token> [<exclude_ini_file>]
+# 成功输出匹配的 ini 文件全路径并返回 0；无匹配返回 1
+find_cf_token_owner_file() {
+    local token="$1" exclude_file="${2:-}"
+    local f t
+    for f in $(_scan_cf_account_files); do
+        [[ -n "$exclude_file" && "$f" == "$exclude_file" ]] && continue
+        t=$(_cf_ini_token "$f")
+        if [[ -n "$t" && "$t" == "$token" ]]; then
+            echo "$f"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# ── 查找根域名已关联的 CF 账号文件 ──────────────────────────
+# 用法: find_root_domain_owner_file <root_domain>
+# 输出: 关联的账号 ini 文件全路径（找不到则空），返回 0/1
+find_root_domain_owner_file() {
+    local root="$1"
+    local filebase
+    filebase=$(domain_to_ini_name "$root")
+
+    # 新格式 per-root 账号文件直接命中
+    if [[ -f "${CF_CONFIG_DIR}/${filebase}.ini" ]]; then
+        echo "${CF_CONFIG_DIR}/${filebase}.ini"
+        return 0
+    fi
+
+    # domain_<root>.ini 映射存在 → 反查源账号 ini
+    local mapping="${CF_CONFIG_DIR}/domain_${filebase}.ini"
+    if [[ -f "$mapping" ]]; then
+        local mapped_token
+        mapped_token=$(_cf_ini_token "$mapping")
+        if [[ -n "$mapped_token" ]]; then
+            local f t
+            for f in $(_scan_cf_account_files); do
+                t=$(_cf_ini_token "$f")
+                if [[ -n "$t" && "$t" == "$mapped_token" ]]; then
+                    echo "$f"
+                    return 0
+                fi
+            done
+        fi
+        # 找不到源账号则返回映射文件本身
+        echo "$mapping"
+        return 0
+    fi
+
+    return 1
+}
+
+# ── Token 写入前的去重确认（供 prompt_cf_token 内部使用） ───
+# 用法: _accept_cf_token <token> [<exclude_ini_file>]
+# 成功（无重复 / 用户确认覆盖）: 写 PROMPT_CF_TOKEN_RESULT 返回 0
+# 用户拒绝覆盖: 返回 1，由上层循环重新提示输入
+_accept_cf_token() {
+    local token="$1" exclude_file="${2:-}"
+    local dup_file dup_name cont
+    dup_file=$(find_cf_token_owner_file "$token" "$exclude_file" || true)
+    if [[ -n "$dup_file" ]]; then
+        dup_name=$(basename "$dup_file" .ini)
+        log_warn "该 Token 已被账号 [${dup_name}] 使用"
+        read -rp "  是否继续写入？[y/N]: " cont
+        if [[ "${cont,,}" != "y" ]]; then
+            log_info "请重新输入 Token..."
+            return 1
+        fi
+    fi
+    PROMPT_CF_TOKEN_RESULT="$token"
+    return 0
+}
+
+# ── 交互式 Token 输入 + 验证（三种失败场景分别处理） ────────
+# 用法: prompt_cf_token <prompt_label> [<root_domain>] [<exclude_ini_file>]
+# 成功: 把校验通过的 Token 写入全局变量 PROMPT_CF_TOKEN_RESULT，返回 0
+# 用户放弃 / 连续 3 次无效: 清空 PROMPT_CF_TOKEN_RESULT，返回 1
+# exclude_ini_file: 去重检测时排除的目标文件（重配置/覆盖写场景）
+prompt_cf_token() {
+    local label="$1" root_domain="${2:-}" exclude_file="${3:-}"
+    PROMPT_CF_TOKEN_RESULT=""
+    local token rc invalid_attempts=0 choice
+
+    while true; do
+        read -rp "  ${label}: " token
+        if [[ -z "$token" ]]; then
+            log_warn "Token 不能为空，请重新输入"
+            continue
+        fi
+
+        rc=0
+        verify_cf_token "$token" "$root_domain" || rc=$?
+
+        case "$rc" in
+            0)
+                if [[ -n "$root_domain" ]]; then
+                    log_info "Token 验证通过（可访问 ${root_domain} 的 Zone）"
+                else
+                    log_info "Token 验证通过"
+                fi
+                _accept_cf_token "$token" "$exclude_file" && return 0
+                ;;
+            1)
+                invalid_attempts=$((invalid_attempts + 1))
+                if [[ $invalid_attempts -ge 3 ]]; then
+                    log_error "Token 连续 3 次验证失败，放弃本次配置（未写入任何文件）"
+                    return 1
+                fi
+                log_warn "Token 无效（CF API 拒绝），请重新输入 [${invalid_attempts}/3]"
+                ;;
+            2)
+                log_warn "无法连接 api.cloudflare.com（超时 / 连接失败 / 5xx）"
+                echo "  a. 重试验证（保留刚才输入的 Token）"
+                echo "  b. 跳过验证强行写入（你自己确认 Token 正确，后续 certbot 会再验一次）"
+                echo "  c. 放弃返回菜单"
+                read -rp "  请选择 [a/b/c]: " choice
+                case "${choice,,}" in
+                    b)
+                        log_warn "已跳过 CF API 验证，按你的输入写入"
+                        _accept_cf_token "$token" "$exclude_file" && return 0
+                        ;;
+                    c)
+                        log_warn "已放弃，未写入任何文件"
+                        return 1
+                        ;;
+                    *)
+                        log_info "重试验证..."
+                        ;;
+                esac
+                ;;
+            3)
+                log_warn "Token 有效，但无法访问域名 ${root_domain} 的 Zone"
+                log_warn "请确认该 Token 的权限范围 / 所属 CF 账号是否正确"
+                echo "  a. 重新输入 Token"
+                echo "  b. 忽略并继续（使用此 Token 写入配置）"
+                read -rp "  请选择 [a/b]: " choice
+                case "${choice,,}" in
+                    b)
+                        log_warn "已忽略 Zone 权限警告，按你的输入写入"
+                        _accept_cf_token "$token" "$exclude_file" && return 0
+                        ;;
+                    *)
+                        log_info "请重新输入 Token..."
+                        ;;
+                esac
+                ;;
+        esac
+    done
+}
+
 # ── 重新配置指定 CF 账号 ─────────────────────────────────────
 reconfigure_cf_accounts() {
     local account_indexes=("$@")
@@ -176,9 +557,13 @@ reconfigure_cf_accounts() {
     for i in "${account_indexes[@]}"; do
         echo ""
         log_info "── 配置第 ${i} 个 CF 账号 ──"
-        read -rp "  账号 ${i} 的 CF API Token: " cf_token
-
         local ini_file="${CF_CONFIG_DIR}/cf_account_${i}.ini"
+        if ! prompt_cf_token "账号 ${i} 的 CF API Token" "" "$ini_file"; then
+            log_error "账号 ${i} 配置已放弃，停止配置剩余账号"
+            return 1
+        fi
+        local cf_token="$PROMPT_CF_TOKEN_RESULT"
+
         cat > "$ini_file" << INI
 # Cloudflare API Token - 账号 ${i}
 dns_cloudflare_api_token = ${cf_token}
@@ -223,7 +608,12 @@ setup_cf_accounts() {
                 echo "上次失败涉及账号: ${failed_account_indexes[*]}"
                 read -rp "是否只重新配置失败账号？[Y/n]: " reconf_failed
                 if [[ "${reconf_failed,,}" != "n" ]]; then
-                    reconfigure_cf_accounts "${failed_account_indexes[@]}"
+                    cert_txn_begin "setup_cf_accounts(failed)"
+                    if ! reconfigure_cf_accounts "${failed_account_indexes[@]}"; then
+                        _cert_txn_rollback 0
+                        return 1
+                    fi
+                    cert_txn_commit
                     log_info "其余 CF 账号配置保持不变"
                     return
                 fi
@@ -240,9 +630,14 @@ setup_cf_accounts() {
     read -rp "你有几个 Cloudflare 账号？[默认1]: " CF_ACCOUNT_COUNT
     CF_ACCOUNT_COUNT=${CF_ACCOUNT_COUNT:-1}
 
+    cert_txn_begin "setup_cf_accounts(all)"
     rm -f "${CF_CONFIG_DIR}"/cf_account_*.ini 2>/dev/null || true
     # shellcheck disable=SC2046
-    reconfigure_cf_accounts $(seq 1 "$CF_ACCOUNT_COUNT")
+    if ! reconfigure_cf_accounts $(seq 1 "$CF_ACCOUNT_COUNT"); then
+        _cert_txn_rollback 0
+        return 1
+    fi
+    cert_txn_commit
 }
 
 # ════════════════════════════════════════════════════════════
@@ -286,9 +681,13 @@ get_domain_ini() {
     if [[ -f "$f" ]]; then
         echo "$f"
     else
-        # 回退到账号1，同时给出警告
+        local fallback="${CF_CONFIG_DIR}/cf_account_1.ini"
+        if [[ ! -f "$fallback" ]]; then
+            log_error "域名 ${root_domain} 无 ini 映射，回退文件也不存在: ${fallback}，请先配置 CF 账号"
+            return 1
+        fi
         log_warn "未找到 ${f}，回退到 cf_account_1.ini"
-        echo "${CF_CONFIG_DIR}/cf_account_1.ini"
+        echo "$fallback"
     fi
 }
 
@@ -315,6 +714,7 @@ save_domain_config() {
     chmod 700 "$CF_CONFIG_DIR"
 
     declare -A acct_domains_map
+    local tmp_file="${CF_DOMAIN_MAP_FILE}.tmp.$$"
 
     {
         echo "# Auto-generated by xray-nginx-deploy cert module"
@@ -359,9 +759,14 @@ save_domain_config() {
         for key in "${!acct_domains_map[@]}"; do
             echo "CF_ACCOUNT_${key}='${acct_domains_map[$key]# }'"
         done
-    } > "$CF_DOMAIN_MAP_FILE"
+    } > "$tmp_file" || { rm -f "$tmp_file"; log_error "写入 ${tmp_file} 失败"; return 1; }
 
-    chmod 600 "$CF_DOMAIN_MAP_FILE"
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    if ! mv -f "$tmp_file" "$CF_DOMAIN_MAP_FILE"; then
+        rm -f "$tmp_file"
+        log_error "替换 ${CF_DOMAIN_MAP_FILE} 失败"
+        return 1
+    fi
     log_info "域名配置已保存: $CF_DOMAIN_MAP_FILE"
 }
 
@@ -482,10 +887,366 @@ _collect_domain_cf() {
     link_domain_to_cf_account "$root_domain" "$cf_idx"
 }
 
+# ── 协议槽位冲突检测 ────────────────────────────────────────
+# 用法: _check_protocol_slot_conflict <new_domain> <protocols>
+# 协议标签即槽位 ID，逐个标签检测是否与现有域名抢同一槽位
+# - 无冲突 → 返回 0
+# - 有冲突 → 列出当前占用域名，提示 [y/N]；y 返回 0（覆盖），N 返回 1（取消）
+#
+# 注：mode 不再参与槽位判定 —— X1 改良版协议拆分后，xray-xhttp / xray-grpc /
+# xray-reality 是独立标签，每个标签的 mode 由协议本身决定（xhttp/grpc=cdn,
+# reality=direct），不再需要外部 mode 与协议组合作为槽位 key。
+_check_protocol_slot_conflict() {
+    local new_domain="$1" new_protocols="$2"
+
+    # 协议标签 → 槽位（一一对应）
+    local -A slot_label_map=(
+        ["xray-xhttp"]="VLESS XHTTP (CDN)"
+        ["xray-grpc"]="VLESS gRPC (CDN)"
+        ["xray-reality"]="VLESS Reality (Direct)"
+        ["singbox"]="AnyTLS (Direct)"
+        ["hysteria2"]="Hysteria2 (Direct)"
+        ["naiveproxy"]="NaiveProxy (Direct)"
+    )
+    # nginx 独立站点不参与 SNI 路由槽位竞争，跳过
+
+    local -a check_tags=()
+    local tag
+    for tag in "${!slot_label_map[@]}"; do
+        case ",${new_protocols}," in
+            *,${tag},*) check_tags+=("$tag") ;;
+        esac
+    done
+
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY")
+
+    local d suffix d_protos
+    for tag in "${check_tags[@]}"; do
+        local -a occupants=()
+        for d in $registry; do
+            [[ "$d" == "$new_domain" ]] && continue
+            suffix=$(echo "$d" | tr '.' '_')
+            d_protos=$(get_state "DOMAIN_PROTO_${suffix}")
+            [[ -z "$d_protos" ]] && continue
+            case ",${d_protos}," in
+                *,${tag},*) occupants+=("$d") ;;
+            esac
+        done
+
+        [[ ${#occupants[@]} -eq 0 ]] && continue
+
+        local slot_id_upper="${tag^^}"
+        slot_id_upper="${slot_id_upper//-/_}"
+
+        log_warn "协议槽位冲突: ${slot_label_map[$tag]} [${tag}]"
+        log_warn "  当前占用: ${occupants[*]}"
+        log_warn "  本架构每槽位仅一个域名能生效，新增 ${new_domain} 后只能其一作为主域名"
+        local confirm
+        read -rp "  是否继续，让 ${new_domain} 成为该槽位的新主域名？[y/N]: " confirm
+        if [[ "${confirm,,}" != "y" ]]; then
+            log_info "已取消"
+            return 1
+        fi
+        # 用户确认 → 显式设 PRIMARY，覆盖"取最后"的回退行为
+        save_state "DOMAIN_PRIMARY_${slot_id_upper}" "$new_domain"
+    done
+    return 0
+}
+
+# ── 协议菜单 + mode 自动推导 ────────────────────────────────
+# X1 改良版：协议拆分到 sub-protocol，mode 由协议决定
+_print_protocol_menu() {
+    echo "    1. xray-xhttp    - VLESS XHTTP（CDN）"
+    echo "    2. xray-grpc     - VLESS gRPC（CDN）"
+    echo "    3. xray-reality  - VLESS Reality（直连）"
+    echo "    4. singbox       - AnyTLS（直连）"
+    echo "    5. hysteria2     - Hysteria2（直连）"
+    echo "    6. naiveproxy    - NaiveProxy（直连）"
+    echo "    7. nginx         - 独立站点（开发中）"
+}
+
+# 协议序号 → 标签（stdout 输出标签，无效返回 1）
+_proto_choice_to_tag() {
+    case "$1" in
+        1) echo "xray-xhttp" ;;
+        2) echo "xray-grpc" ;;
+        3) echo "xray-reality" ;;
+        4) echo "singbox" ;;
+        5) echo "hysteria2" ;;
+        6) echo "naiveproxy" ;;
+        7) echo "nginx" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 多选序号 → 逗号分隔协议列表
+_collect_protocols_from_choices() {
+    local choices="$1"
+    local out="" choice tag
+    for choice in $choices; do
+        if tag=$(_proto_choice_to_tag "$choice"); then
+            out="${out:+$out,}$tag"
+        else
+            log_warn "无效选项: $choice"
+        fi
+    done
+    echo "$out"
+}
+
+# 当同时选择 xray-xhttp 和 xray-grpc 时，询问用户该域名绑定哪个协议
+# 用于 collect_domains 和 add_domain_and_cert 的协议选择后置处理
+# 调用方式：protocols=$(_resolve_cdn_proto_split "$domain" "$protocols")
+_resolve_cdn_proto_split() {
+    local domain="$1" protocols="$2"
+
+    # 未同时包含两个 CDN 协议时直接返回
+    case ",${protocols}," in *,xray-xhttp,*) ;; *) echo "$protocols"; return ;; esac
+    case ",${protocols}," in *,xray-grpc,*)  ;; *) echo "$protocols"; return ;; esac
+
+    echo "" >&2
+    log_warn "同时选择了 xray-xhttp + xray-grpc，每个协议槽位只能绑定一个主域名。" >&2
+    echo "  请为 ${domain} 指定绑定方式：" >&2
+    echo "    a) 合并：两个协议共用 ${domain}（:20443 按 path 分流）" >&2
+    echo "    b) 分离：${domain} 只绑 xhttp（gRPC 另行指定域名）" >&2
+    echo "    c) 分离：${domain} 只绑 gRPC（xhttp 另行指定域名）" >&2
+    local split_choice
+    read -rp "  请选择 [a/b/c，默认 a]: " split_choice
+
+    local out="" tag
+    IFS=',' read -ra _split_tags <<< "$protocols"
+    case "${split_choice,,}" in
+        b) for tag in "${_split_tags[@]}"; do [[ "$tag" != "xray-grpc"  ]] && out="${out:+$out,}$tag"; done ;;
+        c) for tag in "${_split_tags[@]}"; do [[ "$tag" != "xray-xhttp" ]] && out="${out:+$out,}$tag"; done ;;
+        *) out="$protocols" ;;
+    esac
+    echo "$out"
+}
+
+# 由协议列表自动推导 mode（CDN 当且仅当包含 xhttp 或 grpc）
+_derive_mode_from_protocols() {
+    local protos="$1"
+    case ",${protos}," in
+        *,xray-xhttp,*|*,xray-grpc,*) echo "cdn" ;;
+        *) echo "direct" ;;
+    esac
+}
+
+# ════════════════════════════════════════════════════════════
+# 域名配置交互式编辑器（collect_domains 的 b 分支使用）
+# ════════════════════════════════════════════════════════════
+
+# ── 编辑器：添加单个域名 ─────────────────────────────────────
+_editor_add_domain() {
+    local domain protocols mode choices choice
+
+    read -rp "请输入要添加的域名: " domain
+    domain="${domain,,}"
+    [[ -z "$domain" ]] && return 0
+
+    if domain_is_registered "$domain"; then
+        log_warn "域名 $domain 已存在，请用 e 编辑或先 d 删除"
+        return 0
+    fi
+
+    echo "  请选择协议（多选，空格分隔）："
+    _print_protocol_menu
+    read -rp "  输入序号如 1 4: " choices
+    protocols=$(_collect_protocols_from_choices "$choices")
+    [[ -z "$protocols" ]] && { log_warn "未选择协议，已取消"; return 0; }
+
+    mode=$(_derive_mode_from_protocols "$protocols")
+    log_info "推导连接方式: ${mode}（含 xhttp/grpc → cdn，其它 → direct）"
+
+    if ! _check_protocol_slot_conflict "$domain" "$protocols"; then
+        return 0
+    fi
+
+    register_domain "$domain" "$mode" "$protocols"
+    _collect_domain_cf "$domain"
+    log_info "已添加: $domain [mode=$mode, proto=$protocols]"
+}
+
+# ── 编辑器：修改已存在域名的协议 / mode ─────────────────────
+_editor_modify_domain() {
+    local domain="$1"
+    local suffix mode protos
+    suffix=$(echo "$domain" | tr '.' '_')
+    mode=$(get_state "DOMAIN_MODE_${suffix}")
+    protos=$(get_state "DOMAIN_PROTO_${suffix}")
+
+    echo "  当前: $domain [mode=$mode, proto=$protos]"
+    echo "  重新选择协议（留空保持原值）："
+    _print_protocol_menu
+    local choices new_protos=""
+    read -rp "  输入序号如 1 4（留空保持）: " choices
+    if [[ -n "$choices" ]]; then
+        new_protos=$(_collect_protocols_from_choices "$choices")
+    fi
+    [[ -z "$new_protos" ]] && new_protos="$protos"
+
+    local new_mode
+    new_mode=$(_derive_mode_from_protocols "$new_protos")
+    log_info "推导连接方式: ${new_mode}"
+
+    if ! _check_protocol_slot_conflict "$domain" "$new_protos"; then
+        return 0
+    fi
+
+    # 直接覆盖（编辑语义 = 替换；register_domain 是 merge 协议，这里要 replace）
+    save_state "DOMAIN_MODE_${suffix}"  "$new_mode"
+    save_state "DOMAIN_PROTO_${suffix}" "$new_protos"
+    log_info "已修改: $domain [mode=$new_mode, proto=$new_protos]"
+}
+
+# ── 编辑器：删除域名 ────────────────────────────────────────
+_editor_delete_domain() {
+    local domain="$1"
+    local confirm
+    read -rp "确认删除 $domain？[y/N]: " confirm
+    [[ "${confirm,,}" != "y" ]] && { log_info "已取消"; return 0; }
+
+    local suffix
+    suffix=$(echo "$domain" | tr '.' '_')
+
+    # 从 DOMAIN_REGISTRY 移除
+    local registry new_reg="" d
+    registry=$(get_state "DOMAIN_REGISTRY")
+    for d in $registry; do
+        [[ "$d" == "$domain" ]] && continue
+        new_reg="${new_reg:+$new_reg }$d"
+    done
+    save_state "DOMAIN_REGISTRY" "$new_reg"
+    save_state "DOMAIN_MODE_${suffix}"  ""
+    save_state "DOMAIN_PROTO_${suffix}" ""
+    log_info "已删除: $domain"
+
+    # 同根子域名还在 → 保留 ini 与证书；只有当本根域名彻底没人用了才询问
+    local root_domain still_used=false rd
+    root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+    for d in $new_reg; do
+        rd=$(echo "$d" | awk -F. '{print $(NF-1)"."$NF}')
+        if [[ "$rd" == "$root_domain" ]]; then
+            still_used=true
+            break
+        fi
+    done
+    $still_used && return 0
+
+    local filebase
+    filebase=$(domain_to_ini_name "$root_domain")
+
+    local rm_ini
+    read -rp "  根域名 ${root_domain} 已无子域使用，是否删除 domain_${filebase}.ini 关联？[y/N]: " rm_ini
+    if [[ "${rm_ini,,}" == "y" ]]; then
+        rm -f "${CF_CONFIG_DIR}/domain_${filebase}.ini"
+        log_info "已删除 domain_${filebase}.ini"
+    fi
+
+    local rm_cert
+    read -rp "  是否删除 Let's Encrypt 证书 /etc/letsencrypt/live/${root_domain}？[y/N]: " rm_cert
+    if [[ "${rm_cert,,}" == "y" ]]; then
+        if command -v certbot >/dev/null 2>&1; then
+            certbot delete --cert-name "$root_domain" --non-interactive >/dev/null 2>&1 || \
+                rm -rf "/etc/letsencrypt/live/${root_domain}" \
+                       "/etc/letsencrypt/archive/${root_domain}" \
+                       "/etc/letsencrypt/renewal/${root_domain}.conf"
+        else
+            rm -rf "/etc/letsencrypt/live/${root_domain}" \
+                   "/etc/letsencrypt/archive/${root_domain}" \
+                   "/etc/letsencrypt/renewal/${root_domain}.conf"
+        fi
+        log_info "已删除证书 ${root_domain}"
+    fi
+}
+
+# ── 编辑器主循环：展示列表 + a/e/d/s/q 操作 ─────────────────
+# 返回值：0 = 用户选择保存（s），1 = 用户选择放弃（q）
+_domain_editor_loop() {
+    local cmd extra
+    while true; do
+        echo ""
+        echo "── 当前域名列表 ────────────────────────────────────"
+        local registry domains_arr=() idx=1
+        registry=$(get_state "DOMAIN_REGISTRY")
+        if [[ -z "$registry" ]]; then
+            echo "  （暂无）"
+        else
+            local d
+            for d in $registry; do
+                local suffix mode protos
+                suffix=$(echo "$d" | tr '.' '_')
+                mode=$(get_state "DOMAIN_MODE_${suffix}")
+                protos=$(get_state "DOMAIN_PROTO_${suffix}")
+                # 跳过被 _editor_delete_domain 清空过的残留键
+                [[ -z "$mode" && -z "$protos" ]] && continue
+                printf "  %d. %-32s [%s / %s]\n" "$idx" "$d" "$mode" "$protos"
+                domains_arr+=("$d")
+                idx=$((idx + 1))
+            done
+        fi
+        echo "────────────────────────────────────────────────────"
+        echo "操作:  a 添加  |  e <N> 编辑  |  d <N> 删除  |  s 保存退出  |  q 放弃退出"
+        echo ""
+        read -rp "  请选择: " cmd extra
+
+        case "${cmd,,}" in
+            a)
+                _editor_add_domain
+                ;;
+            e)
+                if ! [[ "$extra" =~ ^[0-9]+$ ]] || (( extra < 1 || extra > ${#domains_arr[@]} )); then
+                    log_warn "用法: e <编号>（1-${#domains_arr[@]}）"
+                    continue
+                fi
+                _editor_modify_domain "${domains_arr[$((extra - 1))]}"
+                ;;
+            d)
+                if ! [[ "$extra" =~ ^[0-9]+$ ]] || (( extra < 1 || extra > ${#domains_arr[@]} )); then
+                    log_warn "用法: d <编号>（1-${#domains_arr[@]}）"
+                    continue
+                fi
+                _editor_delete_domain "${domains_arr[$((extra - 1))]}"
+                ;;
+            s)
+                # Preflight 互锁：保存前提前发现冲突，避免 do_conf_* 阶段才被挡
+                # rebuild_protocol_domains 还未在编辑器内运行，这里先用 state 现状跑一遍
+                local _editor_save_force="no"
+                if declare -F preflight_config_check &>/dev/null; then
+                    sync_restore_domain_arrays 2>/dev/null || true
+                    if ! preflight_config_check "domain_editor"; then
+                        echo ""
+                        log_warn "保存前预检失败。选项："
+                        echo "  f - 强制保存（state 会写入冲突状态，后续 do_conf_* 仍会被预检挡下）"
+                        echo "  c - 继续编辑（推荐：先修复冲突再保存）"
+                        local _force_ans
+                        read -rp "  选择 [f/c]: " _force_ans
+                        case "${_force_ans,,}" in
+                            f) _editor_save_force="yes" ;;
+                            *) continue ;;
+                        esac
+                    fi
+                fi
+                return 0
+                ;;
+            q)
+                return 1
+                ;;
+            "")
+                ;;
+            *)
+                log_warn "无效操作: $cmd"
+                ;;
+        esac
+    done
+}
+
 collect_domains() {
     echo ""
     log_step "配置域名信息"
     echo ""
+
+    cert_txn_begin "collect_domains"
 
     if load_domain_config; then
         log_info "发现已有域名配置："
@@ -506,35 +1267,98 @@ collect_domains() {
         done
 
         echo ""
-        read -rp "是否直接复用已有域名配置？[Y/n]: " reuse_domains
-        if [[ "${reuse_domains,,}" != "n" ]]; then
-            normalize_domain_arrays
+        echo "请选择操作："
+        echo "  a. 复用现有配置不修改（默认）"
+        echo "  b. 在现有基础上 增 / 改 / 删（交互式编辑）"
+        echo "  c. 全部清空重新填写"
+        echo ""
+        local domain_action
+        read -rp "  请选择 [a/b/c]: " domain_action
+        domain_action="${domain_action:-a}"
 
-            local missing_ini=()
-            for domain in "${ALL_DOMAINS[@]}"; do
-                local root_domain
-                root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-                if ! has_domain_ini "$root_domain"; then
-                    local already=false
-                    for m in "${missing_ini[@]}"; do
-                        [[ "$m" == "$root_domain" ]] && already=true && break
-                    done
-                    $already || missing_ini+=("$root_domain")
-                fi
-            done
+        case "${domain_action,,}" in
+            a)
+                normalize_domain_arrays
 
-            if [[ ${#missing_ini[@]} -gt 0 ]]; then
-                log_warn "以下根域名缺少账号映射文件，需要重新关联："
-                for rd in "${missing_ini[@]}"; do
-                    echo "  *.${rd}"
+                local missing_ini=()
+                for domain in "${ALL_DOMAINS[@]}"; do
+                    local root_domain
+                    root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+                    if ! has_domain_ini "$root_domain"; then
+                        local already=false
+                        for m in "${missing_ini[@]}"; do
+                            [[ "$m" == "$root_domain" ]] && already=true && break
+                        done
+                        $already || missing_ini+=("$root_domain")
+                    fi
                 done
-                echo ""
-                _prompt_link_domains "${missing_ini[@]}"
-            fi
 
-            log_info "复用已有域名配置"
-            return
-        fi
+                if [[ ${#missing_ini[@]} -gt 0 ]]; then
+                    log_warn "以下根域名缺少账号映射文件，需要重新关联："
+                    for rd in "${missing_ini[@]}"; do
+                        echo "  *.${rd}"
+                    done
+                    echo ""
+                    _prompt_link_domains "${missing_ini[@]}"
+                fi
+
+                log_info "复用已有域名配置"
+                cert_txn_commit
+                return
+                ;;
+            b)
+                if ! _domain_editor_loop; then
+                    log_warn "用户放弃编辑，正在回滚到事务开始前的状态..."
+                    _cert_txn_rollback 0
+                    return 1
+                fi
+                rebuild_protocol_domains
+                load_domain_state
+
+                # 补齐编辑后可能缺失的 CF 账号关联
+                normalize_domain_arrays
+                local missing_ini=()
+                for domain in "${ALL_DOMAINS[@]}"; do
+                    local root_domain
+                    root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+                    if ! has_domain_ini "$root_domain"; then
+                        local already=false
+                        for m in "${missing_ini[@]}"; do
+                            [[ "$m" == "$root_domain" ]] && already=true && break
+                        done
+                        $already || missing_ini+=("$root_domain")
+                    fi
+                done
+                if [[ ${#missing_ini[@]} -gt 0 ]]; then
+                    log_warn "编辑后以下根域名缺少账号映射，请关联："
+                    _prompt_link_domains "${missing_ini[@]}"
+                fi
+
+                echo ""
+                log_info "编辑后的域名配置："
+                local d
+                for d in "${ALL_DOMAINS[@]}"; do
+                    local suffix m p
+                    suffix=$(echo "$d" | tr '.' '_')
+                    m=$(get_state "DOMAIN_MODE_${suffix}")
+                    p=$(get_state "DOMAIN_PROTO_${suffix}")
+                    echo "  $d  [${m} / ${p}]"
+                done
+
+                save_domain_config
+                cert_txn_commit
+                return
+                ;;
+            c)
+                # fall through 到下方的"全新填写"分支
+                ;;
+            *)
+                log_warn "无效选择，按默认（复用）处理"
+                normalize_domain_arrays
+                cert_txn_commit
+                return
+                ;;
+        esac
     fi
 
     # ── 全新填写域名 ──────────────────────────────────────────
@@ -550,17 +1374,27 @@ collect_domains() {
 
     rm -f "${CF_CONFIG_DIR}"/domain_*.ini 2>/dev/null || true
     save_state "DOMAIN_REGISTRY" ""
+    # 清空协议槽位主域名，避免旧值污染冲突检测
+    save_state "DOMAIN_PRIMARY_XRAY_XHTTP"   ""
+    save_state "DOMAIN_PRIMARY_XRAY_GRPC"    ""
+    save_state "DOMAIN_PRIMARY_XRAY_REALITY" ""
+    save_state "DOMAIN_PRIMARY_SINGBOX"      ""
+    save_state "DOMAIN_PRIMARY_HYSTERIA2"    ""
+    save_state "DOMAIN_PRIMARY_NAIVEPROXY"   ""
+    # 清理 v1 遗留键（迁移函数也会清，这里再保险一次）
+    save_state "DOMAIN_PRIMARY_XRAY_CDN"     ""
+    save_state "DOMAIN_PRIMARY_XRAY_DIRECT"  ""
 
-    echo "  协议说明："
-    echo "    xray      - VLESS 相关 (XHTTP/gRPC via CDN, Reality via Direct)"
-    echo "    singbox   - Sing-Box AnyTLS"
-    echo "    hysteria2 - Hysteria2"
-    echo "    naiveproxy- NaiveProxy"
-    echo "    nginx     - 独立 Nginx 站点"
+    echo "  协议说明（X1 改良版：sub-protocol 拆分）："
+    echo "    xray-xhttp   - VLESS XHTTP（CDN）"
+    echo "    xray-grpc    - VLESS gRPC （CDN）"
+    echo "    xray-reality - VLESS Reality（直连）"
+    echo "    singbox      - Sing-Box AnyTLS（直连）"
+    echo "    hysteria2    - Hysteria2（直连）"
+    echo "    naiveproxy   - NaiveProxy（直连）"
+    echo "    nginx        - 独立 Nginx 站点（开发中）"
     echo ""
-    echo "  连接方式："
-    echo "    cdn    - 经 Cloudflare CDN 中转（橙云）"
-    echo "    direct - 直连（关闭 CF 代理 / 灰云）"
+    echo "  连接方式由协议自动推导（含 xhttp/grpc → CDN，其余 → 直连）"
     echo ""
 
     while true; do
@@ -578,34 +1412,22 @@ collect_domains() {
         # ── 多选协议 ──
         echo ""
         echo "  请为 $domain 选择协议（多选，空格分隔序号）："
-        echo "    1. xray       - VLESS 系列 (XHTTP/gRPC + Reality)"
-        echo "    2. singbox    - AnyTLS"
-        echo "    3. hysteria2  - Hysteria2"
-        echo "    4. naiveproxy - NaiveProxy"
-        echo "    5. nginx      - 独立 Nginx 站点"
+        _print_protocol_menu
         local choices
-        read -rp "  输入序号如: 1 3 5: " choices
+        read -rp "  输入序号如: 1 4: " choices
 
-        protocols=""
-        for choice in $choices; do
-            case "$choice" in
-                1) protocols="${protocols:+$protocols,}xray" ;;
-                2) protocols="${protocols:+$protocols,}singbox" ;;
-                3) protocols="${protocols:+$protocols,}hysteria2" ;;
-                4) protocols="${protocols:+$protocols,}naiveproxy" ;;
-                5) protocols="${protocols:+$protocols,}nginx" ;;
-                *) log_warn "无效选项: $choice"; ;;
-            esac
-        done
+        protocols=$(_collect_protocols_from_choices "$choices")
+        [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
+        protocols=$(_resolve_cdn_proto_split "$domain" "$protocols")
         [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
 
-        # ── 连接方式 ──
-        local mode_r
-        read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
-        case "${mode_r:-d}" in
-            c|C|cdn|CDN) mode="cdn" ;;
-            *)           mode="direct" ;;
-        esac
+        # ── 连接方式自动推导 ──
+        mode=$(_derive_mode_from_protocols "$protocols")
+        log_info "推导连接方式: ${mode}"
+
+        if ! _check_protocol_slot_conflict "$domain" "$protocols"; then
+            continue
+        fi
 
         # ── 注册 & 关联 ──
         register_domain "$domain" "$mode" "$protocols"
@@ -635,14 +1457,14 @@ collect_domains() {
 
     read -rp "确认以上配置？[Y/n]: " confirm
     if [[ "${confirm,,}" == "n" ]]; then
-        rm -f "${CF_CONFIG_DIR}"/domain_*.ini 2>/dev/null || true
-        save_state "DOMAIN_REGISTRY" ""
-        log_warn "重新配置域名..."
-        collect_domains
-        return
+        # 用户主动放弃 → 显式回滚还原干净后退出
+        log_warn "用户取消，正在回滚到事务开始前的状态..."
+        _cert_txn_rollback 0
+        return 1
     fi
 
     save_domain_config
+    cert_txn_commit
 }
 
 # ── 补充关联：为指定根域名列表重新选择 CF 账号 ──────────────
@@ -679,6 +1501,8 @@ save_cert_request_status() {
     mkdir -p "$CF_CONFIG_DIR"
     chmod 700 "$CF_CONFIG_DIR"
 
+    local tmp_file="${CF_CERT_STATUS_FILE}.tmp.$$"
+
     {
         echo "# Auto-generated by xray-nginx-deploy cert module"
         # 逐行写入普通文本，不用 declare -p，避免 source 时执行恶意代码
@@ -694,9 +1518,10 @@ save_cert_request_status() {
         echo "# --- FAILED_CF_ACCOUNTS ---"
         for _item in "${FAILED_CF_ACCOUNTS[@]}"; do echo "$_item"; done
         echo "# --- END FAILED_CF_ACCOUNTS ---"
-    } > "$CF_CERT_STATUS_FILE"
+    } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
 
-    chmod 600 "$CF_CERT_STATUS_FILE"
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$CF_CERT_STATUS_FILE" || { rm -f "$tmp_file"; return 1; }
 }
 
 # ── 加载证书请求状态 ─────────────────────────────────────────
@@ -711,7 +1536,6 @@ load_cert_request_status() {
     local _section=""
     while IFS= read -r _line || [[ -n "$_line" ]]; do
         [[ -z "$_line" ]] && continue
-        [[ "$_line" == "#"* ]] && continue
 
         case "$_line" in
             "# --- CERT_SUCCESS_ROOTS ---")
@@ -731,6 +1555,8 @@ load_cert_request_status() {
             "# --- END FAILED_CF_ACCOUNTS ---")
                 _section=""; continue ;;
         esac
+
+        [[ "$_line" == "#"* ]] && continue
 
         case "$_section" in
             SUCCESS) CERT_SUCCESS_ROOTS+=("$_line") ;;
@@ -858,6 +1684,7 @@ request_certificates() {
             log_info "证书已存在，跳过: *.${root_domain}"
             CERT_EXISTING_ROOTS+=("$root_domain")
             ROOT_DOMAIN_DONE["$root_domain"]="existing"
+            save_state "CERT_PATH_${root_domain//./_}" "/etc/letsencrypt/live/${root_domain}"
             continue
         fi
 
@@ -892,6 +1719,7 @@ request_certificates() {
                 log_info "证书申请成功: *.${root_domain} (第 ${attempt} 次尝试)"
                 CERT_SUCCESS_ROOTS+=("$root_domain")
                 ROOT_DOMAIN_DONE["$root_domain"]="success"
+                save_state "CERT_PATH_${root_domain//./_}" "/etc/letsencrypt/live/${root_domain}"
                 break
             fi
 
@@ -949,6 +1777,8 @@ systemctl restart xray     2>/dev/null && echo "xray restarted"     || true
 systemctl restart sing-box 2>/dev/null && echo "sing-box restarted" || true
 HOOK
     chmod +x /etc/letsencrypt/renewal-hooks/deploy/xray-nginx-deploy-reload.sh
+    # 清理旧版本遗留的重复 hook（功能已被上面的脚本覆盖）
+    rm -f /etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh
 
     if certbot_uses_snap; then
         crontab -l 2>/dev/null | grep -v certbot | crontab - || true
@@ -969,7 +1799,15 @@ domain_to_ini_name() {
 # ── 扫描所有 CF 账号文件 ─────────────────────────────────────
 # 兼容新旧两种格式：<root>.ini（新）+ cf_account_N.ini（旧）
 _scan_cf_account_files() {
-    ls "${CF_CONFIG_DIR}"/*.ini 2>/dev/null | grep -v 'domain_\|domain_map\|cert_request'
+    local f base
+    for f in "${CF_CONFIG_DIR}"/*.ini; do
+        [[ -f "$f" ]] || continue
+        base=$(basename "$f")
+        case "$base" in
+            domain_*|cert_request*) ;;
+            *) echo "$f" ;;
+        esac
+    done
 }
 
 # ── 判断旧格式账号是否有对应的新格式文件（Token 相同则视为重复）──
@@ -1050,16 +1888,40 @@ add_cf_account() {
     cf_root="${cf_root,,}"
     [[ -z "$cf_root" ]] && { log_error "根域名不能为空"; return 1; }
 
-    read -rp "请输入 CF API Token: " cf_token
-
     local filebase
     filebase=$(domain_to_ini_name "$cf_root")
     local ini_file="${CF_CONFIG_DIR}/${filebase}.ini"
 
-    cat > "$ini_file" << INI
+    # 根域名重复检测
+    local existing_owner ow
+    existing_owner=$(find_root_domain_owner_file "$cf_root" || true)
+    if [[ -n "$existing_owner" ]]; then
+        log_warn "根域名 ${cf_root} 已关联账号 [$(basename "$existing_owner" .ini)]"
+        read -rp "  是否覆盖现有关联？[y/N]: " ow
+        if [[ "${ow,,}" != "y" ]]; then
+            log_info "已取消，未修改任何文件"
+            return 1
+        fi
+    fi
+
+    if ! prompt_cf_token "请输入 CF API Token" "$cf_root" "$ini_file"; then
+        log_error "新增 CF 账号已放弃，未写入任何文件"
+        return 1
+    fi
+    cf_token="$PROMPT_CF_TOKEN_RESULT"
+
+    # 若该 token 已存在于其他 ini，直接复用，避免同内容重复文件
+    local _dup_src
+    _dup_src=$(find_cf_token_owner_file "$cf_token" "$ini_file" || true)
+    if [[ -n "$_dup_src" ]]; then
+        cp "$_dup_src" "$ini_file"
+        log_info "Token 已存在于 $(basename "$_dup_src")，复用为 ${filebase}.ini"
+    else
+        cat > "$ini_file" << INI
 # Cloudflare API Token — ${cf_root}
 dns_cloudflare_api_token = ${cf_token}
 INI
+    fi
     chmod 600 "$ini_file"
 
     rebuild_cf_ini_files
@@ -1112,6 +1974,8 @@ get_cf_account_by_domain() {
 add_domain_and_cert() {
     log_step "新增域名并申请证书"
 
+    cert_txn_begin "add_domain_and_cert"
+
     load_domain_state
     load_domain_config >/dev/null 2>&1 || true
 
@@ -1149,50 +2013,46 @@ add_domain_and_cert() {
             suffix=$(echo "$domain" | tr '.' '_')
             current_mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
             current_protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+            log_warn "域名 $domain 已存在 [mode=$current_mode, proto=$current_protos]"
+            local edit_confirm
+            read -rp "  是否修改其配置？[y/N]: " edit_confirm
+            if [[ "${edit_confirm,,}" != "y" ]]; then
+                log_info "已跳过 $domain"
+                continue
+            fi
             is_existing=true
-            log_warn "域名 $domain 已存在，将追加协议"
-            log_info "当前配置: $domain [mode=$current_mode, proto=$current_protos]"
+            log_info "进入编辑模式（协议将追加，mode 可改）"
         fi
 
         # ── 多选协议 ──
         echo ""
         echo "  请为 $domain 选择协议（多选，空格分隔序号）："
-        echo "    1. xray       - VLESS 系列"
-        echo "    2. singbox    - AnyTLS"
-        echo "    3. hysteria2  - Hysteria2"
-        echo "    4. naiveproxy - NaiveProxy"
-        echo "    5. nginx      - 独立 Nginx 站点"
+        _print_protocol_menu
         local choices
-        read -rp "  输入序号如: 1 3 5: " choices
+        read -rp "  输入序号如: 1 4: " choices
 
-        protocols=""
-        for choice in $choices; do
-            case "$choice" in
-                1) protocols="${protocols:+$protocols,}xray" ;;
-                2) protocols="${protocols:+$protocols,}singbox" ;;
-                3) protocols="${protocols:+$protocols,}hysteria2" ;;
-                4) protocols="${protocols:+$protocols,}naiveproxy" ;;
-                5) protocols="${protocols:+$protocols,}nginx" ;;
-                *) log_warn "无效选项: $choice"; ;;
-            esac
-        done
+        protocols=$(_collect_protocols_from_choices "$choices")
         [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
-
-        # ── 连接方式 ──
-        local mode_r
-        if [[ "$is_existing" == "true" ]]; then
-            read -rp "  连接方式 [d=直连, c=CDN，默认保持 ${current_mode}]: " mode_r
-        else
-            read -rp "  连接方式 [d=直连(默认), c=CDN]: " mode_r
-        fi
-        case "${mode_r:-${current_mode:-d}}" in
-            c|C|cdn|CDN) mode="cdn" ;;
-            *)           mode="direct" ;;
-        esac
 
         if [[ "$is_existing" == "true" ]]; then
             protocols=$(merge_domain_protocols "$current_protos" "$protocols")
+        fi
+        protocols=$(_resolve_cdn_proto_split "$domain" "$protocols")
+        [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
+
+        # ── 连接方式自动推导（编辑场景同样按当前协议列表推导，不再询问）──
+        mode=$(_derive_mode_from_protocols "$protocols")
+        if [[ "$is_existing" == "true" && "$mode" != "$current_mode" ]]; then
+            log_info "连接方式由 ${current_mode} → ${mode}（按协议自动推导）"
         else
+            log_info "推导连接方式: ${mode}"
+        fi
+
+        if ! _check_protocol_slot_conflict "$domain" "$protocols"; then
+            continue
+        fi
+
+        if [[ "$is_existing" != "true" ]]; then
             # ── 关联 CF 账号（自动匹域名 → 手动选）─────────────
             root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
             local _ini_base _ini_file _matched_ini=() _auto_ini
@@ -1202,7 +2062,7 @@ add_domain_and_cert() {
             if [[ -f "$_ini_file" ]]; then
                 # 精确匹配成功
                 _auto_ini="$_ini_file"
-                log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
+                log_info "已自动匹配 CF 账号: $(basename "$_auto_ini")"
             else
                 # 模糊匹配：扫描所有 ini（排除 domain_ 映射文件），找出包含根域的文件
                 for _f in "${CF_CONFIG_DIR}"/*.ini; do
@@ -1213,7 +2073,7 @@ add_domain_and_cert() {
 
                 if [[ ${#_matched_ini[@]} -eq 1 ]]; then
                     _auto_ini="${_matched_ini[0]}"
-                    log_info "已自动匹配 CF 账号: $(basename $_auto_ini)"
+                    log_info "已自动匹配 CF 账号: $(basename "$_auto_ini")"
                 else
                     # 匹配不到或有多于一个候选，展示列表让手动选择
                     echo ""
@@ -1228,13 +2088,14 @@ add_domain_and_cert() {
                     done
                     local cf_choice _src_ini
                     read -rp "输入方括号内标识选择 CF 账号: " cf_choice
-                    [[ -z "$cf_choice" ]] && { log_error "未选择账号"; return 1; }
+                    [[ -z "$cf_choice" ]] && { log_error "未选择账号"; _cert_txn_rollback 0; return 1; }
 
                     _src_ini="${CF_CONFIG_DIR}/${cf_choice}.ini"
                     [[ -f "$_src_ini" ]] || _src_ini="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
 
                     [[ -f "$_src_ini" ]] || {
                         log_error "CF 账号文件不存在: ${_src_ini}"
+                        _cert_txn_rollback 0
                         return 1
                     }
                     _auto_ini="$_src_ini"
@@ -1266,45 +2127,22 @@ add_domain_and_cert() {
     load_domain_state
     save_domain_config
 
-    # ── 为所有新域名申请证书 ────────────────────────────────
-    for domain in "${new_domains[@]}"; do
-        local root_domain
-        root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-        log_info "申请证书: *.${root_domain}"
+    # 域名/账号配置已落盘 → 提交事务
+    # 证书申请失败不应回滚已配置的域名（可后续单独重申）
+    cert_txn_commit
 
-        local _ini_base
-        _ini_base=$(domain_to_ini_name "$root_domain")
-        local ini_file="${CF_CONFIG_DIR}/domain_${_ini_base}.ini"
-        local certbot_output certbot_rc
-
-        if [[ -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
-            log_info "证书已存在，跳过申请: *.${root_domain}"
-            continue
-        fi
-
-        if certbot_output=$(certbot certonly \
-            --dns-cloudflare \
-            --dns-cloudflare-credentials "$ini_file" \
-            --dns-cloudflare-propagation-seconds 30 \
-            -d "${root_domain}" \
-            -d "*.${root_domain}" \
-            --email "admin@${root_domain}" \
-            --agree-tos \
-            --non-interactive \
-            --expand 2>&1); then
-            certbot_rc=0
-        else
-            certbot_rc=$?
-        fi
-
-        if [[ $certbot_rc -eq 0 && -f "/etc/letsencrypt/live/${root_domain}/fullchain.pem" ]]; then
-            log_info "证书申请成功: *.${root_domain}"
-        else
-            log_error "证书申请失败（退出码: ${certbot_rc}）"
-            while IFS= read -r line; do echo "  $line"; done <<< "$certbot_output"
-            log_warn "请检查域名 DNS 解析和 CF API Token 权限"
-        fi
-    done
+    # ── 为所有新域名申请证书（复用 request_certificates，含重试/限流检测/状态跟踪）──
+    if [[ ${#new_domains[@]} -gt 0 ]]; then
+        local _saved_all=("${ALL_DOMAINS[@]}")
+        local _root _seen_roots=()
+        ALL_DOMAINS=()
+        for domain in "${new_domains[@]}"; do
+            _root=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+            [[ " ${_seen_roots[*]} " != *" ${_root} "* ]] && ALL_DOMAINS+=("$_root") && _seen_roots+=("$_root")
+        done
+        request_certificates
+        ALL_DOMAINS=("${_saved_all[@]}")
+    fi
 
     # 自动配置续期
     setup_auto_renew
@@ -1331,15 +2169,78 @@ refresh_domain_assignments() {
         [[ -n "$protocols" ]] && register_domain "$domain" "$mode" "$protocols"
     done
 
-    [[ -n "${XHTTP_DOMAIN:-}" ]] && register_domain "$XHTTP_DOMAIN" "cdn" "xray"
-    [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]] && register_domain "$GRPC_DOMAIN" "cdn" "xray"
-    [[ -n "${REALITY_DOMAIN:-}" ]] && register_domain "$REALITY_DOMAIN" "direct" "xray"
+    [[ -n "${XHTTP_DOMAIN:-}" ]] && register_domain "$XHTTP_DOMAIN" "cdn" "xray-xhttp"
+    [[ -n "${GRPC_DOMAIN:-}" ]] && register_domain "$GRPC_DOMAIN" "cdn" "xray-grpc"
+    [[ -n "${REALITY_DOMAIN:-}" ]] && register_domain "$REALITY_DOMAIN" "direct" "xray-reality"
     [[ -n "${ANYTLS_DOMAIN:-}" ]] && register_domain "$ANYTLS_DOMAIN" "direct" "singbox"
     [[ -n "${NAIVE_DOMAIN:-}" ]] && register_domain "$NAIVE_DOMAIN" "direct" "naiveproxy"
     [[ -n "${HYSTERIA2_DOMAIN:-}" ]] && register_domain "$HYSTERIA2_DOMAIN" "direct" "hysteria2"
 
     rebuild_protocol_domains
     load_domain_state
+
+    # ── XHTTP/gRPC 合并检测：两槽位落到同一域名时引导用户分离 ──
+    if [[ -n "${XHTTP_DOMAIN:-}" && "${XHTTP_DOMAIN}" == "${GRPC_DOMAIN:-}" ]]; then
+        local _reg _d _sfx _m
+        _reg=$(get_state "DOMAIN_REGISTRY")
+        local -a _other_cdn=()
+        for _d in $_reg; do
+            [[ "$_d" == "$XHTTP_DOMAIN" ]] && continue
+            _sfx=$(echo "$_d" | tr '.' '_')
+            _m=$(get_state "DOMAIN_MODE_${_sfx}" "direct")
+            [[ "$_m" == "cdn" ]] && _other_cdn+=("$_d")
+        done
+
+        if [[ ${#_other_cdn[@]} -gt 0 ]]; then
+            echo ""
+            log_warn "xhttp 和 gRPC 均解析到同一域名: ${XHTTP_DOMAIN}"
+            log_warn "注册表中存在其他 CDN 候选域名: ${_other_cdn[*]}"
+            echo "  建议将两个协议分配到不同域名。"
+            echo ""
+            local _split_yn
+            read -rp "  是否重新分配 xhttp/gRPC 到不同域名？[y/N]: " _split_yn
+            if [[ "${_split_yn,,}" == "y" ]]; then
+                echo ""
+                echo "  请选择要从 ${XHTTP_DOMAIN} 分离出去的协议："
+                echo "    1) ${XHTTP_DOMAIN} 保留 xhttp，gRPC 分给候选域名"
+                echo "    2) ${XHTTP_DOMAIN} 保留 gRPC，xhttp 分给候选域名"
+                local _proto_choice
+                read -rp "  请选择 [1/2]: " _proto_choice
+                local _keep_tag _move_tag
+                case "$_proto_choice" in
+                    1) _keep_tag="xray-xhttp"; _move_tag="xray-grpc" ;;
+                    2) _keep_tag="xray-grpc";  _move_tag="xray-xhttp" ;;
+                    *) log_warn "无效选择，跳过重新分配"; _proto_choice="" ;;
+                esac
+
+                if [[ -n "$_proto_choice" ]]; then
+                    echo ""
+                    echo "  将 ${_move_tag} 分配给哪个域名？"
+                    local _ci=1
+                    for _d in "${_other_cdn[@]}"; do echo "    ${_ci}) ${_d}"; ((_ci++)); done
+                    local _cand_choice
+                    read -rp "  请选择 [1-${#_other_cdn[@]}]: " _cand_choice
+                    local _target="${_other_cdn[$((_cand_choice-1))]:-}"
+
+                    if [[ -n "$_target" ]]; then
+                        local _msuffix _tsuffix
+                        _msuffix=$(echo "$XHTTP_DOMAIN" | tr '.' '_')
+                        _tsuffix=$(echo "$_target"      | tr '.' '_')
+                        save_state "DOMAIN_PROTO_${_msuffix}" "$_keep_tag"
+                        save_state "DOMAIN_PROTO_${_tsuffix}" "$_move_tag"
+                        save_state "DOMAIN_PRIMARY_XRAY_XHTTP" ""
+                        save_state "DOMAIN_PRIMARY_XRAY_GRPC"  ""
+                        log_info "已更新: ${XHTTP_DOMAIN} → ${_keep_tag}"
+                        log_info "已更新: ${_target} → ${_move_tag}"
+                        rebuild_protocol_domains
+                        load_domain_state
+                    else
+                        log_warn "无效选择，跳过重新分配"
+                    fi
+                fi
+            fi
+        fi
+    fi
 
     if [[ -z "${HYSTERIA2_DOMAIN:-}" ]]; then
         local registry

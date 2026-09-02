@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Journal of Distributed Systems Research</title>
+  <!-- self-contained: system font stack, no external dependency -->
+  <style>
+    :root {
+      --ink: #1a1a1a;
+      --ink-light: #4a4a4a;
+      --ink-faint: #8a8a8a;
+      --paper: #f7f4ef;
+      --paper-dark: #ede9e2;
+      --accent: #8b1a1a;
+      --accent-light: #c0392b;
+      --border: #d0c8bc;
+      --mono: 'Courier New', Courier, monospace;
+      --serif: Georgia, 'Palatino Linotype', Georgia, serif;
+      --sans: system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      background: var(--paper);
+      color: var(--ink);
+      font-family: var(--serif);
+      font-size: 17px;
+      line-height: 1.75;
+      min-height: 100vh;
+    }
+
+    /* ── HEADER ── */
+    .site-header {
+      background: var(--ink);
+      color: var(--paper);
+      padding: 0;
+      border-bottom: 3px solid var(--accent);
+    }
+
+    .header-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 18px 60px;
+      border-bottom: 1px solid rgba(255,255,255,0.1);
+    }
+
+    .journal-name {
+      font-family: var(--serif);
+      font-size: 13px;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: rgba(247,244,239,0.6);
+      font-style: italic;
+    }
+
+    .header-meta {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: rgba(247,244,239,0.45);
+      letter-spacing: 0.05em;
+    }
+
+    .header-main {
+      padding: 36px 60px 30px;
+    }
+
+    .header-main h1 {
+      font-family: var(--serif);
+      font-size: 2.2rem;
+      font-weight: 500;
+      letter-spacing: -0.01em;
+      line-height: 1.2;
+      color: var(--paper);
+      margin-bottom: 8px;
+    }
+
+    .header-main h1 em {
+      color: #c9a96e;
+      font-style: italic;
+    }
+
+    .header-subtitle {
+      font-family: var(--sans);
+      font-size: 13px;
+      color: rgba(247,244,239,0.5);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    /* ── NAV ── */
+    nav {
+      background: var(--paper-dark);
+      border-bottom: 1px solid var(--border);
+      padding: 0 60px;
+      display: flex;
+      gap: 0;
+      overflow-x: auto;
+    }
+
+    nav a {
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--ink-light);
+      text-decoration: none;
+      padding: 14px 20px;
+      border-bottom: 2px solid transparent;
+      white-space: nowrap;
+      transition: all 0.2s;
+    }
+
+    nav a:hover { color: var(--accent); border-bottom-color: var(--accent); }
+    nav a.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+    /* ── LAYOUT ── */
+    .page {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 50px 60px;
+      display: grid;
+      grid-template-columns: 1fr 300px;
+      gap: 60px;
+    }
+
+    /* ── FEATURED ARTICLE ── */
+    .featured {
+      border: 1px solid var(--border);
+      background: white;
+      padding: 40px;
+      margin-bottom: 40px;
+      position: relative;
+    }
+
+    .featured::before {
+      content: 'FEATURED ARTICLE';
+      position: absolute;
+      top: -1px;
+      left: -1px;
+      background: var(--accent);
+      color: white;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      padding: 4px 10px;
+    }
+
+    .article-meta {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--ink-faint);
+      letter-spacing: 0.05em;
+      margin-bottom: 14px;
+      display: flex;
+      gap: 20px;
+      flex-wrap: wrap;
+    }
+
+    .article-meta span { display: flex; align-items: center; gap: 5px; }
+
+    .doi {
+      color: var(--accent);
+      font-family: var(--mono);
+      font-size: 11px;
+    }
+
+    .featured h2 {
+      font-family: var(--serif);
+      font-size: 1.65rem;
+      font-weight: 500;
+      line-height: 1.25;
+      margin-bottom: 10px;
+      color: var(--ink);
+    }
+
+    .authors {
+      font-family: var(--sans);
+      font-size: 14px;
+      color: var(--ink-light);
+      margin-bottom: 18px;
+    }
+
+    .authors span { color: var(--accent); font-weight: 600; }
+
+    .abstract-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--ink-faint);
+      margin-bottom: 8px;
+    }
+
+    .abstract {
+      font-size: 15.5px;
+      line-height: 1.7;
+      color: var(--ink-light);
+      border-left: 3px solid var(--border);
+      padding-left: 20px;
+      font-style: italic;
+    }
+
+    .keywords {
+      margin-top: 18px;
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      align-items: center;
+    }
+
+    .keywords-label {
+      font-family: var(--mono);
+      font-size: 10px;
+      color: var(--ink-faint);
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+    }
+
+    .kw {
+      font-family: var(--mono);
+      font-size: 11px;
+      background: var(--paper-dark);
+      border: 1px solid var(--border);
+      padding: 2px 8px;
+      color: var(--ink-light);
+    }
+
+    .read-more {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 22px;
+      font-family: var(--sans);
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--accent);
+      text-decoration: none;
+      border-bottom: 1px solid var(--accent);
+      padding-bottom: 2px;
+      transition: gap 0.2s;
+    }
+    .read-more:hover { gap: 12px; }
+
+    /* ── ARTICLE LIST ── */
+    .section-header {
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
+      margin-bottom: 24px;
+      padding-bottom: 12px;
+      border-bottom: 2px solid var(--ink);
+    }
+
+    .section-header h3 {
+      font-family: var(--serif);
+      font-size: 1.3rem;
+      font-weight: 500;
+    }
+
+    .section-header .count {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--ink-faint);
+    }
+
+    .article-item {
+      padding: 22px 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .article-item:last-child { border-bottom: none; }
+
+    .article-item .article-meta { margin-bottom: 8px; }
+
+    .article-item h4 {
+      font-family: var(--serif);
+      font-size: 1.1rem;
+      font-weight: 500;
+      line-height: 1.3;
+      margin-bottom: 6px;
+      color: var(--ink);
+    }
+
+    .article-item h4 a {
+      color: inherit;
+      text-decoration: none;
+      border-bottom: 1px solid transparent;
+      transition: border-color 0.2s;
+    }
+
+    .article-item h4 a:hover { border-bottom-color: var(--accent); color: var(--accent); }
+
+    .article-item .snippet {
+      font-size: 14.5px;
+      color: var(--ink-faint);
+      line-height: 1.6;
+    }
+
+    /* ── SIDEBAR ── */
+    .sidebar { }
+
+    .sidebar-box {
+      border: 1px solid var(--border);
+      margin-bottom: 28px;
+      background: white;
+    }
+
+    .sidebar-box-header {
+      background: var(--ink);
+      color: var(--paper);
+      padding: 10px 16px;
+      font-family: var(--mono);
+      font-size: 10px;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+    }
+
+    .sidebar-box-body { padding: 18px; }
+
+    .stat-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 14px;
+    }
+
+    .stat {
+      text-align: center;
+      padding: 12px 8px;
+      background: var(--paper);
+      border: 1px solid var(--border);
+    }
+
+    .stat-num {
+      font-family: var(--serif);
+      font-size: 1.6rem;
+      color: var(--accent);
+      display: block;
+      line-height: 1;
+      margin-bottom: 4px;
+    }
+
+    .stat-label {
+      font-family: var(--mono);
+      font-size: 9px;
+      color: var(--ink-faint);
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+    }
+
+    .topic-list { list-style: none; }
+
+    .topic-list li {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px 0;
+      border-bottom: 1px solid var(--paper-dark);
+      font-size: 14px;
+    }
+
+    .topic-list li:last-child { border-bottom: none; }
+
+    .topic-list a {
+      color: var(--ink-light);
+      text-decoration: none;
+      font-family: var(--sans);
+    }
+
+    .topic-list a:hover { color: var(--accent); }
+
+    .topic-count {
+      font-family: var(--mono);
+      font-size: 11px;
+      color: var(--ink-faint);
+      background: var(--paper);
+      padding: 1px 6px;
+      border: 1px solid var(--border);
+    }
+
+    .notice-box {
+      background: #fdf8f0;
+      border: 1px solid #e8d5a3;
+      padding: 14px 16px;
+      font-family: var(--sans);
+      font-size: 13px;
+      line-height: 1.6;
+      color: #5a4a2a;
+    }
+
+    .notice-box strong {
+      display: block;
+      font-size: 11px;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+      color: #8b6914;
+      font-family: var(--mono);
+    }
+
+    /* ── FOOTER ── */
+    footer {
+      background: var(--ink);
+      color: rgba(247,244,239,0.45);
+      padding: 30px 60px;
+      margin-top: 40px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      font-family: var(--mono);
+      font-size: 11px;
+      letter-spacing: 0.04em;
+    }
+
+    footer a { color: rgba(247,244,239,0.45); text-decoration: none; }
+    footer a:hover { color: var(--paper); }
+
+    .footer-links { display: flex; gap: 24px; }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 860px) {
+      .page { grid-template-columns: 1fr; padding: 30px 24px; }
+      .header-top, .header-main, nav, footer { padding-left: 24px; padding-right: 24px; }
+      .header-main h1 { font-size: 1.6rem; }
+    }
+
+    /* ── SUBTLE ANIMATION ── */
+    .featured, .article-item, .sidebar-box {
+      animation: fadeUp 0.5s ease both;
+    }
+    .article-item:nth-child(2) { animation-delay: 0.05s; }
+    .article-item:nth-child(3) { animation-delay: 0.1s; }
+    .article-item:nth-child(4) { animation-delay: 0.15s; }
+
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(12px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+  </style>
+</head>
+<body>
+
+<header class="site-header">
+  <div class="header-top">
+    <span class="journal-name">International Journal of Distributed Systems &amp; Network Research</span>
+    <span class="header-meta">ISSN 2398-7714 &nbsp;|&nbsp; Vol. 12, No. 2, 2025</span>
+  </div>
+  <div class="header-main">
+    <h1>Distributed Systems &amp; <em>Network Research</em></h1>
+    <p class="header-subtitle">Peer-Reviewed Open Access · Published Quarterly</p>
+  </div>
+</header>
+
+<nav>
+  <a href="#" class="active">Current Issue</a>
+  <a href="#">Archive</a>
+  <a href="#">Submit Paper</a>
+  <a href="#">Editorial Board</a>
+  <a href="#">For Reviewers</a>
+  <a href="#">About</a>
+</nav>
+
+<div class="page">
+  <main>
+    <!-- Featured -->
+    <div class="featured">
+      <div class="article-meta">
+        <span>Research Article</span>
+        <span class="doi">DOI: 10.47832/ijdsnr.2025.04.001</span>
+        <span>Received: 14 Jan 2025 &nbsp;·&nbsp; Accepted: 03 Mar 2025</span>
+      </div>
+      <h2>Latency-Optimal Routing in Heterogeneous Wide-Area Networks: A Formal Analysis</h2>
+      <p class="authors">
+        <span>M. Kovalenko</span>, A. Shen, R. Krishnamurthy, <span>L. Fontaine</span>
+        &nbsp;—&nbsp; ETH Zürich · Stanford NSEL · INRIA Rennes
+      </p>
+      <p class="abstract-label">Abstract</p>
+      <p class="abstract">
+        We present a formal framework for characterizing latency-optimal routing policies in
+        heterogeneous wide-area networks where link capacities, propagation delays, and traffic
+        demands are subject to stochastic variation. Building on a fluid-flow model augmented
+        with bounded delay distributions, we derive closed-form bounds for end-to-end latency
+        under both FIFO and work-conserving disciplines. Our analysis reveals a previously
+        unexplored trade-off between path diversity and queuing stability that has practical
+        implications for content-delivery and overlay-network design.
+      </p>
+      <div class="keywords">
+        <span class="keywords-label">Keywords:</span>
+        <span class="kw">WAN routing</span>
+        <span class="kw">queuing theory</span>
+        <span class="kw">overlay networks</span>
+        <span class="kw">stochastic delay</span>
+        <span class="kw">path diversity</span>
+      </div>
+      <a href="#" class="read-more">Read Full Paper →</a>
+    </div>
+
+    <!-- Article list -->
+    <div class="section-header">
+      <h3>Articles in This Issue</h3>
+      <span class="count">12 papers</span>
+    </div>
+
+    <div class="article-item">
+      <div class="article-meta">
+        <span>Research Article</span>
+        <span class="doi">DOI: 10.47832/ijdsnr.2025.04.002</span>
+      </div>
+      <h4><a href="#">Consensus Under Churn: Byzantine Fault Tolerance with Dynamic Membership in Permissionless Networks</a></h4>
+      <p class="authors" style="font-size:13px;margin-bottom:6px;">P. Dziedzic, Y. Tanaka · Warsaw University of Technology</p>
+      <p class="snippet">We extend classical BFT protocols to accommodate rapid node joins and departures, proving liveness and safety under a generalized churn model with up to f = ⌊(n−1)/3⌋ Byzantine participants...</p>
+    </div>
+
+    <div class="article-item">
+      <div class="article-meta">
+        <span>Survey</span>
+        <span class="doi">DOI: 10.47832/ijdsnr.2025.04.003</span>
+      </div>
+      <h4><a href="#">A Taxonomy of Congestion Control Algorithms for High-Bandwidth Satellite Links</a></h4>
+      <p class="authors" style="font-size:13px;margin-bottom:6px;">C. Abramowitz, S. Nair, F. Müller · MIT CSAIL · TU Berlin</p>
+      <p class="snippet">Satellite internet links present unique challenges—high latency, asymmetric bandwidth, and intermittent connectivity—that expose limitations in TCP's congestion control assumptions. This survey categorises 34 algorithms proposed between 2010 and 2024...</p>
+    </div>
+
+    <div class="article-item">
+      <div class="article-meta">
+        <span>Short Communication</span>
+        <span class="doi">DOI: 10.47832/ijdsnr.2025.04.007</span>
+      </div>
+      <h4><a href="#">Empirical Evaluation of HTTP/3 Stream Multiplexing Under Lossy Conditions</a></h4>
+      <p class="authors" style="font-size:13px;margin-bottom:6px;">H. Bergström, A. Okonkwo · KTH Royal Institute of Technology</p>
+      <p class="snippet">Using a controlled emulation environment across 18 network profiles, we measure head-of-line blocking elimination gains afforded by QUIC stream isolation compared with HTTP/2 under packet-loss rates of 0.1–5%...</p>
+    </div>
+
+    <div class="article-item">
+      <div class="article-meta">
+        <span>Research Article</span>
+        <span class="doi">DOI: 10.47832/ijdsnr.2025.04.009</span>
+      </div>
+      <h4><a href="#">Cache Coherence Protocols for Geo-Distributed Key-Value Stores with Tunable Consistency</a></h4>
+      <p class="authors" style="font-size:13px;margin-bottom:6px;">R. Patel, D. Ivanova, K. Lim · UC Berkeley · EPFL</p>
+      <p class="snippet">We propose AdaptCC, a cache coherence protocol that dynamically adjusts consistency guarantees from linearizability to eventual consistency based on real-time replication lag, demonstrating 2.4× throughput improvement...</p>
+    </div>
+  </main>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="sidebar-box">
+      <div class="sidebar-box-header">Journal Metrics · 2024</div>
+      <div class="sidebar-box-body">
+        <div class="stat-grid">
+          <div class="stat">
+            <span class="stat-num">3.84</span>
+            <span class="stat-label">Impact Factor</span>
+          </div>
+          <div class="stat">
+            <span class="stat-num">91</span>
+            <span class="stat-label">H-Index</span>
+          </div>
+          <div class="stat">
+            <span class="stat-num">18%</span>
+            <span class="stat-label">Accept Rate</span>
+          </div>
+          <div class="stat">
+            <span class="stat-num">47d</span>
+            <span class="stat-label">Median Review</span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-box">
+      <div class="sidebar-box-header">Browse by Topic</div>
+      <div class="sidebar-box-body">
+        <ul class="topic-list">
+          <li><a href="#">Network Protocols</a> <span class="topic-count">84</span></li>
+          <li><a href="#">Distributed Consensus</a> <span class="topic-count">62</span></li>
+          <li><a href="#">Cloud Infrastructure</a> <span class="topic-count">58</span></li>
+          <li><a href="#">Security &amp; Privacy</a> <span class="topic-count">51</span></li>
+          <li><a href="#">Edge Computing</a> <span class="topic-count">39</span></li>
+          <li><a href="#">Wireless Systems</a> <span class="topic-count">34</span></li>
+          <li><a href="#">Performance Modelling</a> <span class="topic-count">29</span></li>
+        </ul>
+      </div>
+    </div>
+
+    <div class="sidebar-box">
+      <div class="sidebar-box-header">Call for Papers</div>
+      <div class="sidebar-box-body">
+        <div class="notice-box">
+          <strong>Special Issue · Deadline 30 Jun 2025</strong>
+          <em>Resilient Networking in Adversarial Environments</em> — submissions open for full papers and extended abstracts. Topics include protocol robustness, traffic analysis resistance, and infrastructure hardening.
+        </div>
+      </div>
+    </div>
+
+    <div class="sidebar-box">
+      <div class="sidebar-box-header">Indexed In</div>
+      <div class="sidebar-box-body" style="font-family:var(--mono);font-size:11px;color:var(--ink-faint);line-height:2.2;letter-spacing:0.04em;">
+        Scopus &nbsp;·&nbsp; Web of Science<br>
+        IEEE Xplore &nbsp;·&nbsp; DBLP<br>
+        DOAJ &nbsp;·&nbsp; Google Scholar<br>
+        Semantic Scholar &nbsp;·&nbsp; EI Compendex
+      </div>
+    </div>
+  </aside>
+</div>
+
+<footer>
+  <span>© 2025 IJDSNR — Open Access under CC BY 4.0</span>
+  <div class="footer-links">
+    <a href="#">Privacy</a>
+    <a href="#">Terms</a>
+    <a href="#">Contact</a>
+    <a href="#">RSS</a>
+    <a href="#">Sitemap</a>
+  </div>
+</footer>
+
+</body>
+</html>

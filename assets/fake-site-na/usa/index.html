@@ -1,0 +1,575 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Stillwater — Slow Living &amp; Mindful Travel</title>
+  <style>
+    :root {
+      --mist: #e8ede8;
+      --moss: #5a6b55;
+      --stone: #8a8a7a;
+      --linen: #f4f1ec;
+      --bark: #3d3530;
+      --water: #a8bfbb;
+      --petal: #c8b8a8;
+      --light-moss: #d4ddd0;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      background: var(--linen);
+      color: var(--bark);
+      font-family: system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+      font-weight: 300;
+      overflow-x: hidden;
+    }
+
+    /* ── NAV ── */
+    .nav {
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 22px 60px;
+      background: rgba(244,241,236,0.88);
+      backdrop-filter: blur(12px);
+      border-bottom: 1px solid rgba(90,107,85,0.12);
+      transition: padding 0.3s;
+    }
+
+    .nav-logo {
+      font-family: Georgia, 'Palatino Linotype', serif;
+      font-size: 1.6rem;
+      font-style: italic;
+      color: var(--moss);
+      text-decoration: none;
+      letter-spacing: 0.04em;
+    }
+
+    .nav-links {
+      display: flex;
+      gap: 36px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--stone);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+    .nav-links a:hover { color: var(--moss); }
+
+    /* ── HERO ── */
+    .hero {
+      min-height: 100vh;
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      padding-top: 80px;
+    }
+
+    .hero-left {
+      display: flex;
+      flex-direction: column;
+      justify-content: center;
+      padding: 80px 70px 80px 60px;
+    }
+
+    .hero-eyebrow {
+      font-size: 11px;
+      font-weight: 500;
+      letter-spacing: 0.22em;
+      text-transform: uppercase;
+      color: var(--moss);
+      margin-bottom: 28px;
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .hero-eyebrow::before {
+      content: '';
+      width: 30px; height: 1px;
+      background: var(--moss);
+    }
+
+    .hero h1 {
+      font-family: Georgia, 'Palatino Linotype', serif;
+      font-size: clamp(3rem, 5vw, 4.8rem);
+      font-weight: 300;
+      line-height: 1.1;
+      color: var(--bark);
+      margin-bottom: 28px;
+    }
+    .hero h1 em { font-style: italic; color: var(--moss); }
+
+    .hero-desc {
+      font-size: 15px;
+      line-height: 1.85;
+      color: var(--stone);
+      max-width: 380px;
+      margin-bottom: 44px;
+    }
+
+    .cta-group { display: flex; gap: 20px; align-items: center; }
+
+    .primary-btn {
+      background: var(--moss);
+      color: var(--linen);
+      font-family: system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      padding: 15px 30px;
+      text-decoration: none;
+      transition: background 0.25s;
+    }
+    .primary-btn:hover { background: var(--bark); }
+
+    .text-link {
+      font-size: 13px;
+      color: var(--stone);
+      text-decoration: none;
+      border-bottom: 1px solid currentColor;
+      padding-bottom: 1px;
+      letter-spacing: 0.04em;
+      transition: color 0.2s;
+    }
+    .text-link:hover { color: var(--moss); }
+
+    .hero-right {
+      position: relative;
+      overflow: hidden;
+      min-height: 500px;
+    }
+
+    /* gradient replaces hero photograph */
+    .hero-img-main {
+      width: 100%;
+      height: 100%;
+      display: block;
+      background: linear-gradient(160deg, #2d3d2a 0%, #3d5a38 35%, #5a7a52 68%, #7a9a72 100%);
+    }
+
+    .hero-float-card {
+      position: absolute;
+      bottom: 50px; left: -30px;
+      background: white;
+      padding: 20px 24px;
+      box-shadow: 0 8px 40px rgba(61,53,48,0.12);
+      max-width: 220px;
+    }
+    .float-label {
+      font-size: 10px; font-weight: 500;
+      letter-spacing: 0.18em; text-transform: uppercase;
+      color: var(--moss); margin-bottom: 8px;
+    }
+    .float-quote {
+      font-family: Georgia, serif;
+      font-size: 1.1rem; font-style: italic;
+      line-height: 1.5; color: var(--bark);
+    }
+
+    /* ── INTRO STRIP ── */
+    .intro-strip {
+      background: var(--mist);
+      padding: 60px;
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1px;
+      background-color: var(--light-moss);
+    }
+    .intro-item { background: var(--mist); padding: 44px 40px; text-align: center; }
+    .intro-icon { font-size: 1.8rem; margin-bottom: 14px; display: block; }
+    .intro-item h3 {
+      font-family: Georgia, 'Palatino Linotype', serif;
+      font-size: 1.35rem; font-weight: 400; margin-bottom: 10px;
+    }
+    .intro-item p { font-size: 13.5px; line-height: 1.7; color: var(--stone); }
+
+    /* ── JOURNAL ── */
+    .journal { padding: 100px 60px; }
+
+    .section-head {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-end;
+      margin-bottom: 50px;
+    }
+    .section-head h2 {
+      font-family: Georgia, 'Palatino Linotype', serif;
+      font-size: 2.8rem; font-weight: 300; line-height: 1.1;
+    }
+    .section-head h2 em { font-style: italic; color: var(--moss); }
+
+    .journal-grid {
+      display: grid;
+      grid-template-columns: 1.4fr 1fr 1fr;
+      gap: 24px;
+    }
+    .journal-card { cursor: pointer; }
+
+    /* gradient replaces journal photographs */
+    .journal-img {
+      width: 100%;
+      aspect-ratio: 4/3;
+      display: block;
+      background-size: cover;
+      background-position: center;
+      filter: saturate(0.82);
+      transition: filter 0.4s;
+    }
+    .journal-card:hover .journal-img { filter: saturate(1); }
+
+    .journal-card-body { padding: 20px 0 0; }
+    .jcard-tag {
+      font-size: 10px; font-weight: 500;
+      letter-spacing: 0.18em; text-transform: uppercase;
+      color: var(--moss); margin-bottom: 8px; display: block;
+    }
+    .journal-card h3 {
+      font-family: Georgia, 'Palatino Linotype', serif;
+      font-size: 1.25rem; font-weight: 400;
+      line-height: 1.3; margin-bottom: 8px; color: var(--bark);
+    }
+    .journal-card p { font-size: 13.5px; line-height: 1.65; color: var(--stone); }
+    .journal-card .read {
+      display: inline-block; margin-top: 14px;
+      font-size: 12px; font-weight: 500; letter-spacing: 0.08em;
+      color: var(--moss); text-decoration: none;
+      border-bottom: 1px solid var(--moss); padding-bottom: 1px;
+    }
+
+    /* ── QUOTE SECTION ── */
+    .quote-section {
+      background: var(--bark);
+      padding: 100px 60px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+    .quote-section::before {
+      content: '\201C';
+      position: absolute; top: -40px; left: 50%;
+      transform: translateX(-50%);
+      font-family: Georgia, serif;
+      font-size: 20rem; color: rgba(255,255,255,0.03);
+      line-height: 1; pointer-events: none;
+    }
+    .quote-section blockquote {
+      font-family: Georgia, 'Palatino Linotype', serif;
+      font-size: clamp(1.6rem, 3vw, 2.6rem);
+      font-style: italic; font-weight: 300;
+      color: var(--linen); line-height: 1.45;
+      max-width: 760px; margin: 0 auto 24px;
+    }
+    .quote-attr {
+      font-size: 12px; font-weight: 500;
+      letter-spacing: 0.18em; text-transform: uppercase;
+      color: var(--moss);
+    }
+
+    /* ── PLACES ── */
+    .places { padding: 100px 60px; background: var(--mist); }
+    .places-grid {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 16px; margin-top: 50px;
+    }
+    .place-card {
+      position: relative; overflow: hidden;
+      aspect-ratio: 3/4;
+    }
+    /* gradient image layer, positioned absolutely to enable transform zoom */
+    .place-img {
+      position: absolute; inset: 0;
+      background-size: cover; background-position: center;
+      filter: saturate(0.75);
+      transition: transform 0.5s, filter 0.4s;
+    }
+    .place-card:hover .place-img { transform: scale(1.05); filter: saturate(1); }
+    .place-overlay {
+      position: absolute; bottom: 0; left: 0; right: 0;
+      background: linear-gradient(to top, rgba(61,53,48,0.85), transparent);
+      padding: 24px 20px 20px;
+      color: var(--linen);
+    }
+    .place-num {
+      font-size: 10px; letter-spacing: 0.2em;
+      color: var(--petal); margin-bottom: 4px; font-weight: 500;
+    }
+    .place-name {
+      font-family: Georgia, 'Palatino Linotype', serif;
+      font-size: 1.2rem; font-weight: 300; font-style: italic;
+    }
+
+    /* ── NEWSLETTER ── */
+    .newsletter {
+      padding: 80px 60px;
+      display: grid; grid-template-columns: 1fr 1fr;
+      gap: 80px; align-items: center;
+    }
+    .newsletter h2 {
+      font-family: Georgia, 'Palatino Linotype', serif;
+      font-size: 2.4rem; font-weight: 300;
+      line-height: 1.2; margin-bottom: 14px;
+    }
+    .newsletter h2 em { font-style: italic; color: var(--moss); }
+    .newsletter p { font-size: 14px; line-height: 1.75; color: var(--stone); }
+    .form-row { display: flex; gap: 0; }
+    .form-row input {
+      flex: 1; padding: 16px 20px;
+      border: 1px solid var(--light-moss);
+      background: white;
+      font-family: system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+      font-size: 14px; color: var(--bark); outline: none;
+    }
+    .form-row input::placeholder { color: var(--stone); }
+    .form-row input:focus { border-color: var(--moss); }
+    .form-row button {
+      background: var(--moss); color: var(--linen);
+      border: none; padding: 16px 28px;
+      font-family: system-ui, -apple-system, 'Segoe UI', Arial, sans-serif;
+      font-size: 12px; font-weight: 500;
+      letter-spacing: 0.1em; text-transform: uppercase;
+      cursor: pointer; transition: background 0.2s;
+    }
+    .form-row button:hover { background: var(--bark); }
+    .form-note { font-size: 11px; color: var(--stone); margin-top: 12px; letter-spacing: 0.04em; }
+
+    /* ── FOOTER ── */
+    footer {
+      background: var(--bark);
+      color: rgba(244,241,236,0.4);
+      padding: 40px 60px;
+      display: flex; justify-content: space-between;
+      align-items: center; flex-wrap: wrap; gap: 16px;
+    }
+    .footer-logo {
+      font-family: Georgia, serif;
+      font-size: 1.4rem; font-style: italic;
+      color: var(--moss); text-decoration: none;
+    }
+    .footer-links { display: flex; gap: 28px; }
+    .footer-links a {
+      font-size: 11px; letter-spacing: 0.1em;
+      color: rgba(244,241,236,0.35); text-decoration: none;
+      text-transform: uppercase; transition: color 0.2s;
+    }
+    .footer-links a:hover { color: var(--linen); }
+    footer p { font-size: 11px; letter-spacing: 0.05em; }
+
+    /* ── RESPONSIVE ── */
+    @media (max-width: 900px) {
+      .nav { padding: 18px 24px; }
+      .nav-links { display: none; }
+      .hero { grid-template-columns: 1fr; }
+      .hero-right { min-height: 340px; }
+      .hero-left { padding: 60px 24px; }
+      .intro-strip, .journal, .places, .newsletter,
+      .quote-section, footer { padding-left: 24px; padding-right: 24px; }
+      .intro-strip { grid-template-columns: 1fr; padding: 0; }
+      .journal-grid { grid-template-columns: 1fr; }
+      .places-grid { grid-template-columns: 1fr 1fr; }
+      .newsletter { grid-template-columns: 1fr; gap: 30px; }
+      .section-head { flex-direction: column; align-items: flex-start; gap: 16px; }
+    }
+    @media (max-width: 480px) {
+      .places-grid { grid-template-columns: 1fr; }
+      .form-row { flex-direction: column; }
+      .form-row button { width: 100%; }
+      .hero h1 { font-size: 2.4rem; }
+    }
+
+    /* ── ANIMATIONS ── */
+    @keyframes slideUp {
+      from { opacity: 0; transform: translateY(24px); }
+      to   { opacity: 1; transform: translateY(0); }
+    }
+    .hero-eyebrow { animation: slideUp 0.6s 0.1s both; }
+    .hero h1      { animation: slideUp 0.6s 0.2s both; }
+    .hero-desc    { animation: slideUp 0.6s 0.3s both; }
+    .cta-group    { animation: slideUp 0.6s 0.4s both; }
+  </style>
+</head>
+<body>
+
+<!-- NAV -->
+<nav class="nav">
+  <a href="#" class="nav-logo">Stillwater</a>
+  <ul class="nav-links">
+    <li><a href="#">Journal</a></li>
+    <li><a href="#">Places</a></li>
+    <li><a href="#">Stories</a></li>
+    <li><a href="#">About</a></li>
+    <li><a href="#">Subscribe</a></li>
+  </ul>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+  <div class="hero-left">
+    <p class="hero-eyebrow">A journal of slow travel</p>
+    <h1>Find peace<br>in the <em>unhurried</em><br>places.</h1>
+    <p class="hero-desc">Stillwater is a guide to the quiet corners of the world &mdash; morning walks, slow meals, landscapes that ask nothing of you except your presence.</p>
+    <div class="cta-group">
+      <a href="#" class="primary-btn">Read the Journal</a>
+      <a href="#" class="text-link">Our story &rarr;</a>
+    </div>
+  </div>
+  <div class="hero-right">
+    <!-- forest landscape gradient, fully offline -->
+    <div class="hero-img-main"></div>
+    <div class="hero-float-card">
+      <p class="float-label">This season</p>
+      <p class="float-quote">&ldquo;The lake at 6am asks you nothing. Just to be there.&rdquo;</p>
+    </div>
+  </div>
+</section>
+
+<!-- INTRO STRIP -->
+<div class="intro-strip">
+  <div class="intro-item">
+    <span class="intro-icon">🌿</span>
+    <h3>Slow Travel</h3>
+    <p>Moving through places without rushing them. Noticing the light at different hours. Staying long enough to forget why you came.</p>
+  </div>
+  <div class="intro-item">
+    <span class="intro-icon">☕</span>
+    <h3>Quiet Mornings</h3>
+    <p>Guides to the best coffee in places that haven&rsquo;t been over-discovered. The caf&eacute; with no Wi-Fi. The window with the good view.</p>
+  </div>
+  <div class="intro-item">
+    <span class="intro-icon">🌄</span>
+    <h3>Honest Places</h3>
+    <p>We write about places we&rsquo;ve actually sat in, slept in, and returned to. No sponsored content. No algorithmic optimism.</p>
+  </div>
+</div>
+
+<!-- JOURNAL -->
+<section class="journal">
+  <div class="section-head">
+    <h2>From the <em>journal</em></h2>
+    <a href="#" class="text-link">View all entries &rarr;</a>
+  </div>
+  <div class="journal-grid">
+    <div class="journal-card">
+      <!-- Norway fjord — muted blue gradient -->
+      <div class="journal-img" style="background:linear-gradient(180deg,#1a3050 0%,#2a5070 50%,#4a7a9a 100%)"></div>
+      <div class="journal-card-body">
+        <span class="jcard-tag">Slow Travel &middot; Norway</span>
+        <h3>Three days on the Hardangerfjord with nowhere particular to be</h3>
+        <p>We rented a small wooden cabin with a sagging porch and a rowboat that leaked slightly. It was the best week in recent memory.</p>
+        <a href="#" class="read">Continue reading &rarr;</a>
+      </div>
+    </div>
+    <div class="journal-card">
+      <!-- Lisbon café — warm terracotta gradient -->
+      <div class="journal-img" style="background:linear-gradient(135deg,#4a3028 0%,#6a4838 50%,#8a6848 100%)"></div>
+      <div class="journal-card-body">
+        <span class="jcard-tag">Morning &middot; Lisbon</span>
+        <h3>The caf&eacute; on Rua do S&eacute;culo that opens at 7 and closes when it feels like it</h3>
+        <p>A gal&atilde;o, a pastel de nata, a window. Some cities know how to make mornings feel earned.</p>
+        <a href="#" class="read">Continue reading &rarr;</a>
+      </div>
+    </div>
+    <div class="journal-card">
+      <!-- Japan cedar forest — deep green gradient -->
+      <div class="journal-img" style="background:linear-gradient(160deg,#1e3028 0%,#2e4838 50%,#4e6858 100%)"></div>
+      <div class="journal-card-body">
+        <span class="jcard-tag">Walking &middot; Japan</span>
+        <h3>The Nakasend&omacr; in October: 500 kilometres of cedar and silence</h3>
+        <p>We walked the old postal road for eleven days. By day four we had stopped checking our phones. By day seven we had forgotten what we were anxious about.</p>
+        <a href="#" class="read">Continue reading &rarr;</a>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- QUOTE -->
+<section class="quote-section">
+  <blockquote>
+    &ldquo;Not all those who wander are lost &mdash; but some of them are just looking for somewhere quiet to drink their coffee.&rdquo;
+  </blockquote>
+  <p class="quote-attr">&mdash; Stillwater, Volume III</p>
+</section>
+
+<!-- PLACES -->
+<section class="places">
+  <div class="section-head">
+    <h2>Places worth <em>lingering</em></h2>
+    <a href="#" class="text-link" style="color:var(--stone);">Full map &rarr;</a>
+  </div>
+  <div class="places-grid">
+    <div class="place-card">
+      <!-- Iceland: arctic blue-black -->
+      <div class="place-img" style="background:linear-gradient(180deg,#0e1828 0%,#1e3858 50%,#3e6888 100%)"></div>
+      <div class="place-overlay">
+        <p class="place-num">01</p>
+        <p class="place-name">Sn&aelig;fellsnes, Iceland</p>
+      </div>
+    </div>
+    <div class="place-card">
+      <!-- Patagonia: deep mountain green -->
+      <div class="place-img" style="background:linear-gradient(135deg,#162016 0%,#2a3a22 50%,#406040 100%)"></div>
+      <div class="place-overlay">
+        <p class="place-num">02</p>
+        <p class="place-name">Patagonia, Chile</p>
+      </div>
+    </div>
+    <div class="place-card">
+      <!-- Kyoto: bamboo/plum gradient -->
+      <div class="place-img" style="background:linear-gradient(160deg,#2a1824 0%,#442834 50%,#6a4854 100%)"></div>
+      <div class="place-overlay">
+        <p class="place-num">03</p>
+        <p class="place-name">Arashiyama, Kyoto</p>
+      </div>
+    </div>
+    <div class="place-card">
+      <!-- Scotland: heather moor grey-purple -->
+      <div class="place-img" style="background:linear-gradient(180deg,#1c1e28 0%,#2c3040 50%,#4c5060 100%)"></div>
+      <div class="place-overlay">
+        <p class="place-num">04</p>
+        <p class="place-name">Isle of Skye, Scotland</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- NEWSLETTER -->
+<section class="newsletter">
+  <div>
+    <h2>Letters from <em>still places</em></h2>
+    <p>A quiet dispatch every two weeks. A place, a morning, a recommendation. Nothing urgent. Nothing to sell you.</p>
+  </div>
+  <div>
+    <div class="form-row">
+      <input type="email" placeholder="your@email.com" />
+      <button type="button">Subscribe</button>
+    </div>
+    <p class="form-note">No noise. Unsubscribe whenever. We mean that.</p>
+  </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+  <a href="#" class="footer-logo">Stillwater</a>
+  <p>&copy; 2025 Stillwater Journal. Made slowly.</p>
+  <div class="footer-links">
+    <a href="#">About</a>
+    <a href="#">Privacy</a>
+    <a href="#">Contact</a>
+    <a href="#">Archive</a>
+  </div>
+</footer>
+
+</body>
+</html>

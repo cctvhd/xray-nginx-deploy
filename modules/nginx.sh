@@ -10,34 +10,33 @@ install_nginx() {
 
     case "$OS_ID" in
         ubuntu|debian)
-            curl -fsSL https://nginx.org/keys/nginx_signing.key | \
-                gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
+            if ! grep -q 'nginx\.org' /etc/apt/sources.list.d/nginx.list 2>/dev/null; then
+                curl -fsSL https://nginx.org/keys/nginx_signing.key | \
+                    gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
 
-            case "$OS_ID" in
-                ubuntu)
-                    echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
-http://nginx.org/packages/ubuntu $(lsb_release -cs) nginx" \
-                        > /etc/apt/sources.list.d/nginx.list
-                    ;;
-                debian)
-                    echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
-http://nginx.org/packages/debian $(lsb_release -cs) nginx" \
-                        > /etc/apt/sources.list.d/nginx.list
-                    ;;
-            esac
+                local codename
+                codename=$(lsb_release -cs)
+                echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
+http://nginx.org/packages/${OS_ID} ${codename} nginx" \
+                    > /etc/apt/sources.list.d/nginx.list
 
-            cat > /etc/apt/preferences.d/99nginx << PREF
+                cat > /etc/apt/preferences.d/99nginx << PREF
 Package: nginx
 Pin: origin nginx.org
 Pin-Priority: 900
 PREF
+                log_info "已添加 nginx 官方 apt 仓库"
+            else
+                log_info "nginx 官方 apt 仓库已存在，跳过"
+            fi
 
             apt-get update -y >/dev/null 2>&1
             apt-get install -y nginx >/dev/null 2>&1
             ;;
 
         centos|rhel|rocky|almalinux)
-            cat > /etc/yum.repos.d/nginx.repo << REPO
+            if [[ ! -f /etc/yum.repos.d/nginx.repo ]]; then
+                cat > /etc/yum.repos.d/nginx.repo << REPO
 [nginx-stable]
 name=nginx stable repo
 baseurl=http://nginx.org/packages/centos/\$releasever/\$basearch/
@@ -54,6 +53,10 @@ enabled=0
 gpgkey=https://nginx.org/keys/nginx_signing.key
 module_hotfixes=true
 REPO
+                log_info "已添加 nginx 官方 yum 仓库"
+            else
+                log_info "nginx 官方 yum 仓库已存在，跳过"
+            fi
 
             dnf install -y nginx >/dev/null 2>&1
             ;;
@@ -88,7 +91,7 @@ create_nginx_dirs() {
         /etc/nginx/conf.d
         /etc/nginx/ssl
         /var/log/nginx
-        /var/www/html
+        /var/www/trap
         /var/cache/nginx
         /etc/nginx/certs
     )
@@ -108,10 +111,11 @@ create_nginx_dirs() {
 
 	# 删除 nginx 官方包自带的默认 server 块，避免与自定义配置冲突
 	rm -f /etc/nginx/conf.d/default.conf
+	rm -f /etc/nginx/sites-enabled/default /etc/nginx/sites-available/default
 log_info "目录结构创建完成"
 }
 
-# ── 生成 20880 陷阱端口自签证书（P3修复：让TLS握手能完成）──
+# ── 生成 8400 陷阱端口自签证书（P3修复：让TLS握手能完成）──
 generate_trap_cert() {
     log_step "生成 SNI 陷阱端口自签证书..."
 
@@ -139,34 +143,272 @@ generate_trap_cert() {
 # ── 生成伪装站页面 ───────────────────────────────────────────
 generate_fake_site() {
     local dir="$1"
-    local title="$2"
+    local _slot="${2:-0}"
 
-    cat > "${dir}/index.html" << HTML
+    local _mod_dir
+    _mod_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+    local _assets="${_mod_dir}/../assets"
+
+    # 已安装部署时 assets 跟随 install.sh 复制到 /etc/xray-deploy/assets/
+    local _assets_installed="/etc/xray-deploy/assets"
+
+    # 只取前缀：na/xxx 和 na 均视为 na
+    local _prefix="${HW_REGION%%/*}"
+
+    local _template=""
+
+    # 北美：按 slot 自动轮换分配不同主题，每个域名外观各异
+    # 顺序固定：已知主题按此优先级排列，新增主题追加到末尾（字母序）
+    if [[ "$_prefix" == "na" ]]; then
+        local -a _known_order=(usa usa1 html)
+        local _na_base=""
+        for _nb in "${_assets}/fake-site-na" "${_assets_installed}/fake-site-na"; do
+            if [[ -d "$_nb" ]]; then _na_base="$_nb"; break; fi
+        done
+
+        # 构建有序列表：先按 _known_order 挑存在的，再追加未知的（字母序）
+        local -a _na_dirs=()
+        local _d
+        for _d in "${_known_order[@]}"; do
+            [[ -f "${_na_base}/${_d}/index.html" ]] && _na_dirs+=("$_d")
+        done
+        if [[ -n "$_na_base" ]]; then
+            while IFS= read -r -d '' _extra; do
+                _extra="$(basename "$_extra")"
+                [[ -f "${_na_base}/${_extra}/index.html" ]] || continue
+                local _known=0
+                for _d in "${_known_order[@]}"; do [[ "$_d" == "$_extra" ]] && _known=1 && break; done
+                [[ $_known -eq 0 ]] && _na_dirs+=("$_extra")
+            done < <(find "$_na_base" -mindepth 1 -maxdepth 1 -type d -print0 | sort -z)
+        fi
+
+        if [[ ${#_na_dirs[@]} -gt 0 ]]; then
+            local _subdir="${_na_dirs[$(( _slot % ${#_na_dirs[@]} ))]}"
+            for _f in \
+                "${_assets}/fake-site-na/${_subdir}/index.html" \
+                "${_assets_installed}/fake-site-na/${_subdir}/index.html"; do
+                if [[ -f "$_f" ]]; then _template="$_f"; break; fi
+            done
+        fi
+
+        if [[ -z "$_template" ]]; then
+            log_warn "generate_fake_site: 未找到本地北美模板，将尝试远程下载"
+        fi
+    fi
+
+    # 欧洲/亚洲/默认：统一用欧洲档案馆主题
+    if [[ -z "$_template" ]]; then
+        for _f in \
+            "${_assets}/fake-site-eu.html" \
+            "${_assets_installed}/fake-site-eu.html" \
+            "/var/www/Example/lietuva-heritage (1).html"; do
+            if [[ -f "$_f" ]]; then _template="$_f"; break; fi
+        done
+    fi
+
+    if [[ -n "$_template" ]]; then
+        install -m 644 "$_template" "${dir}/index.html"
+        log_info "已安装伪装页面: ${dir}/index.html  (来源: $_template)"
+
+        # 若模板目录下有 Music/ 子目录，一并复制（如 usa1 含 MP3 文件）
+        local _tmpl_dir
+        _tmpl_dir="$(dirname "$_template")"
+        if [[ -d "${_tmpl_dir}/Music" ]]; then
+            cp -r "${_tmpl_dir}/Music" "${dir}/Music"
+            find "${dir}/Music" -type f -exec chmod 644 {} \;
+            log_info "已复制音乐文件: ${dir}/Music/"
+        fi
+
+        return
+    fi
+
+    # 尝试从远程下载对应主题
+    if command -v curl >/dev/null 2>&1; then
+        local _remote_html=""
+        if [[ "$_prefix" == "na" ]]; then
+            local -a _known_na=(usa usa1 html)
+            local _remote_subdir="${_known_na[$(( _slot % ${#_known_na[@]} ))]}"
+            _remote_html="${BASE_URL}/assets/fake-site-na/${_remote_subdir}/index.html"
+        else
+            _remote_html="${BASE_URL}/assets/fake-site-eu.html"
+        fi
+        if curl -fsSL "$_remote_html" -o "${dir}/index.html" 2>/dev/null; then
+            chmod 644 "${dir}/index.html"
+            log_info "已从远程下载伪装页面: ${dir}/index.html"
+            return
+        fi
+    fi
+
+    # 最终回退：按地区自动生成主题伪装页
+    log_warn "generate_fake_site: 无模板文件可用，自动生成 ${_prefix:-eu} 主题页"
+    case "${_prefix:-eu}" in
+
+        na)
+    cat > "${dir}/index.html" << 'HTML'
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>${title}</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 40px;
-               background: #f5f5f5; color: #333; }
-        .container { max-width: 800px; margin: 0 auto; background: white;
-                     padding: 40px; border-radius: 8px;
-                     box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
-        h1 { color: #2c3e50; }
-        p  { line-height: 1.6; color: #666; }
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pacific Research Library — Digital Collections</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Georgia,'Times New Roman',serif;background:#f8f6f2;color:#1a1a1a}
+header{background:#1c3a5e;color:#fff;padding:20px 40px;border-bottom:4px solid #c8a84b}
+header h1{font-size:1.5rem;letter-spacing:.04em}
+header p{font-size:.82rem;color:#a8bfd0;margin-top:4px}
+nav{background:#24507a;padding:0 40px;display:flex;gap:24px}
+nav a{color:#d0e4f0;text-decoration:none;font-size:.8rem;padding:10px 0;letter-spacing:.06em;text-transform:uppercase}
+nav a:hover{color:#fff}
+.hero{background:linear-gradient(135deg,#1c3a5e,#24507a);color:#fff;padding:60px 40px}
+.hero h2{font-size:1.9rem;max-width:580px;line-height:1.3;font-weight:normal}
+.hero p{margin-top:14px;color:#b8d0e4;max-width:500px;line-height:1.7;font-size:.92rem}
+main{max-width:1060px;margin:40px auto;padding:0 40px;display:grid;grid-template-columns:2fr 1fr;gap:28px}
+.card{background:#fff;border:1px solid #ddd;padding:22px;border-radius:3px}
+.card h3{color:#1c3a5e;margin-bottom:8px;font-size:.95rem}
+.card p{font-size:.87rem;color:#555;line-height:1.65}
+footer{background:#111;color:#666;text-align:center;padding:18px;font-size:.78rem;margin-top:40px}
+</style>
 </head>
 <body>
-    <div class="container">
-        <h1>Welcome to ${title}</h1>
-        <p>This server is running nginx.</p>
-        <p>If you see this page, the web server is successfully installed and working.</p>
+<header>
+  <h1>Pacific Research Library</h1>
+  <p>Digital Collections &amp; Archives &middot; Established 1924</p>
+</header>
+<nav><a href="#">Collections</a><a href="#">Research</a><a href="#">Digital Archive</a><a href="#">About</a><a href="#">Contact</a></nav>
+<div class="hero">
+  <h2>Preserving Knowledge for Future Generations</h2>
+  <p>Access over 2.4 million digitized documents, photographs, maps and recordings from regional collections dating back to the 18th century.</p>
+</div>
+<main>
+  <div>
+    <div class="card" style="margin-bottom:18px">
+      <h3>Featured: Pacific Coast Survey Records 1847&ndash;1920</h3>
+      <p>Newly digitized survey records documenting early settlement patterns, land grants, and environmental change along the Pacific Coast are now available for public research access.</p>
     </div>
+    <div class="card">
+      <h3>Digital Archive Search</h3>
+      <p>Search our complete catalog of digitized materials including manuscripts, photographs, oral history recordings, and government documents.</p>
+    </div>
+  </div>
+  <div>
+    <div class="card" style="margin-bottom:18px">
+      <h3>Library Hours</h3>
+      <p>Mon&ndash;Fri: 9:00 AM &ndash; 6:00 PM<br>Saturday: 10:00 AM &ndash; 4:00 PM<br>Sunday: Closed</p>
+    </div>
+    <div class="card">
+      <h3>Research Assistance</h3>
+      <p>Reference librarians available for genealogy research, historical inquiries, and archival requests.</p>
+    </div>
+  </div>
+</main>
+<footer>&copy; 2024 Pacific Research Library &middot; All Rights Reserved</footer>
 </body>
 </html>
 HTML
+            ;;
+
+        as)
+    cat > "${dir}/index.html" << 'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Asia-Pacific Research Network — Open Data Portal</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,'Segoe UI',sans-serif;background:#f4f6fa;color:#1a1f2e}
+header{background:#1a2a4a;color:#fff;padding:15px 48px;display:flex;justify-content:space-between;align-items:center}
+header h1{font-size:1.05rem;font-weight:500;letter-spacing:.02em}
+nav a{color:#90a8c8;text-decoration:none;font-size:.8rem;margin-left:24px}
+nav a:hover{color:#fff}
+.hero{background:linear-gradient(135deg,#1a2a4a,#0d3060);color:#fff;padding:52px 48px}
+.hero h2{font-size:1.75rem;font-weight:400;max-width:540px;line-height:1.4}
+.hero p{margin-top:14px;color:#90a8c8;max-width:460px;line-height:1.7;font-size:.88rem}
+.stats{display:flex;gap:40px;margin-top:30px}
+.stat span{display:block;font-size:1.7rem;font-weight:700;color:#4a9eff}
+.stat small{font-size:.76rem;color:#7090b0}
+main{max-width:1060px;margin:36px auto;padding:0 48px;display:grid;grid-template-columns:repeat(2,1fr);gap:18px}
+.card{background:#fff;border-radius:5px;padding:22px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.card h3{font-size:.9rem;color:#1a2a4a;margin-bottom:7px}
+.card p{font-size:.84rem;color:#5a6a8a;line-height:1.62}
+footer{background:#1a2a4a;color:#4a6a8a;text-align:center;padding:18px;font-size:.76rem;margin-top:40px}
+</style>
+</head>
+<body>
+<header>
+  <h1>Asia-Pacific Research Network</h1>
+  <nav><a href="#">Datasets</a><a href="#">Publications</a><a href="#">Projects</a><a href="#">About</a></nav>
+</header>
+<div class="hero">
+  <h2>Open Science Data Portal</h2>
+  <p>A collaborative research infrastructure providing open access to datasets, publications and tools across the Asia-Pacific scientific community.</p>
+  <div class="stats">
+    <div class="stat"><span>18,400+</span><small>Datasets</small></div>
+    <div class="stat"><span>340</span><small>Member Institutions</small></div>
+    <div class="stat"><span>28</span><small>Countries</small></div>
+  </div>
+</div>
+<main>
+  <div class="card"><h3>Climate &amp; Environment</h3><p>Long-term observational records, satellite imagery archives and environmental monitoring data from across the Pacific region.</p></div>
+  <div class="card"><h3>Biodiversity</h3><p>Species occurrence records, ecological surveys and conservation status data aggregated from member research stations.</p></div>
+  <div class="card"><h3>Social Sciences</h3><p>Longitudinal survey data, demographic studies and urban development research from partner universities and institutes.</p></div>
+  <div class="card"><h3>Marine Research</h3><p>Oceanographic measurements, coral reef monitoring data and fisheries research from Pacific Ocean observation networks.</p></div>
+</main>
+<footer>&copy; 2024 Asia-Pacific Research Network &middot; Open Data Initiative</footer>
+</body>
+</html>
+HTML
+            ;;
+
+        # eu 及其他未知前缀均使用欧洲学术档案主题
+        *)
+    cat > "${dir}/index.html" << 'HTML'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Nordic Heritage Institute — Digital Repository</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:'Palatino Linotype',Palatino,Georgia,serif;background:#0f1a14;color:#e0ddd0;min-height:100vh}
+header{background:linear-gradient(180deg,#000,#0f1a14);border-bottom:1px solid rgba(180,140,40,.3);padding:26px 60px;display:flex;justify-content:space-between;align-items:center}
+.logo h1{font-size:1.35rem;letter-spacing:.08em;color:#e8d890}
+.logo p{font-size:.72rem;letter-spacing:.2em;text-transform:uppercase;color:#8a9a84;margin-top:4px}
+nav a{color:#8a9a84;text-decoration:none;font-size:.76rem;letter-spacing:.1em;text-transform:uppercase;margin-left:30px}
+nav a:hover{color:#e8d890}
+.banner{padding:76px 60px;background:radial-gradient(ellipse at 30% 50%,#162410,#0f1a14 70%);border-bottom:1px solid rgba(180,140,40,.12)}
+.banner h2{font-size:2.1rem;color:#e8d890;max-width:560px;line-height:1.28;font-weight:normal}
+.banner p{margin-top:18px;color:#a0b090;line-height:1.8;max-width:480px;font-size:.92rem}
+main{max-width:980px;margin:56px auto;padding:0 60px;display:grid;grid-template-columns:repeat(3,1fr);gap:22px}
+.card{border:1px solid rgba(180,140,40,.18);padding:22px;background:rgba(255,255,255,.02)}
+.card h3{color:#c8a040;font-size:.82rem;letter-spacing:.1em;text-transform:uppercase;margin-bottom:10px;font-weight:normal}
+.card p{font-size:.86rem;color:#909880;line-height:1.7}
+footer{border-top:1px solid rgba(180,140,40,.12);text-align:center;padding:22px;font-size:.72rem;color:#4a5a44;letter-spacing:.08em;margin-top:60px}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo"><h1>Nordic Heritage Institute</h1><p>Digital Repository &amp; Cultural Archives</p></div>
+  <nav><a href="#">Collections</a><a href="#">Research</a><a href="#">Publications</a><a href="#">About</a></nav>
+</header>
+<div class="banner">
+  <h2>Preserving the Living Memory of the North</h2>
+  <p>A curated digital archive of folk traditions, oral histories, and cultural heritage from the Nordic and Baltic regions, spanning eight centuries of documented history.</p>
+</div>
+<main>
+  <div class="card"><h3>Manuscripts</h3><p>Over 140,000 digitized manuscript pages from monastic and civic archives, spanning the 13th to 20th centuries.</p></div>
+  <div class="card"><h3>Folk Music</h3><p>Audio recordings of traditional songs and instrumental pieces collected through fieldwork expeditions from 1948 to the present.</p></div>
+  <div class="card"><h3>Oral Histories</h3><p>Transcribed and recorded testimonies documenting community life, seasonal traditions, and historical memory across the region.</p></div>
+</main>
+<footer>NORDIC HERITAGE INSTITUTE &middot; DIGITAL REPOSITORY &middot; MMXXIV</footer>
+</body>
+</html>
+HTML
+            ;;
+    esac
 }
 
 # ── 生成 cloudflare_real_ip.conf ─────────────────────────────
@@ -249,6 +491,19 @@ map "\$from_cf:\$http_cf_connecting_ip" \$final_real_ip {
     "~^1:.+"   \$http_cf_connecting_ip;
     default    \$remote_addr;
 }
+
+# ── 媒体文件扩展名检测 ─────────────────────────────────────────────────
+# 非 CF 流量访问媒体文件时应直接返回文件，而非跳转 /_fake 伪装页
+map \$uri \$is_media_ext {
+    ~*\.(mp4|mp3|ogg|m4a|wav|webm|flac|aac)(\?.*)?$  1;
+    default                                            0;
+}
+
+# ── 伪装页跳转判断：仅对非 CF 流量 + 非媒体文件触发 ─────────────────
+map "\${from_cf}_\${is_media_ext}" \$redirect_to_fake {
+    "0_0"   1;
+    default 0;
+}
 CONF
 
     log_info "Cloudflare 真实IP配置生成完成"
@@ -316,9 +571,9 @@ cat > "$TMP_CF_CONF" << HEREDOC
 set_real_ip_from 127.0.0.1;
 set_real_ip_from ::1;
 
-$(echo "$CF_IPV4" | sed 's/^/set_real_ip_from /;s/$/;/')
+$(echo "$CF_IPV4" | grep -v '^[[:space:]]*$' | sed 's/^/set_real_ip_from /;s/$/;/')
 
-$(echo "$CF_IPV6" | sed 's/^/set_real_ip_from /;s/$/;/')
+$(echo "$CF_IPV6" | grep -v '^[[:space:]]*$' | sed 's/^/set_real_ip_from /;s/$/;/')
 
 real_ip_header    proxy_protocol;
 real_ip_recursive on;
@@ -327,14 +582,24 @@ geo \$remote_addr \$from_cf {
     default 0;
     127.0.0.1 0;
     ::1 0;
-$(echo "$CF_IPV4" | sed 's/^/    /;s/$/ 1;/')
-$(echo "$CF_IPV6" | sed 's/^/    /;s/$/ 1;/')
+$(echo "$CF_IPV4" | grep -v '^[[:space:]]*$' | sed 's/^/    /;s/$/ 1;/')
+$(echo "$CF_IPV6" | grep -v '^[[:space:]]*$' | sed 's/^/    /;s/$/ 1;/')
 }
 
 map "\$from_cf:\$http_cf_connecting_ip" \$final_real_ip {
     "1:"       \$remote_addr;
     "~^1:.+"   \$http_cf_connecting_ip;
     default    \$remote_addr;
+}
+
+map \$uri \$is_media_ext {
+    ~*\.(mp4|mp3|ogg|m4a|wav|webm|flac|aac)(\?.*)?$  1;
+    default                                            0;
+}
+
+map "\${from_cf}_\${is_media_ext}" \$redirect_to_fake {
+    "0_0"   1;
+    default 0;
 }
 HEREDOC
 
@@ -663,7 +928,7 @@ stream {
     map \$ssl_preread_server_name \$backend {
 $(generate_sni_map)
         # -- SNI 陷阱兜底 -----------------------------------------
-        default               127.0.0.1:20880;
+        default               127.0.0.1:8400;
     }
 
     server {
@@ -678,16 +943,16 @@ $(generate_sni_map)
 
     # -- 中间层: 消费 proxy_protocol 后转发给 sing-box ----------
     server {
-        listen 127.0.0.1:18443 proxy_protocol;
-        proxy_pass            127.0.0.1:8443;
+        listen 127.0.0.1:8360 proxy_protocol;
+        proxy_pass            127.0.0.1:8330;
         proxy_connect_timeout 10s;
         proxy_timeout         7200s;
     }
 
     # -- 中间层: 消费 proxy_protocol 后转发给 caddy-naive -------
     server {
-        listen 127.0.0.1:18444 proxy_protocol;
-        proxy_pass            127.0.0.1:8444;
+        listen 127.0.0.1:8370 proxy_protocol;
+        proxy_pass            127.0.0.1:8340;
         proxy_connect_timeout 10s;
         proxy_timeout         7200s;
     }
@@ -698,7 +963,7 @@ CONF
 }
 
 # ── 生成 SNI 路由映射 ────────────────────────────────────────
-# P4修复：Reality serverNames 里的所有域名都加进 stream map 指向 9443
+# P4修复：Reality serverNames 里的所有域名都加进 stream map 指向 8320
 generate_sni_map() {
     local had_output=0
     local sn
@@ -706,49 +971,71 @@ generate_sni_map() {
 
     # Reality 自有域名
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames 全部路由到 9443）--"
-        echo "        ${REALITY_DOMAIN}     127.0.0.1:9443;"
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames 全部路由到 8320）--"
+        echo "        ${REALITY_DOMAIN}     127.0.0.1:8320;"
         seen_sni["${REALITY_DOMAIN}"]=1
         had_output=1
     fi
 
-    # Reality 所有 serverNames（包括公共域名）全部指向 9443
-    # 确保客户端用任意 serverName 连接时都能命中正确后端
+    # XHTTP-Reality 自有域名 → 8325（xhttp-reality inbound）
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" && -z "${seen_sni[${XHTTP_REALITY_DOMAIN}]:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        echo "        # -- xhttp-reality 自有域名 → 8325 -------------------"
+        echo "        ${XHTTP_REALITY_DOMAIN}     127.0.0.1:8325;"
+        seen_sni["${XHTTP_REALITY_DOMAIN}"]=1
+        had_output=1
+    fi
+
+    # Reality 所有 serverNames（包括公共域名）全部路由到 8320
     if [[ -n "${REALITY_SERVER_NAMES:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality serverNames 全部路由到 9443 ---------------"
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality serverNames 全部路由到 8320 ---------------"
         for sn in "${REALITY_SERVER_NAMES[@]}"; do
             [[ -n "$sn" ]] || continue
             [[ -n "${seen_sni[$sn]:-}" ]] && continue
-            echo "        ${sn}     127.0.0.1:9443;"
+            echo "        ${sn}     127.0.0.1:8320;"
             seen_sni["$sn"]=1
         done
         had_output=1
     fi
 
-    if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
+    # XHTTP_REALITY_SNI 单独路由到 8325，无论是否在 REALITY_SERVER_NAMES 里
+    # 必须在 serverNames 循环之后处理，防止被 8320 抢先匹配
+    if [[ -n "${XHTTP_REALITY_SNI:-}" && -z "${seen_sni[${XHTTP_REALITY_SNI}]:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
-        echo "        # -- xhttp CDN 回源 -----------------------------------"
-        echo "        ${XHTTP_DOMAIN}        127.0.0.1:20443;"
+        echo "        # -- xhttp-reality 公共 SNI → 8325 --------------------"
+        echo "        ${XHTTP_REALITY_SNI}     127.0.0.1:8325;"
+        seen_sni["${XHTTP_REALITY_SNI}"]=1
         had_output=1
     fi
 
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
+    if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" == "${XHTTP_DOMAIN}" ]]; then
+            echo "        # -- xhttp + gRPC CDN 回源（同域名合并到 8380，按 path 分流）--"
+        else
+            echo "        # -- xhttp CDN 回源 -----------------------------------"
+        fi
+        echo "        ${XHTTP_DOMAIN}        127.0.0.1:8380;"
+        had_output=1
+    fi
+
+    if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- gRPC CDN 回源 ------------------------------------"
-        echo "        ${GRPC_DOMAIN}         127.0.0.1:20445;"
+        echo "        ${GRPC_DOMAIN}         127.0.0.1:8390;"
         had_output=1
     fi
 
     if [[ -n "${ANYTLS_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- AnyTLS -> nginx 中间层 -> sing-box ---------------"
-        echo "        ${ANYTLS_DOMAIN}       127.0.0.1:18443;"
+        echo "        ${ANYTLS_DOMAIN}       127.0.0.1:8360;"
     fi
 
     if [[ -n "${NAIVE_DOMAIN:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- NaiveProxy -> nginx 中间层 -> caddy-naive ------"
-        echo "        ${NAIVE_DOMAIN}       127.0.0.1:18444;"
+        echo "        ${NAIVE_DOMAIN}       127.0.0.1:8370;"
     fi
 }
 
@@ -761,7 +1048,7 @@ generate_upstreams_conf() {
 # /etc/nginx/conf.d/00-upstreams.conf
 # ============================================================
 upstream vless_xhttp_backend {
-    server 127.0.0.1:8001 max_fails=0 fail_timeout=30s;
+    server 127.0.0.1:8300 max_fails=0 fail_timeout=30s;
     keepalive          256;
     keepalive_requests 10000;
 # 与 Xray xhttp hMaxReusableSecs(1800-3600s) 形成梯度
@@ -770,12 +1057,13 @@ keepalive_timeout 300s;
 }
 
 upstream vless_grpc_backend {
-    server 127.0.0.1:8002 max_fails=0 fail_timeout=30s;
+    server 127.0.0.1:8310 max_fails=0 fail_timeout=30s;
     keepalive          128;
     keepalive_requests 1000;
-    # 修复3：与 xray grpc idle_timeout(80s) 形成梯度
-    # nginx(90s) > xray(80s) > 客户端(60s)，避免连接被提前回收
-    keepalive_timeout  90s;
+    # Fix: nginx must recycle before xray grpc idle_timeout(60s)
+    # nginx(50s) < xray(60s): nginx closes idle conn first, preventing reuse of connections xray has already closed
+    # See: nginx ngx_http_upstream_module keepalive_timeout docs
+    keepalive_timeout  50s;
 }
 CONF
 
@@ -787,6 +1075,13 @@ CONF
 generate_fallback_conf() {
     log_step "生成 fallback 配置..."
 
+    if declare -F load_latency_params &>/dev/null; then
+        load_latency_params
+    else
+        LATENCY_GRPC_TIMEOUT=120
+        LATENCY_PROXY_TIMEOUT=7200
+    fi
+
     cat > /etc/nginx/conf.d/fallback.conf << CONF
 # ============================================================
 # /etc/nginx/conf.d/fallback.conf
@@ -796,7 +1091,7 @@ generate_fallback_conf() {
 # 因此 listen 不加 proxy_protocol
 # ============================================================
 server {
-listen 127.0.0.1:10080;
+listen 127.0.0.1:8350;
     server_name   _;
     access_log    off;
     server_tokens off;
@@ -813,7 +1108,8 @@ listen 127.0.0.1:10080;
         gzip off;
         proxy_pass              http://vless_xhttp_backend;
         proxy_http_version      1.1;
-        proxy_set_header        Connection "";
+        # Fix: "close" disables upstream keepalive reuse; xhttp half-close causes broken-pipe with Connection ""
+        proxy_set_header        Connection "close";
         proxy_set_header        Host \$host;
  # fallback 经 xver=0 转发，无 proxy_protocol，使用 \$final_real_ip 获取真实 IP
         proxy_set_header        X-Real-IP \$final_real_ip;
@@ -826,31 +1122,31 @@ listen 127.0.0.1:10080;
         proxy_next_upstream_tries   0;
         client_max_body_size    0;
         proxy_connect_timeout   15s;
-        proxy_send_timeout      7200s;
-        proxy_read_timeout      7200s;
+        proxy_send_timeout      ${LATENCY_PROXY_TIMEOUT}s;
+        proxy_read_timeout      ${LATENCY_PROXY_TIMEOUT}s;
         # P5修复：fallback 长连接单独覆盖
-        keepalive_timeout       7200s;
+        keepalive_timeout       ${LATENCY_PROXY_TIMEOUT}s;
     }
 
-    location /grpc.Service {
+    location /${GRPC_SERVICE_NAME} {
         gzip off;
         grpc_pass            grpc://vless_grpc_backend;
         grpc_set_header      Host \$host;
         grpc_next_upstream   off;
         grpc_connect_timeout 15s;
-        grpc_send_timeout    7200s;
-        grpc_read_timeout    7200s;
+        grpc_send_timeout    ${LATENCY_GRPC_TIMEOUT}s;
+        grpc_read_timeout    ${LATENCY_GRPC_TIMEOUT}s;
         # fallback 直连长连接，跟 Reality 入口保持长超时
         grpc_buffer_size     128k;
         grpc_socket_keepalive on;
-        keepalive_timeout    7200s;
+        keepalive_timeout    ${LATENCY_GRPC_TIMEOUT}s;
         client_max_body_size 0;
-        client_body_timeout 7200s;
-        send_timeout 7200s;
+        client_body_timeout ${LATENCY_GRPC_TIMEOUT}s;
+        send_timeout ${LATENCY_GRPC_TIMEOUT}s;
     }
 
     location / {
-        root      /var/www/html;
+        root      /var/www/${REALITY_DOMAIN:-${XHTTP_DOMAIN:-html}};
         index     index.html;
         try_files \$uri \$uri/ /index.html;
  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
@@ -871,7 +1167,23 @@ CONF
 generate_servers_conf() {
     log_step "生成 servers.conf..."
 
-    > /etc/nginx/conf.d/servers.conf
+    # Preflight 互锁：servers.conf 是 SNI 路由的最终落地，写入前最后一道闸
+    if declare -F preflight_config_check &>/dev/null; then
+        if ! preflight_config_check "generate_servers_conf"; then
+            log_error "servers.conf 生成已阻止"
+            return 1
+        fi
+    fi
+
+    if declare -F load_latency_params &>/dev/null; then
+        load_latency_params
+    else
+        LATENCY_GRPC_TIMEOUT=120
+        LATENCY_PROXY_TIMEOUT=7200
+    fi
+
+    # 有意清空配置文件，后续以 >> 追加方式逐段写入
+    : > /etc/nginx/conf.d/servers.conf
 
     get_root_domain() {
         echo "$1" | awk -F. '{print $(NF-1)"."$NF}'
@@ -879,9 +1191,50 @@ generate_servers_conf() {
 
     # xhttp CDN server 块
     if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
-        local xhttp_root
+        local xhttp_root cert_path
         xhttp_root=$(get_root_domain "${XHTTP_DOMAIN}")
-        local cert_path="/etc/letsencrypt/live/${xhttp_root}"
+        cert_path=$(get_state "CERT_PATH_${xhttp_root//./_}" "")
+        [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${xhttp_root}"
+
+        mkdir -p "/var/www/${XHTTP_DOMAIN}"
+        generate_fake_site "/var/www/${XHTTP_DOMAIN}" 0
+
+        # 同域名合并：xhttp 与 gRPC 共用同一域名时，gRPC location 并入此 server 块
+        local grpc_merged_location=""
+        if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" == "${XHTTP_DOMAIN}" ]]; then
+            grpc_merged_location=$(cat << CONF
+
+    # 同域名合并：gRPC location 并入 xhttp server 块（按 path 分流）
+    location /${GRPC_SERVICE_NAME} {
+        gzip       off;
+        access_log off;
+        limit_req  zone=websocket burst=100 nodelay;
+        limit_conn conn_limit 200;
+
+        grpc_pass             grpc://vless_grpc_backend;
+        grpc_set_header       Host \$host;
+        grpc_set_header       X-Real-IP \$final_real_ip;
+        grpc_set_header       X-Forwarded-For \$final_real_ip;
+        grpc_set_header       X-Forwarded-Proto \$scheme;
+        grpc_set_header       Te "trailers";
+        grpc_set_header       Content-Type "application/grpc";
+
+        grpc_connect_timeout  15s;
+        grpc_send_timeout     ${LATENCY_GRPC_TIMEOUT}s;
+        grpc_read_timeout     ${LATENCY_GRPC_TIMEOUT}s;
+        grpc_socket_keepalive on;
+        grpc_next_upstream    off;
+        # CF 免费版硬限制约 100s，中延迟默认 120s，高延迟用 300s
+        grpc_buffer_size      128k;
+        keepalive_timeout     ${LATENCY_GRPC_TIMEOUT}s;
+
+        client_max_body_size  0;
+        client_body_timeout   ${LATENCY_GRPC_TIMEOUT}s;
+        send_timeout          ${LATENCY_GRPC_TIMEOUT}s;
+    }
+CONF
+)
+        fi
 
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
@@ -890,7 +1243,7 @@ generate_servers_conf() {
 # P1修复：location 路径与 xray xhttpSettings.path 保持一致
 # ===================================================================
 server {
-    listen 127.0.0.1:20443 ssl proxy_protocol;
+    listen 127.0.0.1:8380 ssl proxy_protocol;
     http2  on;
     server_name ${XHTTP_DOMAIN};
     gzip   on;
@@ -911,7 +1264,7 @@ server {
     resolver_timeout 5s;
     server_tokens off;
 
-    if (\$from_cf = 0) {
+    if (\$redirect_to_fake) {
         rewrite ^ /_fake last;
     }
 
@@ -922,10 +1275,10 @@ server {
         limit_req  zone=websocket burst=100 nodelay;
         limit_conn conn_limit 200;
 
-        http2_push_preload      off;
         proxy_pass              http://vless_xhttp_backend;
         proxy_http_version      1.1;
-        proxy_set_header        Connection "";
+        # Fix: "close" disables upstream keepalive reuse; xhttp half-close causes broken-pipe with Connection ""
+        proxy_set_header        Connection "close";
         proxy_set_header        Host \$host;
         proxy_set_header        X-Real-IP \$final_real_ip;
         proxy_set_header        X-Forwarded-For \$final_real_ip;
@@ -946,8 +1299,8 @@ server {
         proxy_hide_header X-Cache-Status;
 
         proxy_connect_timeout       15s;
-        proxy_send_timeout          7200s;
-        proxy_read_timeout          7200s;
+        proxy_send_timeout          ${LATENCY_PROXY_TIMEOUT}s;
+        proxy_read_timeout          ${LATENCY_PROXY_TIMEOUT}s;
         proxy_buffering             off;
         proxy_request_buffering     off;
         chunked_transfer_encoding   on;
@@ -958,12 +1311,13 @@ server {
         proxy_next_upstream_timeout 0;
         proxy_next_upstream_tries   0;
         client_max_body_size        0;
-        client_body_timeout         7200s;
-        send_timeout                7200s;
+        client_body_timeout         ${LATENCY_PROXY_TIMEOUT}s;
+        send_timeout                ${LATENCY_PROXY_TIMEOUT}s;
         # P5修复：长连接在 location 内单独覆盖
-        keepalive_timeout           7200s;
+        keepalive_timeout           ${LATENCY_PROXY_TIMEOUT}s;
         keepalive_requests          5000;
     }
+${grpc_merged_location}
 
     location = /health {
         limit_req  zone=health burst=5 nodelay;
@@ -980,7 +1334,7 @@ server {
 
     location /_fake {
         internal;
-        root      /var/www/html;
+        root      /var/www/${XHTTP_DOMAIN};
         index     index.html;
         try_files /index.html =200;
  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
@@ -994,7 +1348,7 @@ server {
     }
 
     location / {
-        root  /var/www/html;
+        root  /var/www/${XHTTP_DOMAIN};
         index index.html;
  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
  add_header X-Content-Type-Options nosniff always;
@@ -1019,10 +1373,15 @@ CONF
     fi
 
     # gRPC CDN server 块
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        local grpc_root
+    # 同域名时已合并进 xhttp server 块（8380），跳过独立 gRPC 块以避免端口/SNI 冲突
+    if [[ -n "${GRPC_DOMAIN:-}" && "${GRPC_DOMAIN}" != "${XHTTP_DOMAIN:-}" ]]; then
+        local grpc_root cert_path
         grpc_root=$(get_root_domain "${GRPC_DOMAIN}")
-        local cert_path="/etc/letsencrypt/live/${grpc_root}"
+        cert_path=$(get_state "CERT_PATH_${grpc_root//./_}" "")
+        [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${grpc_root}"
+
+        mkdir -p "/var/www/${GRPC_DOMAIN}"
+        generate_fake_site "/var/www/${GRPC_DOMAIN}" 1
 
         cat >> /etc/nginx/conf.d/servers.conf << CONF
 
@@ -1030,7 +1389,7 @@ CONF
 # CDN ${GRPC_DOMAIN} — gRPC
 # ===================================================================
 server {
-    listen 127.0.0.1:20445 ssl proxy_protocol;
+    listen 127.0.0.1:8390 ssl proxy_protocol;
     http2  on;
     server_name ${GRPC_DOMAIN};
     gzip   on;
@@ -1051,11 +1410,11 @@ server {
     resolver_timeout 5s;
     server_tokens off;
 
-    if (\$from_cf = 0) {
+    if (\$redirect_to_fake) {
         rewrite ^ /_fake last;
     }
 
-    location /grpc.Service {
+    location /${GRPC_SERVICE_NAME} {
         gzip       off;
         access_log off;
         limit_req  zone=websocket burst=100 nodelay;
@@ -1070,17 +1429,17 @@ server {
         grpc_set_header       Content-Type "application/grpc";
 
         grpc_connect_timeout  15s;
-        grpc_send_timeout     120s;
-        grpc_read_timeout     120s;
+        grpc_send_timeout     ${LATENCY_GRPC_TIMEOUT}s;
+        grpc_read_timeout     ${LATENCY_GRPC_TIMEOUT}s;
         grpc_socket_keepalive on;
         grpc_next_upstream    off;
-        # CF 免费版硬限制约 100s，这里按 120s 管理 CDN 侧连接
+        # CF 免费版硬限制约 100s，中延迟默认 120s，高延迟用 300s
         grpc_buffer_size      128k;
-        keepalive_timeout     120s;
+        keepalive_timeout     ${LATENCY_GRPC_TIMEOUT}s;
 
         client_max_body_size  0;
-        client_body_timeout   120s;
-        send_timeout          120s;
+        client_body_timeout   ${LATENCY_GRPC_TIMEOUT}s;
+        send_timeout          ${LATENCY_GRPC_TIMEOUT}s;
     }
 
     location = /health {
@@ -1136,6 +1495,94 @@ server {
 CONF
     fi
 
+    # Reality dest 伪装站（8321）：仅在使用自有域名时生成
+    # xray 的 realitySettings.dest 指向此处，Reality 从本地真实证书读取指纹
+    # 非 Xray 访客直接看到伪装网站，天然无外部流量可偷
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        local reality_root reality_cert_path
+        reality_root=$(get_root_domain "${REALITY_DOMAIN}")
+        reality_cert_path=$(get_state "CERT_PATH_${reality_root//./_}" "")
+        [[ -z "$reality_cert_path" ]] && reality_cert_path="/etc/letsencrypt/live/${reality_root}"
+
+        mkdir -p "/var/www/${REALITY_DOMAIN}"
+        generate_fake_site "/var/www/${REALITY_DOMAIN}" 2
+
+        cat >> /etc/nginx/conf.d/servers.conf << CONF
+
+# ===================================================================
+# Reality dest 伪装站 ${REALITY_DOMAIN}（8321）
+# 不加 proxy_protocol（Reality xver=0 直连）
+# ===================================================================
+server {
+    listen 127.0.0.1:8321 ssl;
+    server_name ${REALITY_DOMAIN};
+
+    ssl_certificate     ${reality_cert_path}/fullchain.pem;
+    ssl_certificate_key ${reality_cert_path}/privkey.pem;
+    include /etc/nginx/ssl/common.conf;
+
+    root        /var/www/${REALITY_DOMAIN};
+    index       index.html;
+    server_tokens off;
+    access_log  off;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "public, max-age=3600" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Content-Security-Policy "default-src 'self' fonts.googleapis.com fonts.gstatic.com; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' fonts.googleapis.com; font-src 'self' fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';" always;
+    }
+}
+CONF
+    fi
+
+    # XHTTP-Reality dest 伪装站（8326）：使用自有域名时生成
+    # xray 的 vless-xhttp-reality realitySettings.dest 指向此处
+    # 主题 slot 3：NA 地区 3 主题时回绕到 usa（与 XHTTP_DOMAIN 相同）；
+    # 如需独立主题，可在 assets/fake-site-na/ 新增第 4 个子目录
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+        local xhttp_reality_root xhttp_reality_cert_path
+        xhttp_reality_root=$(get_root_domain "${XHTTP_REALITY_DOMAIN}")
+        xhttp_reality_cert_path=$(get_state "CERT_PATH_${xhttp_reality_root//./_}" "")
+        [[ -z "$xhttp_reality_cert_path" ]] && xhttp_reality_cert_path="/etc/letsencrypt/live/${xhttp_reality_root}"
+
+        mkdir -p "/var/www/${XHTTP_REALITY_DOMAIN}"
+        generate_fake_site "/var/www/${XHTTP_REALITY_DOMAIN}" 3
+
+        cat >> /etc/nginx/conf.d/servers.conf << CONF
+
+# ===================================================================
+# XHTTP-Reality dest 伪装站 ${XHTTP_REALITY_DOMAIN}（8326）
+# ===================================================================
+server {
+    listen 127.0.0.1:8326 ssl;
+    server_name ${XHTTP_REALITY_DOMAIN};
+
+    ssl_certificate     ${xhttp_reality_cert_path}/fullchain.pem;
+    ssl_certificate_key ${xhttp_reality_cert_path}/privkey.pem;
+    include /etc/nginx/ssl/common.conf;
+
+    root        /var/www/${XHTTP_REALITY_DOMAIN};
+    index       index.html;
+    server_tokens off;
+    access_log  off;
+
+    location / {
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "public, max-age=3600" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Content-Security-Policy "default-src 'self' fonts.googleapis.com fonts.gstatic.com; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' fonts.googleapis.com; font-src 'self' fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';" always;
+    }
+}
+CONF
+    fi
+
     # 兜底 server 块
     cat >> /etc/nginx/conf.d/servers.conf << 'CONF'
 
@@ -1143,26 +1590,26 @@ CONF
 # 兜底：SNI 不匹配拒绝握手
 # ===================================================================
 server {
-    listen 127.0.0.1:20443 ssl default_server proxy_protocol;
+    listen 127.0.0.1:8380 ssl default_server proxy_protocol;
     ssl_reject_handshake on;
 }
 
 server {
-    listen 127.0.0.1:20445 ssl default_server proxy_protocol;
+    listen 127.0.0.1:8390 ssl default_server proxy_protocol;
     ssl_reject_handshake on;
 }
 CONF
 
-    # P3修复：20880 加自签证书完成 TLS 握手，返回伪装页而非 RST
+    # P3修复：8400 加自签证书完成 TLS 握手，返回伪装页而非 RST
     cat >> /etc/nginx/conf.d/servers.conf << 'CONF'
 
 # ===================================================================
-# SNI 陷阱伪装站（20880）
+# SNI 陷阱伪装站（8400）
 # P3修复：加自签证书让扫描器能完成 TLS 握手，返回正常伪装页
 #         而非直接 RST（更难被识别为代理节点）
 # ===================================================================
 server {
-    listen 127.0.0.1:20880 ssl proxy_protocol;
+    listen 127.0.0.1:8400 ssl proxy_protocol;
     ssl_certificate     /etc/nginx/certs/trap.crt;
     ssl_certificate_key /etc/nginx/certs/trap.key;
     ssl_protocols       TLSv1.2 TLSv1.3;
@@ -1179,7 +1626,7 @@ server {
     gzip_types          text/plain text/css application/json application/javascript
                         text/xml application/xml application/xml+rss text/javascript
                         image/svg+xml;
-    root                /var/www/html;
+    root                /var/www/trap;
     index               index.html;
 
     location / {
@@ -1204,19 +1651,12 @@ CONF
     cat >> /etc/nginx/conf.d/servers.conf << CONF
 
 # ===================================================================
-# HTTP → HTTPS 重定向 & ACME 验证
+# HTTP → HTTPS 重定向（证书用 DNS-Cloudflare，无需 webroot 验证）
 # ===================================================================
 server {
     listen 80;
     listen [::]:80;
     server_name ${all_domain_names};
-
-    location ^~ /.well-known/acme-challenge/ {
-        root          /var/www/html;
-        try_files     \$uri =404;
-        access_log    off;
-        log_not_found off;
-    }
 
     location / {
         return 301 https://\$host\$request_uri;
@@ -1245,7 +1685,7 @@ run_nginx() {
     log_step "========== Nginx 安装配置 =========="
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
+    generate_fake_site "/var/www/trap" 2
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf

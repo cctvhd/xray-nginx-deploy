@@ -8,13 +8,14 @@
 # ── 辅助：从 klzgrad/forwardproxy 仓库 go.mod 动态获取 module 路径 ──
 # 不硬编码，避免未来 fork/迁移后路径失效
 _get_forwardproxy_module() {
-    local go_mod_url="https://raw.githubusercontent.com/klzgrad/forwardproxy/master/go.mod"
+    # Read from the naive branch — same branch used in the build — to get the correct module path
+    local go_mod_url="https://raw.githubusercontent.com/klzgrad/forwardproxy/naive/go.mod"
     local mod_path
     mod_path=$(curl -fsSL "$go_mod_url" 2>/dev/null \
         | grep '^module ' | head -1 | awk '{print $2}')
     if [[ -z "$mod_path" ]]; then
         log_warn "无法解析 forwardproxy go.mod，使用默认值"
-        mod_path="github.com/caddyserver/forwardproxy"
+        mod_path="github.com/klzgrad/forwardproxy"
     fi
     echo "$mod_path"
 }
@@ -133,6 +134,7 @@ install_naive() {
         rm -rf "$tmpdir"
 
         export PATH="/usr/local/go/bin:$PATH"
+        # shellcheck disable=SC2016  # 字面量 $PATH 写入 /etc/profile，由用户 shell 展开
         grep -q '/usr/local/go/bin' /etc/profile 2>/dev/null \
             || echo 'export PATH=/usr/local/go/bin:$PATH' >> /etc/profile
         log_info "Go $(go version 2>&1 | grep -oE 'go[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1) 安装完成"
@@ -148,6 +150,7 @@ install_naive() {
             exit 1
         fi
         export PATH="${HOME}/go/bin:$PATH"
+        # shellcheck disable=SC2016  # 字面量 ${HOME}/$PATH 写入 /etc/profile，由用户 shell 展开
         grep -q '/go/bin' /etc/profile 2>/dev/null \
             || echo 'export PATH=${HOME}/go/bin:$PATH' >> /etc/profile
     fi
@@ -162,30 +165,70 @@ install_naive() {
     fp_module=$(_get_forwardproxy_module)
     log_info "forwardproxy module: ${fp_module}"
 
-    log_info "开始编译 Caddy + forwardproxy（首次编译需下载依赖，请耐心等待）..."
-    local build_tmpdir
-    build_tmpdir=$(mktemp -d)
+    log_info "开始编译 Caddy + forwardproxy（首次编译需下载依赖，约需 3-10 分钟，请勿中断）..."
+    log_warn "编译期间请勿按 Ctrl+C 或关闭 SSH 连接"
 
-    if ! xcaddy build --with "${fp_module}=github.com/klzgrad/forwardproxy@naive" --output "${build_tmpdir}/caddy"; then
-        log_error "xcaddy 编译失败"
+    local build_tmpdir build_log
+    build_tmpdir=$(mktemp -d)
+    build_log="${build_tmpdir}/build.log"
+
+    log_info "编译命令: xcaddy build --with ${fp_module}=github.com/klzgrad/forwardproxy@naive --output ${build_tmpdir}/caddy"
+
+    # setsid 将编译进程从终端会话脱离，防止 SSH 断开或 Ctrl+C 中断编译
+    # 同时 trap SIGINT 阻止信号传递给子进程
+    trap '' INT
+    setsid xcaddy build \
+            --with "${fp_module}=github.com/klzgrad/forwardproxy@naive" \
+            --output "${build_tmpdir}/caddy" 2>&1 | tee "${build_log}" &
+    local build_pid=$!
+    wait "$build_pid"
+    local build_rc=$?
+    trap - INT
+
+    if [[ $build_rc -ne 0 ]]; then
+        log_error "xcaddy 编译失败（exit=${build_rc}）"
+        log_error "编译日志末尾："
+        tail -20 "${build_log}" >&2 || true
+        # 检查内存，给出提示
+        local avail_mb
+        avail_mb=$(awk '/MemAvailable/{print int($2/1024)}' /proc/meminfo)
+        if (( avail_mb < 512 )); then
+            log_warn "可用内存仅 ${avail_mb}MB，Go 编译建议至少 1GB 可用内存"
+            log_warn "可先释放内存或增加 swap 后重试：fallocate -l 2G /swapfile && chmod 600 /swapfile && mkswap /swapfile && swapon /swapfile"
+        fi
         rm -rf "$build_tmpdir"
         exit 1
     fi
 
     # ── 5. 验证编译产物 ────────────────────────────────────
-    if ! "${build_tmpdir}/caddy" list-modules 2>/dev/null | grep -q 'forward_proxy'; then
-        log_error "编译验证失败: caddy list-modules 未包含 forward_proxy"
+    local modules_out
+    modules_out=$("${build_tmpdir}/caddy" list-modules 2>&1)
+    log_info "caddy list-modules 完整输出（前50行）:"
+    echo "$modules_out" | head -50
+    local proxy_lines
+    proxy_lines=$(echo "$modules_out" | grep -iE 'proxy|forward' || true)
+    if [[ -n "$proxy_lines" ]]; then
+        log_info "proxy/forward 相关模块: ${proxy_lines}"
+    else
+        log_warn "list-modules 中无任何 proxy/forward 相关模块"
+    fi
+    # 兼容 "forward_proxy" 或 "forwardproxy"（Caddy 不同版本命名不同）
+    if ! echo "$modules_out" | grep -qiE 'forward.?proxy'; then
+        log_error "编译验证失败: caddy list-modules 未包含 forward_proxy / forwardproxy"
+        log_error "请检查 klzgrad/forwardproxy naive 分支是否兼容当前 Caddy 版本"
         rm -rf "$build_tmpdir"
         exit 1
     fi
 
-    if ! cp "${build_tmpdir}/caddy" /usr/local/bin/caddy-naive; then
+    # Use copy-then-rename to avoid "Text file busy" when caddy-naive is running
+    if ! cp "${build_tmpdir}/caddy" /usr/local/bin/caddy-naive.new; then
         log_error "安装 caddy-naive 失败: 无法复制到 /usr/local/bin/"
         rm -rf "$build_tmpdir"
         set +x
         exit 1
     fi
-    chmod +x /usr/local/bin/caddy-naive
+    chmod +x /usr/local/bin/caddy-naive.new
+    mv -f /usr/local/bin/caddy-naive.new /usr/local/bin/caddy-naive
     rm -rf "$build_tmpdir"
 
     # SELinux: 标记 Caddy 二进制为普通 bin_t（AlmaLinux/CentOS 12/SuSE 等加固环境）
@@ -279,7 +322,7 @@ configure_naive() {
     log_info "私钥: ${NAIVE_KEY}"
 
     # ── 3. 监听端口 ──────────────────────────────────────────
-    local NAIVE_PORT="8444"
+    local NAIVE_PORT="8340"
     log_info "后端监听端口: 127.0.0.1:${NAIVE_PORT}"
 
     # ── 4. 认证信息 ──────────────────────────────────────────
@@ -335,18 +378,38 @@ configure_naive() {
     fi
     log_info "伪装反代: ${NAIVE_PROXY_TARGET}"
 
-    # ── 7. 写入 Caddyfile ────────────────────────────────────
+    # ── 7. certaccess 组：让 caddy-naive 直读 letsencrypt 证书 ──
+    # 创建共享组（幂等），live/ 和 archive/ 设为组可穿越（750），
+    # privkey 设为组可读（640）。续签 hook 会对新文件重复此操作。
+    if ! getent group certaccess > /dev/null 2>&1; then
+        groupadd -r certaccess
+        log_info "已创建 certaccess 组"
+    fi
+    usermod -aG certaccess caddy-naive
+    chgrp certaccess /etc/letsencrypt/live /etc/letsencrypt/archive
+    chmod 750 /etc/letsencrypt/live /etc/letsencrypt/archive
+    find "/etc/letsencrypt/archive/${root_domain}" -name "privkey*.pem" \
+        -exec chgrp certaccess {} \; -exec chmod 640 {} \; 2>/dev/null || true
+    log_info "certaccess 权限已配置"
+
+    # ── 8. 写入 Caddyfile ────────────────────────────────────
+    # servers { protocols h1 h2 }：禁用 HTTP/3，避免 Caddy 广播
+    # Alt-Svc: h3=":PORT" — NaiveProxy 客户端（Chromium 网络栈）收到后
+    # 会尝试 QUIC 升级到内部端口，外部 UDP 不可达，导致连接混乱。
     mkdir -p /etc/caddy-naive
 
     cat > /etc/caddy-naive/Caddyfile << EOF
 {
     admin off
     auto_https off
+    servers {
+        protocols h1 h2
+    }
 }
 
 :${NAIVE_PORT} {
     bind 127.0.0.1
-    tls /etc/caddy-naive/fullchain.pem /etc/caddy-naive/privkey.pem {
+    tls ${NAIVE_CERT} ${NAIVE_KEY} {
         protocols tls1.2 tls1.3
         ciphers TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256
     }
@@ -365,29 +428,12 @@ configure_naive() {
 }
 EOF
 
-    log_info "已写入 /etc/caddy-naive/Caddyfile"
-
-    # ── 8. 证书复制 ──────────────────────────────────────────
-    if [[ ! -f "${NAIVE_CERT}" ]]; then
-        log_error "证书源文件不存在: ${NAIVE_CERT}"
-        return 1
-    fi
-    if [[ ! -f "${NAIVE_KEY}" ]]; then
-        log_error "私钥源文件不存在: ${NAIVE_KEY}"
-        return 1
-    fi
-    if ! cp "${NAIVE_CERT}" /etc/caddy-naive/fullchain.pem; then
-        log_error "证书复制失败: ${NAIVE_CERT} -> /etc/caddy-naive/fullchain.pem"
-        return 1
-    fi
-    if ! cp "${NAIVE_KEY}" /etc/caddy-naive/privkey.pem; then
-        log_error "私钥复制失败: ${NAIVE_KEY} -> /etc/caddy-naive/privkey.pem"
-        return 1
-    fi
-    chown -R caddy-naive:caddy-naive /etc/caddy-naive
-    log_info "证书已复制到 /etc/caddy-naive/"
+    chown caddy-naive:caddy-naive /etc/caddy-naive/Caddyfile
+    log_info "已写入 /etc/caddy-naive/Caddyfile（直引用 letsencrypt 证书）"
 
     # ── 9. 写入 certbot deploy hook ──────────────────────────
+    # 续签后 certbot 生成新 privkeyN.pem（默认 600 root:root），
+    # hook 修复为 640 certaccess，然后 reload caddy-naive 使新证书生效。
     cat > /etc/letsencrypt/renewal-hooks/deploy/naive-cert.sh << 'HOOK'
 #!/bin/bash
 # Auto-generated by xray-nginx-deploy — NaiveProxy cert deploy hook
@@ -408,18 +454,17 @@ DOMAIN=$(get_naive_domain)
 [[ -z "$DOMAIN" ]] && { echo "[Naive Hook] 无法读取域名"; exit 1; }
 
 ROOT_DOMAIN=$(echo "$DOMAIN" | sed 's/^[^.]*\.//')
-SRC_FULLCHAIN="/etc/letsencrypt/live/${ROOT_DOMAIN}/fullchain.pem"
-SRC_PRIVKEY="/etc/letsencrypt/live/${ROOT_DOMAIN}/privkey.pem"
+ARCHIVE_DIR="/etc/letsencrypt/archive/${ROOT_DOMAIN}"
 
-if [[ -f "$SRC_FULLCHAIN" && -f "$SRC_PRIVKEY" ]]; then
-    cp "$SRC_FULLCHAIN" /etc/caddy-naive/fullchain.pem
-    cp "$SRC_PRIVKEY" /etc/caddy-naive/privkey.pem
-    chown -R caddy-naive:caddy-naive /etc/caddy-naive
-    systemctl restart caddy-naive.service
-    echo "[Naive Hook] 证书已更新: ${DOMAIN}"
-else
-    echo "[Naive Hook] 证书文件不存在，跳过: ${DOMAIN}"
+# 修复续签后新 privkeyN.pem 的权限（默认 600，caddy-naive 需要 640 certaccess）
+if [[ -d "$ARCHIVE_DIR" ]]; then
+    find "$ARCHIVE_DIR" -name "privkey*.pem" \
+        -exec chgrp certaccess {} \; -exec chmod 640 {} \;
+    echo "[Naive Hook] 已修复 ${ARCHIVE_DIR} 私钥权限"
 fi
+
+systemctl reload caddy-naive.service 2>/dev/null || systemctl restart caddy-naive.service
+echo "[Naive Hook] caddy-naive 已重载: ${DOMAIN}"
 HOOK
     chmod +x /etc/letsencrypt/renewal-hooks/deploy/naive-cert.sh
     log_info "已写入证书部署 hook"
