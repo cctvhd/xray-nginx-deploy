@@ -51,6 +51,7 @@ run_system_optimize() {
     log_step "========== 优化系统 =========="
     detect_os
     collect_hardware_info
+    collect_latency_tier
     install_base_tools           # 先装工具，后续优化依赖 ethtool/tc
     load_kernel_modules
     optimize_hardware_interrupts
@@ -218,6 +219,20 @@ collect_hardware_info() {
     esac
     log_info "磁盘类型已设为: ${HW_DISK_TYPE}"
 
+    # ── 服务器地区（同时决定 Reality dest 列表和伪装网页主题）──
+    echo ""
+    echo "服务器地区："
+    echo "  eu  = 欧洲（默认，波罗的海档案馆主题，Reality 选欧洲 dest）"
+    echo "  na  = 北美（多个域名自动轮换不同主题，Reality 选北美 dest）"
+    echo "  as  = 亚洲（Reality 选亚洲 dest，网页回落欧洲主题）"
+    echo "  新增北美主题：在 assets/fake-site-na/ 下建子目录放 index.html 即可"
+    local input_region
+    read -rp "地区 [当前: ${HW_REGION:-eu}，直接回车保持]: " input_region
+    if [[ -n "$input_region" ]]; then
+        HW_REGION="$input_region"
+    fi
+    log_info "地区已设为: ${HW_REGION:-eu}"
+
     # ── 确认最终值 ───────────────────────────────────────────
     echo ""
     log_info "═══ 最终硬件参数 ════════════════════════"
@@ -226,8 +241,64 @@ collect_hardware_info() {
     log_info "  磁盘类型   : ${HW_DISK_TYPE}"
     log_info "  网络栈     : ${HW_DUAL_STACK}"
     log_info "  带宽       : ${HW_BANDWIDTH}"
+    log_info "  地区模板   : ${HW_REGION:-（欧洲默认）}"
     log_info "════════════════════════════════════════"
     echo ""
+}
+
+# ── 网络延迟档位配置 ──────────────────────────────────────────
+collect_latency_tier() {
+    log_step "配置网络延迟档位..."
+
+    local current_level current_ms
+    current_level=$(get_state "LATENCY_LEVEL" "")
+    current_ms=$(get_state "LATENCY_MS" "")
+
+    if [[ -n "$current_level" ]]; then
+        log_info "当前延迟档位: ${current_level}（${current_ms}ms）"
+        local reconf
+        read -rp "是否重新配置延迟档位？[y/N]: " reconf
+        if [[ "${reconf,,}" != "y" ]]; then
+            LATENCY_LEVEL="$current_level"
+            LATENCY_MS="$current_ms"
+            return 0
+        fi
+    fi
+
+    echo ""
+    echo "  请选择服务器到客户端的网络延迟档位："
+    echo "    1) 低延迟  （≤80ms，亚太/国内直连）"
+    echo "    2) 中延迟  （80-150ms，东南亚/日韩）"
+    echo "    3) 高延迟  （150-300ms，欧美）"
+    echo "    4) 自定义  （手动输入 ms 值）"
+    echo ""
+    local tier_choice
+    read -rp "  请选择 [1-4，默认2]: " tier_choice
+
+    case "${tier_choice:-2}" in
+        1) LATENCY_LEVEL="low";    LATENCY_MS=40  ;;
+        2) LATENCY_LEVEL="medium"; LATENCY_MS=120 ;;
+        3) LATENCY_LEVEL="high";   LATENCY_MS=200 ;;
+        4)
+            local custom_ms
+            read -rp "  请输入延迟值（ms，整数，如 100）: " custom_ms
+            if [[ "$custom_ms" =~ ^[0-9]+$ ]]; then
+                LATENCY_MS="$custom_ms"
+                if   (( LATENCY_MS <= 80  )); then LATENCY_LEVEL="low"
+                elif (( LATENCY_MS <= 150 )); then LATENCY_LEVEL="medium"
+                else                               LATENCY_LEVEL="high"
+                fi
+            else
+                log_warn "无效输入，默认使用中延迟档位"
+                LATENCY_LEVEL="medium"; LATENCY_MS=120
+            fi
+            ;;
+        *)  LATENCY_LEVEL="medium"; LATENCY_MS=120 ;;
+    esac
+
+    save_state "LATENCY_LEVEL" "$LATENCY_LEVEL"
+    save_state "LATENCY_MS"    "$LATENCY_MS"
+    log_info "延迟档位已保存: ${LATENCY_LEVEL}（${LATENCY_MS}ms）"
 }
 
 # ── 检测虚拟化环境（仅用于日志） ─────────────────────────────
@@ -542,7 +613,7 @@ setup_selinux_policy() {
         fi
     fi
 
-    local ports=(20443 20445 20880 18443 9443 8443)
+    local ports=(8380 8390 8400 8360 8320 8330)
     local existing_http_ports
     existing_http_ports=$(semanage port -l 2>/dev/null | grep '^http_port_t' || true)
 
@@ -637,7 +708,7 @@ fi
 # ── 向后兼容别名 / 补全函数（install.sh 调用）────────────────
 
 detect_os() {
-    detect_virt_type "$@"
+    detect_virt_type
 
     local os_id os_name
     if [[ -f /etc/os-release ]]; then
@@ -746,8 +817,14 @@ upgrade_kernel() {
     grub2-set-default 0 2>/dev/null || true
 
     # 兼容 UEFI 和 BIOS 两种 grub 路径
-    local efi_dir
-    efi_dir=$(ls /boot/efi/EFI/ 2>/dev/null | grep -v '^BOOT$' | head -1)
+    local efi_dir="" d base
+    for d in /boot/efi/EFI/*/; do
+        [[ -d "$d" ]] || continue
+        base=$(basename "$d")
+        [[ "$base" == "BOOT" ]] && continue
+        efi_dir="$base"
+        break
+    done
     if [[ -n "$efi_dir" && -f "/boot/efi/EFI/${efi_dir}/grub.cfg" ]]; then
         grub2-mkconfig -o "/boot/efi/EFI/${efi_dir}/grub.cfg" >/dev/null 2>&1 || true
         log_info "UEFI grub 配置已更新 (/boot/efi/EFI/${efi_dir}/grub.cfg)"

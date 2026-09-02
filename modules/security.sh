@@ -1,0 +1,798 @@
+#!/usr/bin/env bash
+# ============================================================
+# modules/security.sh
+# SSH 登录安全检查与加固
+# ============================================================
+
+_security_ssh_service() {
+    if systemctl list-unit-files sshd.service >/dev/null 2>&1; then
+        echo "sshd"
+    elif systemctl list-unit-files ssh.service >/dev/null 2>&1; then
+        echo "ssh"
+    else
+        echo "sshd"
+    fi
+}
+
+_security_sshd_config_test() {
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -t
+    elif [[ -x /usr/sbin/sshd ]]; then
+        /usr/sbin/sshd -t
+    else
+        log_error "未找到 sshd 命令，无法验证 SSH 配置"
+        return 1
+    fi
+}
+
+_security_sshd_effective_config() {
+    if command -v sshd >/dev/null 2>&1; then
+        sshd -T 2>/dev/null
+    elif [[ -x /usr/sbin/sshd ]]; then
+        /usr/sbin/sshd -T 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+_security_sshd_effective_value() {
+    local key="$1"
+    awk -v k="$key" '$1 == k { $1=""; sub(/^ /, ""); print; exit }' <<< "${SSHD_EFFECTIVE_CONFIG:-}"
+}
+
+_security_effective_value_from() {
+    local config="$1" key="$2"
+    awk -v k="$key" '$1 == k { $1=""; sub(/^ /, ""); print; exit }' <<< "$config"
+}
+
+_security_current_ssh_ports() {
+    local ports effective_ports
+    effective_ports=$(awk '$1 == "port" { print $2 }' <<< "${SSHD_EFFECTIVE_CONFIG:-}" \
+        | sort -n -u \
+        | tr '\n' ' ' \
+        | sed 's/[[:space:]]*$//')
+    if [[ -n "$effective_ports" ]]; then
+        echo "$effective_ports"
+        return
+    fi
+
+    ports=$(ss -tlnp 2>/dev/null \
+        | awk '/sshd|ssh/{print $4}' \
+        | grep -oE '[0-9]+$' \
+        | sort -n -u \
+        | tr '\n' ' ' \
+        | sed 's/[[:space:]]*$//')
+    [[ -n "$ports" ]] && echo "$ports" || echo "22"
+}
+
+_security_validate_ports() {
+    local port
+    for port in $1; do
+        [[ "$port" =~ ^[0-9]+$ ]] || return 1
+        (( port >= 1 && port <= 65535 )) || return 1
+    done
+}
+
+_security_has_authorized_key() {
+    local path
+    if (( ${#SECURITY_AUTHORIZED_KEY_FILES[@]} == 0 )); then
+        SECURITY_AUTHORIZED_KEY_FILES=("/root/.ssh/authorized_keys")
+    fi
+    for path in "${SECURITY_AUTHORIZED_KEY_FILES[@]}"; do
+        [[ -s "$path" ]] && return 0
+    done
+    return 1
+}
+
+_security_root_authorized_key_files() {
+    local configured="${1:-}" entry expanded
+    configured="${configured:-.ssh/authorized_keys}"
+
+    SECURITY_AUTHORIZED_KEY_FILES=()
+    for entry in $configured; do
+        case "$entry" in
+            AuthorizedKeysCommand*) continue ;;
+            none) continue ;;
+            ./*) expanded="/root/${entry#./}" ;;
+            /*) expanded="$entry" ;;
+            *) expanded="/root/$entry" ;;
+        esac
+        SECURITY_AUTHORIZED_KEY_FILES+=("$expanded")
+    done
+
+    if (( ${#SECURITY_AUTHORIZED_KEY_FILES[@]} == 0 )); then
+        SECURITY_AUTHORIZED_KEY_FILES=("/root/.ssh/authorized_keys")
+    fi
+}
+
+_security_primary_authorized_key_file() {
+    echo "${SECURITY_AUTHORIZED_KEY_FILES[0]:-/root/.ssh/authorized_keys}"
+}
+
+_security_ensure_dropin_include() {
+    local main_conf="/etc/ssh/sshd_config" first_active
+    [[ -f "$main_conf" ]] || return 0
+
+    first_active=$(awk '/^[[:space:]]*($|#)/ { next } { print; exit }' "$main_conf")
+    if [[ "$first_active" =~ ^[[:space:]]*[Ii]nclude[[:space:]]+/etc/ssh/sshd_config\.d/\*\.conf([[:space:]]|$) ]]; then
+        return 0
+    fi
+
+    SECURITY_MAIN_CONF_BACKUP="${main_conf}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -f "$main_conf" "$SECURITY_MAIN_CONF_BACKUP"
+    {
+        echo "Include /etc/ssh/sshd_config.d/*.conf"
+        sed '/^[[:space:]]*Include[[:space:]]\+\/etc\/ssh\/sshd_config\.d\/\*\.conf/I d' "$main_conf"
+    } > "${main_conf}.tmp.$$"
+    mv -f "${main_conf}.tmp.$$" "$main_conf"
+    log_info "已在 ${main_conf} 启用 sshd_config.d drop-in"
+}
+
+_security_managed_directives() {
+    cat <<'EOF'
+port
+pubkeyauthentication
+authorizedkeysfile
+authenticationmethods
+permitrootlogin
+passwordauthentication
+kbdinteractiveauthentication
+challengeresponseauthentication
+hostbasedauthentication
+permitemptypasswords
+gssapiauthentication
+usepam
+clientaliveinterval
+clientalivecountmax
+x11forwarding
+gatewayports
+allowagentforwarding
+allowtcpforwarding
+maxauthtries
+logingracetime
+maxsessions
+maxstartups
+permittunnel
+allowstreamlocalforwarding
+addressfamily
+listenaddress
+tcpkeepalive
+kexalgorithms
+ciphers
+macs
+strictmodes
+ignorerhosts
+printmotd
+printlastlog
+banner
+syslogfacility
+loglevel
+EOF
+}
+
+_security_managed_directives_regex() {
+    _security_managed_directives | paste -sd'|' -
+}
+
+_security_dropin_files() {
+    local dropin_dir="$1"
+    [[ -d "$dropin_dir" ]] || return 0
+    find "$dropin_dir" -maxdepth 1 -type f -name "*.conf" -print 2>/dev/null | sort
+}
+
+_security_dropin_conflicts() {
+    local target="$1" dropin_dir file keys
+    dropin_dir=$(dirname "$target")
+    keys=$(_security_managed_directives_regex)
+
+    while IFS= read -r file; do
+        [[ "$file" == "$target" ]] && continue
+        awk -v keys="$keys" '
+            BEGIN {
+                split(keys, items, "|")
+                for (i in items) managed[items[i]] = 1
+            }
+            /^[[:space:]]*($|#)/ { next }
+            tolower($1) == "match" { exit }
+            /^[[:space:]]*[Ii]nclude[[:space:]]+\/etc\/crypto-policies\// {
+                print FILENAME ":" FNR ": " $0
+                next
+            }
+            {
+                key = tolower($1)
+                if (managed[key]) {
+                    print FILENAME ":" FNR ": " $0
+                }
+            }
+        ' "$file"
+    done < <(_security_dropin_files "$dropin_dir")
+}
+
+_security_comment_conflicting_dropins() {
+    local target="$1" dropin_dir file keys tmp changed total=0
+    dropin_dir=$(dirname "$target")
+    keys=$(_security_managed_directives_regex)
+
+    while IFS= read -r file; do
+        [[ "$file" == "$target" ]] && continue
+        changed=0
+        tmp="${file}.tmp.$$"
+        awk -v keys="$keys" '
+            BEGIN {
+                split(keys, items, "|")
+                for (i in items) managed[items[i]] = 1
+            }
+            /^[[:space:]]*($|#)/ { print; next }
+            tolower($1) == "match" {
+                print
+                in_match = 1
+                next
+            }
+            in_match { print; next }
+            {
+                key = tolower($1)
+                if (managed[key]) {
+                    print "# disabled by xray-nginx-deploy security module: " $0
+                    changed = 1
+                    next
+                }
+                print
+            }
+            END { exit changed ? 10 : 0 }
+        ' "$file" > "$tmp" || changed=$?
+
+        if [[ "$changed" == "10" ]]; then
+            local backup
+            backup="${file}.bak.$(date +%Y%m%d%H%M%S)"
+            cp -f "$file" "$backup"
+            mv -f "$tmp" "$file"
+            SECURITY_MODIFIED_DROPINS+=("${file}|${backup}")
+            log_info "已注释冲突项: ${file}"
+            total=$((total + 1))
+        else
+            rm -f "$tmp"
+        fi
+    done < <(_security_dropin_files "$dropin_dir")
+
+    (( total > 0 )) && log_info "已处理 ${total} 个 SSH drop-in 配置文件"
+}
+
+_security_restore_modified_dropins() {
+    local item file backup
+    for item in "${SECURITY_MODIFIED_DROPINS[@]:-}"; do
+        file=${item%%|*}
+        backup=${item#*|}
+        [[ -f "$backup" ]] || continue
+        cp -f "$backup" "$file"
+        log_warn "已恢复 SSH drop-in 备份: ${file}"
+    done
+    if [[ -n "${SECURITY_MAIN_CONF_BACKUP:-}" && -f "$SECURITY_MAIN_CONF_BACKUP" ]]; then
+        cp -f "$SECURITY_MAIN_CONF_BACKUP" /etc/ssh/sshd_config
+        log_warn "已恢复 /etc/ssh/sshd_config 备份"
+    fi
+}
+
+_security_latest_backup() {
+    local pattern="$1" latest=""
+    while IFS= read -r backup; do
+        latest="$backup"
+        break
+    done < <(find "$(dirname "$pattern")" -maxdepth 1 -type f -name "$(basename "$pattern")" -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn \
+        | awk '{print $2}')
+    [[ -n "$latest" ]] && echo "$latest"
+}
+
+_security_effective_ports_match() {
+    local effective="$1" expected="$2" effective_ports expected_ports
+    effective_ports=$(awk '$1 == "port" { print $2 }' <<< "$effective" \
+        | sort -n -u \
+        | tr '\n' ' ' \
+        | sed 's/[[:space:]]*$//')
+    expected_ports=$(printf '%s\n' "$expected" \
+        | tr ' ' '\n' \
+        | sort -n -u \
+        | tr '\n' ' ' \
+        | sed 's/[[:space:]]*$//')
+    [[ "$effective_ports" == "$expected_ports" ]]
+}
+
+_security_require_effective_value() {
+    local effective="$1" key="$2" expected="$3" actual
+    actual=$(_security_effective_value_from "$effective" "$key")
+    if [[ "$actual" != "$expected" ]]; then
+        log_error "SSH 生效配置不符合预期: ${key}=${actual:-missing}，期望 ${expected}"
+        return 1
+    fi
+}
+
+_security_verify_effective_config() {
+    local effective="$1" ssh_ports="$2" root_login="$3" allow_forward="$4" gateway_ports="$5"
+    local permit_tunnel="$6" alive_interval="$7" crypto_mode="$8"
+
+    _security_effective_ports_match "$effective" "$ssh_ports" || {
+        log_error "SSH 生效端口不符合预期: ${ssh_ports}"
+        return 1
+    }
+    # 'without-password' is a legacy alias for 'prohibit-password'; normalize before comparing
+    local actual_root_login normalized_expected
+    actual_root_login=$(_security_effective_value_from "$effective" "permitrootlogin")
+    [[ "$actual_root_login" == "without-password" ]] && actual_root_login="prohibit-password"
+    normalized_expected="$root_login"
+    [[ "$normalized_expected" == "without-password" ]] && normalized_expected="prohibit-password"
+    if [[ "$actual_root_login" != "$normalized_expected" ]]; then
+        log_error "SSH 生效配置不符合预期: permitrootlogin=${actual_root_login:-missing}，期望 ${normalized_expected}"
+        return 1
+    fi
+    _security_require_effective_value "$effective" "passwordauthentication" "no" || return 1
+    _security_require_effective_value "$effective" "kbdinteractiveauthentication" "no" || return 1
+    _security_require_effective_value "$effective" "pubkeyauthentication" "yes" || return 1
+    _security_require_effective_value "$effective" "authenticationmethods" "publickey" || return 1
+    _security_require_effective_value "$effective" "clientaliveinterval" "$alive_interval" || return 1
+    _security_require_effective_value "$effective" "clientalivecountmax" "10" || return 1
+    _security_require_effective_value "$effective" "allowtcpforwarding" "$allow_forward" || return 1
+    _security_require_effective_value "$effective" "allowagentforwarding" "$allow_forward" || return 1
+    _security_require_effective_value "$effective" "gatewayports" "$gateway_ports" || return 1
+    _security_require_effective_value "$effective" "permittunnel" "$permit_tunnel" || return 1
+    _security_require_effective_value "$effective" "allowstreamlocalforwarding" "no" || return 1
+    _security_require_effective_value "$effective" "maxauthtries" "3" || return 1
+    _security_require_effective_value "$effective" "logingracetime" "30" || return 1
+    _security_require_effective_value "$effective" "maxsessions" "3" || return 1
+    _security_require_effective_value "$effective" "maxstartups" "3:30:10" || return 1
+    _security_require_effective_value "$effective" "strictmodes" "yes" || return 1
+    [[ "$crypto_mode" == "modern" ]] || return 0
+    # When system crypto-policy manages algorithms, skip exact match — policy enforces security
+    [[ "${SECURITY_USE_CRYPTO_POLICY:-0}" == "1" ]] && return 0
+    _security_require_effective_value "$effective" "kexalgorithms" "curve25519-sha256,diffie-hellman-group16-sha512" || return 1
+    _security_require_effective_value "$effective" "ciphers" "chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com" || return 1
+    _security_require_effective_value "$effective" "macs" "hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com" || return 1
+}
+
+_security_ports_listening() {
+    local ssh_ports="$1" port listening
+    listening=$(ss -tln 2>/dev/null || true)
+    for port in $ssh_ports; do
+        if ! awk -v p="$port" '$4 ~ ":" p "$" { found = 1 } END { exit found ? 0 : 1 }' <<< "$listening"; then
+            log_error "SSH 重启后未检测到端口 ${port} 正在监听"
+            return 1
+        fi
+    done
+}
+
+_security_restore_security_dropin() {
+    local dropin="$1" latest_backup
+    latest_backup=$(_security_latest_backup "${dropin}.bak.*")
+    if [[ -n "$latest_backup" ]]; then
+        cp -f "$latest_backup" "$dropin"
+    else
+        rm -f "$dropin"
+    fi
+}
+
+_security_apply_crypto_policy() {
+    local policy="$1"
+    command -v update-crypto-policies >/dev/null 2>&1 || return 1
+    local current
+    current=$(update-crypto-policies --show 2>/dev/null | tr -d '[:space:]' || true)
+    SECURITY_CRYPTO_POLICY_BACKUP="${current:-}"
+    if update-crypto-policies --set "$policy" >/dev/null 2>&1; then
+        log_info "已设置系统 crypto-policy: ${policy}（原: ${current:-unknown}）"
+        return 0
+    fi
+    log_warn "update-crypto-policies --set ${policy} 执行失败，将使用显式算法配置"
+    SECURITY_CRYPTO_POLICY_BACKUP=""
+    return 1
+}
+
+_security_restore_crypto_policy() {
+    [[ -z "${SECURITY_CRYPTO_POLICY_BACKUP:-}" ]] && return 0
+    command -v update-crypto-policies >/dev/null 2>&1 || return 0
+    update-crypto-policies --set "$SECURITY_CRYPTO_POLICY_BACKUP" 2>/dev/null || true
+    log_warn "已恢复系统 crypto-policy: ${SECURITY_CRYPTO_POLICY_BACKUP}"
+    SECURITY_CRYPTO_POLICY_BACKUP=""
+}
+
+_security_key_valid() {
+    local key type keydata
+    key=$(printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+    [[ -z "$key" ]] && return 1
+    type=$(awk '{print $1}' <<< "$key")
+    keydata=$(awk '{print $2}' <<< "$key")
+    [[ ${#keydata} -lt 40 ]] && return 1
+    case "$type" in
+        ssh-ed25519|sk-ssh-ed25519@openssh.com) ;;
+        ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521) ;;
+        sk-ecdsa-sha2-nistp256@openssh.com) ;;
+        ssh-rsa) log_warn "检测到 ssh-rsa；建议改用 ED25519 新密钥" ;;
+        ssh-dss) log_warn "ssh-dss 已不安全，强烈建议更换 ED25519 密钥" ;;
+        *) return 1 ;;
+    esac
+    SECURITY_KEY_TYPE="$type"
+    return 0
+}
+
+_security_key_user_home() {
+    local user="$1" home
+    if command -v getent >/dev/null 2>&1; then
+        home=$(getent passwd "$user" 2>/dev/null | cut -d: -f6)
+    fi
+    [[ -z "$home" ]] && home=$(awk -F: -v u="$user" '$1==u{print $6;exit}' /etc/passwd 2>/dev/null)
+    if [[ -z "$home" ]]; then
+        [[ "$user" == "root" ]] && home="/root" || home="/home/$user"
+    fi
+    echo "$home"
+}
+
+_security_key_file_for() {
+    local user="$1" home pattern entry
+    home=$(_security_key_user_home "$user")
+    pattern=""
+    [[ -n "${SSHD_EFFECTIVE_CONFIG:-}" ]] && pattern=$(_security_sshd_effective_value "authorizedkeysfile")
+    [[ -z "$pattern" ]] && pattern=".ssh/authorized_keys"
+    entry=$(awk '{print $1}' <<< "$pattern")
+    entry="${entry//%u/$user}"
+    entry="${entry//%h/$home}"
+    entry="${entry//%H/$home}"
+    case "$entry" in
+        /*) echo "$entry" ;;
+        ./*) echo "${home}/${entry#./}" ;;
+        *) echo "${home}/${entry}" ;;
+    esac
+}
+
+_security_key_ensure_dir() {
+    local key_file="$1" user="${2:-root}" key_dir
+    key_dir=$(dirname "$key_file")
+    mkdir -p "$key_dir"
+    chmod 700 "$key_dir"
+    [[ -f "$key_file" ]] || touch "$key_file"
+    chmod 600 "$key_file"
+    if [[ "$user" != "root" ]]; then
+        chown "$user:" "$key_dir" "$key_file" 2>/dev/null || true
+    fi
+    command -v restorecon >/dev/null 2>&1 \
+        && restorecon -v "$key_dir" "$key_file" 2>/dev/null || true
+}
+
+_security_key_list() {
+    local key_file="$1" i=0 line ktype kcomment
+    if [[ ! -s "$key_file" ]]; then
+        log_info "（无授权公钥）"
+        return 0
+    fi
+    while IFS= read -r line; do
+        [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+        (( i++ ))
+        ktype=$(awk '{print $1}' <<< "$line")
+        kcomment=$(awk 'NF>=3{for(j=3;j<=NF;j++) printf "%s%s",$j,(j<NF?" ":""); print ""}' <<< "$line")
+        printf "  %2d. %-40s  %s\n" "$i" "$ktype" "${kcomment:-（无注释）}"
+    done < "$key_file"
+}
+
+_security_key_append() {
+    local key_file="$1" key="$2" user="${3:-root}"
+    _security_key_ensure_dir "$key_file" "$user"
+    if grep -qxF "$key" "$key_file" 2>/dev/null; then
+        log_info "该公钥已存在，跳过追加"
+        return 0
+    fi
+    printf '%s\n' "$key" >> "$key_file"
+    log_info "公钥已追加 → ${key_file}"
+}
+
+_security_key_replace() {
+    local key_file="$1" key="$2" user="${3:-root}" backup
+    _security_key_ensure_dir "$key_file" "$user"
+    if [[ -s "$key_file" ]]; then
+        backup="${key_file}.bak.$(date +%Y%m%d%H%M%S)"
+        cp -f "$key_file" "$backup"
+        log_info "已备份原文件 → ${backup}"
+    fi
+    printf '%s\n' "$key" > "$key_file"
+    log_info "authorized_keys 已替换 → ${key_file}"
+}
+
+_security_add_authorized_key_interactive() {
+    local key key_file
+    key_file=$(_security_primary_authorized_key_file)
+
+    echo ""
+    log_warn "未检测到 root 可用 SSH 公钥。"
+    log_info "将写入: ${key_file}"
+    read -rp "是否现在粘贴一个 SSH 公钥？[y/N]: " add_key
+    [[ "${add_key,,}" != "y" ]] && return 1
+
+    echo "请粘贴单行公钥（推荐 ssh-ed25519 AAAA... comment）："
+    read -r key
+    if ! _security_key_valid "$key"; then
+        log_error "公钥格式看起来不正确，已取消写入"
+        return 1
+    fi
+    _security_key_append "$key_file" "$key"
+}
+
+run_security_ssh() {
+    log_step "========== SSH 登录安全检查与加固 =========="
+
+    local service current_ports ssh_ports root_login allow_forward gateway_ports permit_tunnel alive_interval
+    local crypto_mode effective_after
+    local current_root_login current_password_auth current_pubkey_auth current_auth_keys
+    local current_allow_forward current_gateway_ports current_permit_tunnel current_alive_interval conflicts
+    service=$(_security_ssh_service)
+    SSHD_EFFECTIVE_CONFIG=$(_security_sshd_effective_config || true)
+    current_ports=$(_security_current_ssh_ports)
+    current_root_login=$(_security_sshd_effective_value "permitrootlogin")
+    current_password_auth=$(_security_sshd_effective_value "passwordauthentication")
+    current_pubkey_auth=$(_security_sshd_effective_value "pubkeyauthentication")
+    current_auth_keys=$(_security_sshd_effective_value "authorizedkeysfile")
+    current_allow_forward=$(_security_sshd_effective_value "allowtcpforwarding")
+    current_gateway_ports=$(_security_sshd_effective_value "gatewayports")
+    current_permit_tunnel=$(_security_sshd_effective_value "permittunnel")
+    current_alive_interval=$(_security_sshd_effective_value "clientaliveinterval")
+    _security_root_authorized_key_files "$current_auth_keys"
+
+    echo ""
+    log_info "SSH 服务: ${service}.service"
+    log_info "当前监听端口: ${current_ports}"
+    log_info "当前 root 登录策略: ${current_root_login:-unknown}"
+    log_info "当前密码登录: ${current_password_auth:-unknown} | 公钥登录: ${current_pubkey_auth:-unknown}"
+    log_info "当前 AuthorizedKeysFile: ${current_auth_keys:-.ssh/authorized_keys}"
+    log_info "root 密钥检查路径: ${SECURITY_AUTHORIZED_KEY_FILES[*]}"
+    read -rp "SSH 端口（多个用空格分隔）[默认: ${current_ports}]: " ssh_ports
+    ssh_ports="${ssh_ports:-$current_ports}"
+    if ! _security_validate_ports "$ssh_ports"; then
+        log_error "SSH 端口格式无效: ${ssh_ports}"
+        return 1
+    fi
+
+    if ! _security_has_authorized_key; then
+        _security_add_authorized_key_interactive || {
+            log_warn "没有确认可用 SSH 公钥，本次不会禁用密码登录或重启 sshd。"
+            save_state "SSH_PORTS" "$ssh_ports"
+            save_state "CONF_SECURITY_SSH" "0"
+            return 0
+        }
+    fi
+
+    if ! _security_has_authorized_key; then
+        log_warn "authorized_keys 仍为空，本次不会写入加固配置。"
+        save_state "SSH_PORTS" "$ssh_ports"
+        save_state "CONF_SECURITY_SSH" "0"
+        return 0
+    fi
+
+    echo ""
+    echo "Root 登录策略:"
+    echo "  1. prohibit-password（推荐，仅允许密钥登录）"
+    echo "  2. no（完全禁止 root 登录）"
+    echo "  3. 保持当前值 (${current_root_login:-prohibit-password})"
+    read -rp "输入序号 [1-3，默认 1]: " root_choice
+    case "${root_choice:-1}" in
+        2) root_login="no" ;;
+        3) root_login="${current_root_login:-prohibit-password}" ;;
+        *) root_login="prohibit-password" ;;
+    esac
+
+    read -rp "是否允许 TCP/Agent 转发？[y/N/keep]: " forward_choice
+    case "${forward_choice,,}" in
+        y) allow_forward="yes" ;;
+        keep|k) allow_forward="${current_allow_forward:-yes}" ;;
+        *) allow_forward="no" ;;
+    esac
+
+    read -rp "是否允许远程转发绑定非 loopback？[y/N/keep]: " gateway_choice
+    case "${gateway_choice,,}" in
+        y) gateway_ports="yes" ;;
+        keep|k) gateway_ports="${current_gateway_ports:-no}" ;;
+        *) gateway_ports="no" ;;
+    esac
+
+    read -rp "是否允许 SSH tun 隧道？[y/N/keep]: " tunnel_choice
+    case "${tunnel_choice,,}" in
+        y) permit_tunnel="yes" ;;
+        keep|k) permit_tunnel="${current_permit_tunnel:-no}" ;;
+        *) permit_tunnel="no" ;;
+    esac
+
+    read -rp "ClientAliveInterval 秒数 [默认: ${current_alive_interval:-60}]: " alive_interval
+    alive_interval="${alive_interval:-${current_alive_interval:-60}}"
+    if ! [[ "$alive_interval" =~ ^[0-9]+$ ]] || (( alive_interval < 30 )); then
+        log_error "ClientAliveInterval 必须是 >= 30 的数字"
+        return 1
+    fi
+
+    echo ""
+    echo "SSH 加密算法模式:"
+    echo "  1. modern（推荐，现代高性能算法，旧客户端可能不兼容）"
+    echo "  2. compatible（使用系统默认算法，兼容性更好）"
+    read -rp "输入序号 [1-2，默认 1]: " crypto_choice
+    case "${crypto_choice:-1}" in
+        2) crypto_mode="compatible" ;;
+        *) crypto_mode="modern" ;;
+    esac
+
+    local dropin_dir="/etc/ssh/sshd_config.d"
+    local dropin="${dropin_dir}/99-xray-deploy-security.conf"
+    SECURITY_MODIFIED_DROPINS=()
+    SECURITY_MAIN_CONF_BACKUP=""
+    SECURITY_CRYPTO_POLICY_BACKUP=""
+    SECURITY_USE_CRYPTO_POLICY=0
+    if [[ "$crypto_mode" == "modern" ]] && _security_apply_crypto_policy "DEFAULT:NO-SHA1"; then
+        SECURITY_USE_CRYPTO_POLICY=1
+    fi
+    mkdir -p "$dropin_dir"
+    _security_ensure_dropin_include
+
+    conflicts=$(_security_dropin_conflicts "$dropin")
+    if [[ -n "$conflicts" ]]; then
+        echo ""
+        log_warn "检测到 sshd_config.d 中存在与本模块冲突的指令，将自动注销这些配置项并备份原文件。"
+        printf '%s\n' "$conflicts"
+        _security_comment_conflicting_dropins "$dropin"
+    fi
+
+    [[ -f "$dropin" ]] && cp -f "$dropin" "${dropin}.bak.$(date +%Y%m%d%H%M%S)"
+
+    {
+        echo "# Auto-generated by xray-nginx-deploy security module"
+        for port in $ssh_ports; do
+            echo "Port ${port}"
+        done
+        echo "AddressFamily inet"
+        echo "ListenAddress 0.0.0.0"
+        echo "PubkeyAuthentication yes"
+        echo "AuthorizedKeysFile ${current_auth_keys:-.ssh/authorized_keys}"
+        echo "AuthenticationMethods publickey"
+        echo "PermitRootLogin ${root_login}"
+        echo "PasswordAuthentication no"
+        echo "KbdInteractiveAuthentication no"
+        echo "ChallengeResponseAuthentication no"
+        echo "HostbasedAuthentication no"
+        echo "PermitEmptyPasswords no"
+        echo "GSSAPIAuthentication no"
+        echo "UsePAM yes"
+        echo "ClientAliveInterval ${alive_interval}"
+        echo "ClientAliveCountMax 10"
+        echo "X11Forwarding no"
+        echo "GatewayPorts ${gateway_ports}"
+        echo "AllowAgentForwarding ${allow_forward}"
+        echo "AllowTcpForwarding ${allow_forward}"
+        echo "MaxAuthTries 3"
+        echo "LoginGraceTime 30"
+        echo "MaxSessions 3"
+        echo "MaxStartups 3:30:10"
+        echo "PermitTunnel ${permit_tunnel}"
+        echo "AllowStreamLocalForwarding no"
+        echo "StrictModes yes"
+        echo "IgnoreRhosts yes"
+        echo "TCPKeepAlive yes"
+        echo "PrintMotd no"
+        echo "PrintLastLog yes"
+        echo "Banner none"
+        if [[ "$crypto_mode" == "modern" && "${SECURITY_USE_CRYPTO_POLICY:-0}" == "0" ]]; then
+            echo "KexAlgorithms curve25519-sha256,diffie-hellman-group16-sha512"
+            echo "Ciphers chacha20-poly1305@openssh.com,aes256-gcm@openssh.com,aes128-gcm@openssh.com"
+            echo "MACs hmac-sha2-512-etm@openssh.com,hmac-sha2-256-etm@openssh.com"
+        fi
+        echo "SyslogFacility AUTHPRIV"
+        echo "LogLevel VERBOSE"
+    } > "$dropin"
+
+    log_info "已写入 ${dropin}"
+    log_step "验证 SSH 配置语法..."
+    if ! _security_sshd_config_test; then
+        log_error "SSH 配置验证失败，已恢复备份（如存在）"
+        _security_restore_security_dropin "$dropin"
+        _security_restore_modified_dropins
+        _security_restore_crypto_policy
+        return 1
+    fi
+
+    log_step "验证 SSH 生效配置..."
+    effective_after=$(_security_sshd_effective_config || true)
+    if [[ -z "$effective_after" ]] || ! _security_verify_effective_config "$effective_after" "$ssh_ports" "$root_login" "$allow_forward" "$gateway_ports" "$permit_tunnel" "$alive_interval" "$crypto_mode"; then
+        log_error "SSH 生效配置验证失败，已恢复备份（如存在）"
+        _security_restore_security_dropin "$dropin"
+        _security_restore_modified_dropins
+        _security_restore_crypto_policy
+        return 1
+    fi
+
+    echo ""
+    log_warn "不要关闭当前 SSH 会话。重启后请新开终端测试端口: ${ssh_ports}"
+    read -rp "确认现在重启 ${service}.service？[y/N]: " restart_ssh
+    if [[ "${restart_ssh,,}" != "y" ]]; then
+        log_warn "已写入配置但未重启 SSH，配置尚未生效"
+        save_state "SSH_PORTS" "$ssh_ports"
+        save_state "CONF_SECURITY_SSH" "0"
+        return 0
+    fi
+
+    if ! systemctl restart "${service}.service"; then
+        log_error "SSH 重启失败"
+        _security_restore_security_dropin "$dropin"
+        _security_restore_modified_dropins
+        _security_restore_crypto_policy
+        systemctl restart "${service}.service" 2>/dev/null || true
+        return 1
+    fi
+    if ! _security_ports_listening "$ssh_ports"; then
+        _security_restore_security_dropin "$dropin"
+        _security_restore_modified_dropins
+        _security_restore_crypto_policy
+        systemctl restart "${service}.service" 2>/dev/null || true
+        return 1
+    fi
+
+    save_state "SSH_PORTS" "$ssh_ports"
+    save_state "SSH_ROOT_LOGIN" "$root_login"
+    save_state "SSH_ALLOW_FORWARD" "$allow_forward"
+    save_state "SSH_GATEWAY_PORTS" "$gateway_ports"
+    save_state "SSH_PERMIT_TUNNEL" "$permit_tunnel"
+    save_state "SSH_CLIENT_ALIVE_INTERVAL" "$alive_interval"
+    save_state "SSH_CRYPTO_MODE" "$crypto_mode"
+    save_state "SSH_AUTHORIZED_KEYS_FILE" "$(_security_primary_authorized_key_file)"
+    save_state "CONF_SECURITY_SSH" "1"
+
+    log_info "SSH 已重启。请立即用新终端测试: ssh -p $(awk '{print $1}' <<< "$ssh_ports") root@<服务器IP>"
+    log_info "========== SSH 登录安全检查与加固完成 =========="
+}
+
+run_security_keys() {
+    log_step "========== SSH 公钥管理 =========="
+    [[ -z "${SSHD_EFFECTIVE_CONFIG:-}" ]] && SSHD_EFFECTIVE_CONFIG=$(_security_sshd_effective_config || true)
+
+    echo ""
+    local target_user key_file
+    read -rp "管理哪个用户的公钥？[默认: root]: " target_user
+    target_user="${target_user:-root}"
+
+    local user_exists=0
+    if command -v getent >/dev/null 2>&1; then
+        getent passwd "$target_user" >/dev/null 2>&1 && user_exists=1
+    else
+        grep -q "^${target_user}:" /etc/passwd 2>/dev/null && user_exists=1
+    fi
+    if (( user_exists == 0 )); then
+        log_error "用户 ${target_user} 不存在"
+        return 1
+    fi
+
+    key_file=$(_security_key_file_for "$target_user")
+    log_info "公钥文件: ${key_file}"
+
+    echo ""
+    log_info "当前已授权公钥:"
+    _security_key_list "$key_file"
+
+    echo ""
+    echo "操作:"
+    echo "  a. 追加公钥（自动去重）"
+    echo "  r. 替换（备份原文件后重写）"
+    echo "  q. 返回"
+    read -rp "请选择 [a/r/q]: " key_action
+    echo ""
+
+    case "${key_action,,}" in
+        a|r)
+            echo "请粘贴单行公钥（ssh-ed25519 / ecdsa-sha2-nistp* / ssh-rsa）："
+            read -r new_key
+            if ! _security_key_valid "$new_key"; then
+                log_error "公钥格式不正确（期望: TYPE AAAA... [comment]），已取消"
+                return 1
+            fi
+            if [[ "${key_action,,}" == "a" ]]; then
+                _security_key_append "$key_file" "$new_key" "$target_user"
+            else
+                _security_key_replace "$key_file" "$new_key" "$target_user"
+            fi
+            echo ""
+            log_info "操作后 authorized_keys:"
+            _security_key_list "$key_file"
+            ;;
+        q|Q) return 0 ;;
+        *) log_warn "无效选择，已取消"; return 0 ;;
+    esac
+
+    log_info "========== SSH 公钥管理完成 =========="
+}

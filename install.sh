@@ -28,7 +28,7 @@ STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync uninstall upgrade)
+DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync security firewall crowdsec uninstall upgrade)
 ALL_MODULES=()
 
 init_module_list() {
@@ -136,7 +136,7 @@ get_state() {
 save_state() {
     local key="$1"
     local value="$2"
-    local escaped
+    local escaped tmp_file
 
     mkdir -p "$STATE_DIR" || return 1
     chmod 700 "$STATE_DIR" || return 1
@@ -144,8 +144,16 @@ save_state() {
     chmod 600 "$STATE_FILE" || return 1
 
     escaped=$(printf '%s' "$value" | sed "s/'/'\\\\''/g")
-    sed -i "/^${key}=/d" "$STATE_FILE" || return 1
-    echo "${key}='${escaped}'" >> "$STATE_FILE" || return 1
+    tmp_file="${STATE_FILE}.tmp.$$"
+
+    # 原子写入：在内存构建完整内容 → 写 .tmp → mv（同 fs 下原子）
+    # 任一步失败都不污染正式文件
+    {
+        grep -v "^${key}=" "$STATE_FILE" 2>/dev/null || true
+        echo "${key}='${escaped}'"
+    } > "$tmp_file" || { rm -f "$tmp_file"; return 1; }
+    chmod 600 "$tmp_file" 2>/dev/null || true
+    mv -f "$tmp_file" "$STATE_FILE" || { rm -f "$tmp_file"; return 1; }
 }
 
 get_step() {
@@ -246,9 +254,496 @@ register_domain() {
     fi
 }
 
+# ── 解析协议槽位的主域名 ────────────────────────────────────
+# 用法: _resolve_protocol_primary <slot> <候选1> [<候选2> ...]
+# 0 候选 → 清空 + 输出空
+# 1 候选 → 用之 + 设 DOMAIN_PRIMARY_<slot>
+# 2+ 候选 → 优先用现有 DOMAIN_PRIMARY_<slot>（如仍在候选里），
+#           否则用最后一个（最新注册），log_warn 提示用户
+# 注意: 所有日志写 stderr，stdout 仅输出选中的域名
+_resolve_protocol_primary() {
+    local slot="$1"; shift
+    local -a cands=("$@")
+    local primary_key="DOMAIN_PRIMARY_${slot}"
+    local current chosen
+
+    if [[ ${#cands[@]} -eq 0 ]]; then
+        save_state "$primary_key" ""
+        echo ""
+        return
+    fi
+
+    if [[ ${#cands[@]} -eq 1 ]]; then
+        save_state "$primary_key" "${cands[0]}"
+        echo "${cands[0]}"
+        return
+    fi
+
+    # 多候选：先看是否已显式指定 PRIMARY 且仍在候选里
+    current=$(get_state "$primary_key" "")
+    if [[ -n "$current" ]]; then
+        local c
+        for c in "${cands[@]}"; do
+            if [[ "$c" == "$current" ]]; then
+                echo "$current"
+                return
+            fi
+        done
+    fi
+
+    # 退回到最后一个候选（最新注册）
+    chosen="${cands[-1]}"
+    log_warn "协议槽位 ${slot} 有多个候选: ${cands[*]}" >&2
+    log_warn "  未指定 DOMAIN_PRIMARY_${slot} 或已失效，自动选择最新: ${chosen}" >&2
+    log_warn "  如需改主域名，可在编辑器或重配置时显式指定" >&2
+    save_state "$primary_key" "$chosen"
+    echo "$chosen"
+}
+
+# ════════════════════════════════════════════════════════════
+# Preflight 配置健康互锁（5 项检查 + 软警告）
+# ════════════════════════════════════════════════════════════
+# 纯函数：只读 state，stderr 输出诊断，stdout 不污染
+# 返回: 0 = 全过；非 0 = 至少一项硬失败
+# 用法: preflight_config_check [<context>]
+#       <context> 仅用于错误信息标注调用阶段（do_conf_nginx 等）
+#
+# 设计原则：
+# - 任何 *_DOMAIN 为空时跳过对应槽位（首次安装/未启用不应阻塞）
+# - Check 1 / 2 / 3 / 4a / 4c / 5b/c/d → 硬失败
+# - Check 5a (domain_map.conf 漂移) → 软警告
+
+_PREFLIGHT_FAIL_COUNT=0
+_PREFLIGHT_WARN_COUNT=0
+
+_preflight_fail() {
+    # args: title, detail, impact, fix
+    echo "" >&2
+    echo -e "${RED}[PREFLIGHT FAIL]${NC} $1" >&2
+    echo "  $2" >&2
+    echo "  影响：$3" >&2
+    echo "  修复：$4" >&2
+    _PREFLIGHT_FAIL_COUNT=$((_PREFLIGHT_FAIL_COUNT + 1))
+}
+
+_preflight_warn() {
+    echo "" >&2
+    echo -e "${YELLOW}[PREFLIGHT WARN]${NC} $1" >&2
+    echo "  $2" >&2
+    echo "  影响：$3" >&2
+    echo "  建议：$4" >&2
+    _PREFLIGHT_WARN_COUNT=$((_PREFLIGHT_WARN_COUNT + 1))
+}
+
+# Check 1: nginx stream map SNI 唯一性（数据驱动）
+# stream_slots 表列出所有进入 ssl_preread 路由表的槽位
+# compatible_pairs 表列出允许同 SNI 的槽位对（架构上能合并的）
+_preflight_check_sni_uniqueness() {
+    local -a stream_slots=(
+        "xray-xhttp:XHTTP_DOMAIN"
+        "xray-grpc:GRPC_DOMAIN"
+        "anytls:ANYTLS_DOMAIN"
+        "naive:NAIVE_DOMAIN"
+    )
+    # 同 SNI 允许的槽位对（双向）—— 当前架构会合并到同一 server 块
+    local -a compatible_pairs=(
+        "xray-xhttp:xray-grpc"
+    )
+
+    declare -A _compat=()
+    local pair a b
+    for pair in "${compatible_pairs[@]}"; do
+        a="${pair%:*}"; b="${pair#*:}"
+        _compat["${a}|${b}"]=1
+        _compat["${b}|${a}"]=1
+    done
+
+    declare -A _dom_slots=()
+    local entry slot var domain
+    for entry in "${stream_slots[@]}"; do
+        slot="${entry%:*}"; var="${entry#*:}"
+        domain="${!var:-}"
+        domain="${domain,,}"
+        [[ -z "$domain" ]] && continue
+        _dom_slots["$domain"]+="${slot} "
+    done
+
+    local d slots_str
+    for d in "${!_dom_slots[@]}"; do
+        slots_str="${_dom_slots[$d]}"
+        local -a slots_arr
+        read -ra slots_arr <<< "$slots_str"
+        (( ${#slots_arr[@]} < 2 )) && continue
+
+        local i j ok=true
+        for ((i=0; i<${#slots_arr[@]}; i++)); do
+            for ((j=i+1; j<${#slots_arr[@]}; j++)); do
+                if [[ -z "${_compat["${slots_arr[i]}|${slots_arr[j]}"]:-}" ]]; then
+                    ok=false; break 2
+                fi
+            done
+        done
+        if ! $ok; then
+            _preflight_fail \
+                "Check 1: SNI 唯一性冲突" \
+                "域名 ${d} 同时分配给槽位: ${slots_arr[*]}" \
+                "nginx stream map 同 key 多目标，nginx -t 失败" \
+                "去域名编辑器，让冲突槽位指向不同域名"
+        fi
+    done
+}
+
+# Check 2: Reality SNI 污染
+# REALITY_DOMAIN + REALITY_SERVER_NAMES[*] 全部会被 nginx stream map 路由到 9443
+# 不能与四个业务域名重合
+_preflight_check_reality_pollution() {
+    local -a own_domains=(
+        "${XHTTP_DOMAIN:-}"
+        "${GRPC_DOMAIN:-}"
+        "${ANYTLS_DOMAIN:-}"
+        "${NAIVE_DOMAIN:-}"
+    )
+    local -a reality_snis=()
+    [[ -n "${REALITY_DOMAIN:-}" ]] && reality_snis+=("${REALITY_DOMAIN}")
+
+    if declare -p REALITY_SERVER_NAMES &>/dev/null; then
+        local sn
+        for sn in "${REALITY_SERVER_NAMES[@]:-}"; do
+            [[ -n "$sn" ]] && reality_snis+=("$sn")
+        done
+    fi
+    (( ${#reality_snis[@]} == 0 )) && return 0
+
+    local r d r_lc d_lc
+    for r in "${reality_snis[@]}"; do
+        r_lc="${r,,}"
+        for d in "${own_domains[@]}"; do
+            [[ -z "$d" ]] && continue
+            d_lc="${d,,}"
+            if [[ "$r_lc" == "$d_lc" ]]; then
+                _preflight_fail \
+                    "Check 2: Reality SNI 污染" \
+                    "${d} 既是 Reality SNI（serverNames/REALITY_DOMAIN），又是用户业务域名" \
+                    "nginx stream map 同 SNI 双值（既路由到 9443 又路由到 CDN/直连后端）" \
+                    "重配 Reality 选不同的公共 SNI；或在域名编辑器移走该业务域名"
+                break    # 同一个 reality SNI 只报一次，避免 XHTTP==GRPC 时重复
+            fi
+        done
+    done
+}
+
+# Check 3: XHTTP_PATH 与 gRPC location 冲突
+_preflight_check_xhttp_path() {
+    [[ -z "${XHTTP_PATH:-}" ]] && return 0
+
+    if [[ "${XHTTP_PATH}" != /* ]]; then
+        _preflight_fail \
+            "Check 3: XHTTP_PATH 格式错误" \
+            "XHTTP_PATH=${XHTTP_PATH} 必须以 / 开头" \
+            "nginx location 解析失败，xhttp 入口不可用" \
+            "删除 state 中 XHTTP_PATH 后重跑配置 Xray，会自动重新生成"
+    fi
+    if [[ "${XHTTP_PATH}" == "/" ]]; then
+        _preflight_fail \
+            "Check 3: XHTTP_PATH 太宽" \
+            "XHTTP_PATH=/ 会拦截所有路径" \
+            "fallback 站点和 _fake 路径都被吞掉，业务异常" \
+            "删除 state 中 XHTTP_PATH 后重跑配置 Xray"
+    fi
+    local _grpc_svc="${GRPC_SERVICE_NAME:-grpc.Service}"
+    if [[ "${XHTTP_PATH}" == /${_grpc_svc}* ]]; then
+        _preflight_fail \
+            "Check 3: XHTTP_PATH 与 gRPC 路径冲突" \
+            "XHTTP_PATH=${XHTTP_PATH} 以 /${_grpc_svc} 开头" \
+            "同域名场景下 nginx 最长前缀匹配会让 location /${_grpc_svc} 抢走 xhttp 流量" \
+            "删除 state 中 XHTTP_PATH 后重跑配置 Xray"
+    fi
+    if (( ${#XHTTP_PATH} < 8 )); then
+        _preflight_warn \
+            "Check 3: XHTTP_PATH 长度可疑" \
+            "XHTTP_PATH=${XHTTP_PATH}（长度 ${#XHTTP_PATH}）" \
+            "正常自动生成的 UUID 路径长度 ≥ 33；过短可能是手动改动" \
+            "如需重置，删除 state 中 XHTTP_PATH 后重跑配置 Xray"
+    fi
+}
+
+# Check 4a: 内部端口常量两两不同（防御性）
+# 关联数组 key 重复会被 bash 静默覆盖，count 偏离 11 即异常
+_preflight_check_internal_ports() {
+    declare -A _internal_ports=(
+        [8300]="xray vless-xhttp-cdn"
+        [8310]="xray vless-grpc-cdn"
+        [8330]="sing-box anytls"
+        [8340]="caddy-naive"
+        [8320]="xray reality-direct"
+        [8325]="xray vless-xhttp-reality"
+        [8350]="nginx fallback"
+        [8360]="nginx middle->anytls"
+        [8370]="nginx middle->naive"
+        [8380]="nginx xhttp ssl"
+        [8390]="nginx grpc ssl"
+        [8400]="nginx SNI trap"
+    )
+    if (( ${#_internal_ports[@]} != 12 )); then
+        _preflight_fail \
+            "Check 4a: 内部端口表数量异常" \
+            "期望 12 个端口，实际 ${#_internal_ports[@]} 个 —— 可能某两个常量被改成同值" \
+            "nginx upstream / proxy_pass 会指向错误后端，整个栈不可用" \
+            "检查 modules/{nginx,xray,singbox,naive}.sh 中的端口常量"
+    fi
+}
+
+# Check 4c: 用户可配置端口（HYSTERIA2_PORT + 端口跳跃区间）冲突
+# 注：Hysteria2 使用 UDP，与本工具内部的 TCP 端口（8001/8002/8443/8444 等）
+# 协议不同，不构成端口冲突，因此不检测端口跳跃区间是否覆盖内部端口。
+_preflight_check_user_ports() {
+    [[ -z "${HYSTERIA2_PORT:-}" ]] && return 0
+
+    # 端口越界硬失败；特权端口 (<1024) 仅软警告（Hysteria 以 root 运行可绑定）
+    if ! [[ "${HYSTERIA2_PORT}" =~ ^[0-9]+$ ]] || (( HYSTERIA2_PORT < 1 || HYSTERIA2_PORT > 65535 )); then
+        _preflight_fail \
+            "Check 4c: HYSTERIA2_PORT 越界" \
+            "HYSTERIA2_PORT=${HYSTERIA2_PORT}，期望范围 1-65535" \
+            "Hysteria2 无法绑定该端口" \
+            "重配 Hysteria2 选 1-65535 范围内的端口"
+    elif (( HYSTERIA2_PORT < 1024 )); then
+        _preflight_warn \
+            "Check 4c: HYSTERIA2_PORT 为特权端口" \
+            "HYSTERIA2_PORT=${HYSTERIA2_PORT} (<1024)" \
+            "需要 root 权限；如以非特权用户运行会绑定失败。默认 443 属此类，systemd 服务以 root 启动正常" \
+            "若以非 root 运行，改用 ≥1024 的端口"
+    fi
+
+    # Hysteria2 是 UDP，与本工具内部 TCP 端口不构成协议层冲突，不检测内部端口区间
+
+    if [[ -n "${HYSTERIA2_PH_START:-}" && -n "${HYSTERIA2_PH_END:-}" ]]; then
+        local s="${HYSTERIA2_PH_START}" e="${HYSTERIA2_PH_END}"
+        if ! [[ "$s" =~ ^[0-9]+$ ]] || ! [[ "$e" =~ ^[0-9]+$ ]]; then
+            _preflight_fail \
+                "Check 4c: HYSTERIA2 端口跳跃区间格式错误" \
+                "HYSTERIA2_PH_START=${s} HYSTERIA2_PH_END=${e}（非数字）" \
+                "Hysteria2 配置生成失败" \
+                "重配 Hysteria2 端口跳跃，输入数字端口"
+        else
+            if (( s >= e )); then
+                _preflight_fail \
+                    "Check 4c: HYSTERIA2 端口跳跃区间无效" \
+                    "HYSTERIA2_PH_START=${s} 应小于 HYSTERIA2_PH_END=${e}" \
+                    "Hysteria2 服务无法启动" \
+                    "重配 Hysteria2 端口跳跃，确保 START < END"
+            fi
+            if (( s < 1 || e > 65535 )); then
+                _preflight_fail \
+                    "Check 4c: HYSTERIA2 端口跳跃区间越界" \
+                    "端口跳跃区间 ${s}-${e} 超出 1-65535" \
+                    "Hysteria2 无法绑定越界端口" \
+                    "调整端口跳跃区间到 1-65535"
+            fi
+            # 主端口落在跳跃区间内会导致 listen 重复绑定
+            if (( HYSTERIA2_PORT >= s && HYSTERIA2_PORT <= e )); then
+                _preflight_fail \
+                    "Check 4c: HYSTERIA2_PORT 落在跳跃区间内" \
+                    "HYSTERIA2_PORT=${HYSTERIA2_PORT} 在端口跳跃区间 ${s}-${e} 内" \
+                    "Hysteria2 listen 配置会重复绑定同一端口，启动失败" \
+                    "主端口应在跳跃区间之外"
+            fi
+        fi
+    fi
+}
+
+# Check 5b/c/d: state 内部一致性
+_preflight_check_state_consistency() {
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+
+    # 5b: 注册表里每个域名都有非空 DOMAIN_PROTO_<suffix>
+    local d suffix proto
+    for d in $registry; do
+        suffix=$(_domain_state_suffix "$d")
+        proto=$(get_state "DOMAIN_PROTO_${suffix}" "")
+        if [[ -z "$proto" ]]; then
+            _preflight_fail \
+                "Check 5b: 域名注册表悬空" \
+                "DOMAIN_REGISTRY 含 ${d}，但 DOMAIN_PROTO_${suffix} 为空" \
+                "rebuild_protocol_domains 会跳过该域名，下游协议变量异常" \
+                "在域名编辑器删除并重新添加 ${d}"
+        fi
+    done
+
+    # 5c: 每个非空 *_DOMAIN 都在 DOMAIN_REGISTRY 里
+    local -a expected=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN)
+    local var dom
+    for var in "${expected[@]}"; do
+        dom="${!var:-}"
+        [[ -z "$dom" ]] && continue
+        if ! echo " $registry " | grep -qF " $dom "; then
+            _preflight_fail \
+                "Check 5c: 协议域名未注册" \
+                "${var}=${dom}，但 ${dom} 不在 DOMAIN_REGISTRY 中" \
+                "下次 rebuild_protocol_domains 会清空该协议域名" \
+                "在域名编辑器添加 ${dom} 并指定协议"
+        fi
+    done
+
+    # 5d: DOMAIN_PRIMARY_* 指向已注册域名
+    local -a primary_keys=(
+        "DOMAIN_PRIMARY_XRAY_XHTTP"
+        "DOMAIN_PRIMARY_XRAY_GRPC"
+        "DOMAIN_PRIMARY_XRAY_REALITY"
+        "DOMAIN_PRIMARY_SINGBOX"
+        "DOMAIN_PRIMARY_HYSTERIA2"
+        "DOMAIN_PRIMARY_NAIVEPROXY"
+    )
+    local key val
+    for key in "${primary_keys[@]}"; do
+        val=$(get_state "$key" "")
+        [[ -z "$val" ]] && continue
+        if ! echo " $registry " | grep -qF " $val "; then
+            _preflight_fail \
+                "Check 5d: 协议主域名指向已注销域名" \
+                "${key}=${val}，但不在 DOMAIN_REGISTRY 中" \
+                "_resolve_protocol_primary 会回退到最新候选或清空，造成意外切换" \
+                "在域名编辑器重新指定该槽位的主域名"
+        fi
+    done
+}
+
+# Check 5a: domain_map.conf 漂移（软警告）
+_preflight_check_domain_map_drift() {
+    local map_file="/etc/cloudflare/domain_map.conf"
+    [[ -f "$map_file" ]] || return 0
+
+    local -a vars=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN)
+    local var state_val map_val drifted=""
+    for var in "${vars[@]}"; do
+        state_val="${!var:-}"
+        map_val=$(grep "^${var}=" "$map_file" 2>/dev/null | head -1 | cut -d= -f2- | tr -d "'\"")
+        if [[ "$state_val" != "$map_val" ]]; then
+            drifted+=" ${var}(state='${state_val}' map='${map_val}')"
+        fi
+    done
+    if [[ -n "$drifted" ]]; then
+        _preflight_warn \
+            "Check 5a: domain_map.conf 漂移" \
+            "STATE 与 ${map_file} 不一致：${drifted}" \
+            "运行时使用 STATE，domain_map.conf 仅作恢复镜像；漂移不影响当前运行" \
+            "如需同步，重跑 SSL 证书申请，或重新走域名编辑器保存"
+    fi
+}
+
+preflight_config_check() {
+    local context="${1:-}"
+    _PREFLIGHT_FAIL_COUNT=0
+    _PREFLIGHT_WARN_COUNT=0
+
+    _preflight_check_sni_uniqueness
+    _preflight_check_reality_pollution
+    _preflight_check_xhttp_path
+    _preflight_check_internal_ports
+    _preflight_check_user_ports
+    _preflight_check_state_consistency
+    _preflight_check_domain_map_drift
+
+    echo "" >&2
+    if (( _PREFLIGHT_FAIL_COUNT > 0 )); then
+        echo -e "${RED}[PREFLIGHT]${NC} ${_PREFLIGHT_FAIL_COUNT} 项硬失败${context:+（${context} 阶段）}，已阻止配置生成" >&2
+        echo -e "${RED}[PREFLIGHT]${NC} 修复入口：菜单 → 申请 SSL 证书 → 编辑域名" >&2
+        return 1
+    fi
+    if (( _PREFLIGHT_WARN_COUNT > 0 )); then
+        echo -e "${YELLOW}[PREFLIGHT]${NC} ${_PREFLIGHT_WARN_COUNT} 项软警告${context:+（${context} 阶段）}，配置已继续生成" >&2
+    else
+        echo -e "${GREEN:-}[PREFLIGHT]${NC:-} 全部检查通过${context:+（${context} 阶段）}" >&2
+    fi
+    return 0
+}
+
+# ── 数据迁移 v1 → v2：旧 "xray" 协议标签拆分为 sub-protocol ─
+# 旧格式: DOMAIN_PROTO_<suffix>="xray" + DOMAIN_MODE=cdn/direct
+# 新格式: DOMAIN_PROTO_<suffix>="xray-xhttp" / "xray-grpc" / "xray-reality"
+#         mode 字段保留（用户语义、UI 显示），但协议消费方按 sub-protocol 区分
+# 幂等：第二次起空跑（无 "xray" 裸标签 → 无操作）
+_migrate_xray_proto_v1_to_v2() {
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+    [[ -z "$registry" ]] && return 0
+
+    local migrated_count=0
+    local d suffix protos mode
+    for d in $registry; do
+        suffix=$(_domain_state_suffix "$d")
+        protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+        # 老格式：协议列表中包含裸 "xray"
+        case ",${protos}," in
+            *,xray,*) ;;
+            *) continue ;;
+        esac
+        mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
+
+        local -a old_arr=()
+        IFS=',' read -ra old_arr <<< "$protos"
+        local new_list="" item
+        for item in "${old_arr[@]}"; do
+            if [[ "$item" == "xray" ]]; then
+                if [[ "$mode" == "cdn" ]]; then
+                    # CDN 模式：保守迁移为同时支持 xhttp + grpc（保留原有歧义）
+                    # 用户后续在域名编辑器里可裁剪为单一 sub-protocol
+                    new_list="${new_list:+$new_list,}xray-xhttp,xray-grpc"
+                else
+                    new_list="${new_list:+$new_list,}xray-reality"
+                fi
+            else
+                new_list="${new_list:+$new_list,}$item"
+            fi
+        done
+        # 去重仅对 CDN 域名执行：xhttp/grpc 迁移时可能产生重复标签；
+        # direct 域名（reality 等）不受影响，直接写回
+        # （mode 已在本循环顶部从 DOMAIN_MODE_${suffix} 读取）
+        if [[ "$mode" == "cdn" ]]; then
+            local _dp _seen_p="," _deduped=""
+            IFS=',' read -ra _dp_arr <<< "$new_list"
+            for _dp in "${_dp_arr[@]}"; do
+                [[ -z "$_dp" ]] && continue
+                case "$_seen_p" in *",${_dp},"*) continue ;; esac
+                _deduped="${_deduped:+$_deduped,}${_dp}"
+                _seen_p="${_seen_p}${_dp},"
+            done
+            new_list="$_deduped"
+        fi
+        save_state "DOMAIN_PROTO_${suffix}" "$new_list"
+        migrated_count=$((migrated_count + 1))
+    done
+
+    # 槽位主域名键迁移
+    local old_cdn old_direct
+    old_cdn=$(get_state "DOMAIN_PRIMARY_XRAY_CDN" "")
+    old_direct=$(get_state "DOMAIN_PRIMARY_XRAY_DIRECT" "")
+    if [[ -n "$old_cdn" ]]; then
+        # 不覆盖用户已显式设置的新键
+        [[ -z "$(get_state "DOMAIN_PRIMARY_XRAY_XHTTP" "")" ]] && save_state "DOMAIN_PRIMARY_XRAY_XHTTP" "$old_cdn"
+        [[ -z "$(get_state "DOMAIN_PRIMARY_XRAY_GRPC" "")" ]] && save_state "DOMAIN_PRIMARY_XRAY_GRPC"  "$old_cdn"
+        save_state "DOMAIN_PRIMARY_XRAY_CDN" ""
+        migrated_count=$((migrated_count + 1))
+    fi
+    if [[ -n "$old_direct" ]]; then
+        [[ -z "$(get_state "DOMAIN_PRIMARY_XRAY_REALITY" "")" ]] && save_state "DOMAIN_PRIMARY_XRAY_REALITY" "$old_direct"
+        save_state "DOMAIN_PRIMARY_XRAY_DIRECT" ""
+        migrated_count=$((migrated_count + 1))
+    fi
+
+    if (( migrated_count > 0 )); then
+        log_info "[迁移] xray 协议标签 v1→v2 拆分: ${migrated_count} 项更新（xray → xray-xhttp/xray-grpc/xray-reality）"
+    fi
+}
+
 rebuild_protocol_domains() {
-    local registry xhttp_domain="" grpc_domain="" reality_domain="" anytls_domain="" hyst_domain="" naive_domain=""
+    # 启动时先做幂等迁移，确保下游按新 sub-protocol 标签运行
+    _migrate_xray_proto_v1_to_v2
+
+    local registry
     local all_d="" cdn_d="" direct_d=""
+    local -a xhttp_cands=() grpc_cands=() reality_cands=()
+    local -a singbox_cands=() hyst_cands=() naive_cands=()
 
     registry=$(get_state "DOMAIN_REGISTRY" "")
 
@@ -266,34 +761,42 @@ rebuild_protocol_domains() {
             direct_d="${direct_d:+$direct_d }$domain"
         fi
 
-        if [[ "$protocols" == *"xray"* ]]; then
-            if [[ "$mode" == "cdn" ]]; then
-                xhttp_domain="${domain}"
-                [[ -z "$grpc_domain" ]] && grpc_domain="${domain}"
-            else
-                reality_domain="${domain}"
-            fi
-        fi
-        if [[ "$protocols" == *"singbox"* ]]; then
-            anytls_domain="${domain}"
-        fi
-        if [[ "$protocols" == *"hysteria2"* ]]; then
-            hyst_domain="${domain}"
-        fi
-        if [[ "$protocols" == *"naiveproxy"* ]]; then
-            naive_domain="${domain}"
-        fi
+        # 按 sub-protocol 精确匹配（逗号分隔列表）
+        case ",${protocols}," in *,xray-xhttp,*)   xhttp_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,xray-grpc,*)    grpc_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,xray-reality,*) reality_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,singbox,*)      singbox_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,hysteria2,*)    hyst_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,naiveproxy,*)   naive_cands+=("$domain") ;; esac
     done
 
-    save_state "ALL_DOMAINS" "$all_d"
-    save_state "CDN_DOMAINS" "$cdn_d"
+    local xhttp_domain grpc_domain reality_domain anytls_domain hyst_domain naive_domain
+    xhttp_domain=$(_resolve_protocol_primary   "XRAY_XHTTP"   "${xhttp_cands[@]}")
+    grpc_domain=$(_resolve_protocol_primary    "XRAY_GRPC"    "${grpc_cands[@]}")
+    reality_domain=$(_resolve_protocol_primary "XRAY_REALITY" "${reality_cands[@]}")
+    anytls_domain=$(_resolve_protocol_primary  "SINGBOX"      "${singbox_cands[@]}")
+    hyst_domain=$(_resolve_protocol_primary    "HYSTERIA2"    "${hyst_cands[@]}")
+    naive_domain=$(_resolve_protocol_primary   "NAIVEPROXY"   "${naive_cands[@]}")
+
+    save_state "ALL_DOMAINS"    "$all_d"
+    save_state "CDN_DOMAINS"    "$cdn_d"
     save_state "DIRECT_DOMAINS" "$direct_d"
-    save_state "XHTTP_DOMAIN" "$xhttp_domain"
-    save_state "GRPC_DOMAIN" "$grpc_domain"
-    save_state "REALITY_DOMAIN" "$reality_domain"
-    save_state "ANYTLS_DOMAIN" "$anytls_domain"
+    save_state "XHTTP_DOMAIN"     "$xhttp_domain"
+    save_state "GRPC_DOMAIN"      "$grpc_domain"
+    save_state "REALITY_DOMAIN"   "$reality_domain"
+    save_state "ANYTLS_DOMAIN"    "$anytls_domain"
     save_state "HYSTERIA2_DOMAIN" "$hyst_domain"
-    save_state "NAIVE_DOMAIN" "$naive_domain"
+    save_state "NAIVE_DOMAIN"     "$naive_domain"
+
+    # 派生完成后将本地变量同步到当前 shell，preflight 才能看到最新值
+    XHTTP_DOMAIN="$xhttp_domain"
+    GRPC_DOMAIN="$grpc_domain"
+    REALITY_DOMAIN="$reality_domain"
+    ANYTLS_DOMAIN="$anytls_domain"
+    HYSTERIA2_DOMAIN="$hyst_domain"
+    NAIVE_DOMAIN="$naive_domain"
+    # 软诊断：rebuild 不阻塞调用方（修复流程可能正处中间状态），仅打印
+    preflight_config_check "rebuild_protocol_domains" || true
 }
 
 load_domain_state() {
@@ -309,9 +812,66 @@ load_domain_state() {
     XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+    # 自愈：DOMAIN_PRIMARY_XRAY_REALITY 是权威来源，state 丢失时自动修复
+    if [[ -z "${REALITY_DOMAIN:-}" ]]; then
+        local _primary_reality
+        _primary_reality=$(get_state "DOMAIN_PRIMARY_XRAY_REALITY" "")
+        if [[ -n "${_primary_reality}" ]]; then
+            REALITY_DOMAIN="${_primary_reality}"
+            save_state "REALITY_DOMAIN" "${_primary_reality}"
+        fi
+    fi
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
+    XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
+    XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
+}
+
+# ── 读取延迟档位参数 → 设置协议生成变量 ────────────────────
+# 调用后可用：LATENCY_XMUX_CONCURRENCY / LATENCY_XMUX_REQUEST_TIMES /
+#             LATENCY_XMUX_REUSABLE_SECS / LATENCY_GRPC_TIMEOUT / LATENCY_PROXY_TIMEOUT
+load_latency_params() {
+    local level
+    level=$(get_state "LATENCY_LEVEL" "medium")
+    case "$level" in
+        low)
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_CONCURRENCY="8-16"
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_REQUEST_TIMES="300-500"
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_REUSABLE_SECS="1200-1800"
+            # shellcheck disable=SC2034
+            LATENCY_GRPC_TIMEOUT=60
+            # shellcheck disable=SC2034
+            LATENCY_PROXY_TIMEOUT=1800
+            ;;
+        high)
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_CONCURRENCY="32-64"
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_REQUEST_TIMES="1000-1500"
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_REUSABLE_SECS="3000-5400"
+            # shellcheck disable=SC2034
+            LATENCY_GRPC_TIMEOUT=300
+            # shellcheck disable=SC2034
+            LATENCY_PROXY_TIMEOUT=7200
+            ;;
+        medium|*)
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_CONCURRENCY="16-32"
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_REQUEST_TIMES="600-900"
+            # shellcheck disable=SC2034
+            LATENCY_XMUX_REUSABLE_SECS="1800-3000"
+            # shellcheck disable=SC2034
+            LATENCY_GRPC_TIMEOUT=120
+            # shellcheck disable=SC2034
+            LATENCY_PROXY_TIMEOUT=7200
+            ;;
+    esac
 }
 
 # ── 模块加载：本地缓存 → 脚本同级目录 → 远程下载并缓存 ─────
@@ -321,6 +881,33 @@ load_module() {
     local local_path="${MODULES_DIR}/${module}.sh"
     local remote_url="${BASE_URL}/modules/${module}.sh"
     local first_line
+
+    # curl 模式（bash <(curl ...)）：MODULES_DIR 不是真实目录，强制从远程拉取最新模块
+    # 避免旧缓存掩盖修复；本地 git 开发模式不受影响
+    if [[ ! -d "${MODULES_DIR}" ]]; then
+        log_info "更新模块 ${module}.sh ..."
+        mkdir -p "$LOCAL_MODULES_DIR"
+        chmod 700 "$LOCAL_MODULES_DIR"
+        if curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
+            chmod 600 "$cached_path"
+            first_line=$(head -n 1 "$cached_path" 2>/dev/null || true)
+            if [[ -z "$first_line" ]] || { [[ "$first_line" != '#!'* ]] && [[ "$first_line" != '#' ]]; }; then
+                log_error "远程模块 ${module}.sh 首行安全检查失败"
+                rm -f "$cached_path"; exit 1
+            fi
+            source "$cached_path"
+        else
+            log_warn "下载失败，使用缓存..."
+            [[ -f "$cached_path" ]] && source "$cached_path"
+        fi
+        return
+    fi
+
+    # 本地文件比缓存新时（git pull 后）优先使用本地版本
+    if [[ -f "$cached_path" && -f "$local_path" && "$local_path" -nt "$cached_path" ]]; then
+        cp "$local_path" "$cached_path"
+        chmod 600 "$cached_path"
+    fi
 
     if [[ -f "$cached_path" ]]; then
         first_line=$(head -n 1 "$cached_path" 2>/dev/null || true)
@@ -378,11 +965,18 @@ sync_modules() {
     local ok=0 fail=0
     for module in "${ALL_MODULES[@]}"; do
         local cached_path="${LOCAL_MODULES_DIR}/${module}.sh"
+        local local_path="${MODULES_DIR}/${module}.sh"
         local remote_url="${BASE_URL}/modules/${module}.sh"
         echo -n "  ${module}.sh ... "
-        if curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
+        # 优先从本地 git clone 目录复制（更快且不依赖网络）
+        if [[ -f "$local_path" ]]; then
+            cp "$local_path" "$cached_path"
             chmod 600 "$cached_path"
-            echo -e "${GREEN}OK${NC}"
+            echo -e "${GREEN}OK (local)${NC}"
+            (( ok++ )) || true
+        elif curl -fsSL "$remote_url" -o "$cached_path" 2>/dev/null; then
+            chmod 600 "$cached_path"
+            echo -e "${GREEN}OK (remote)${NC}"
             (( ok++ )) || true
         else
             echo -e "${RED}失败${NC}"
@@ -400,21 +994,39 @@ sync_modules() {
 }
 
 # ── 根据实际服务状态自动补全 state ──────────────────────────
+_sync_state_if_needed() {
+    local key="$1"
+    [[ "$(get_step "$key")" == "1" ]] && return 0
+    save_state "$key" "1"
+}
+
 _sync_inst_state() {
-    command -v nginx    &>/dev/null && [[ "$(get_step INST_NGINX)"   != "1" ]] && save_state "INST_NGINX"   "1" || true
-    command -v xray     &>/dev/null && [[ "$(get_step INST_XRAY)"    != "1" ]] && save_state "INST_XRAY"    "1" || true
-    command -v sing-box   &>/dev/null && [[ "$(get_step INST_SINGBOX)"   != "1" ]] && save_state "INST_SINGBOX"   "1" || true
-    command -v hysteria   &>/dev/null && [[ "$(get_step INST_HYSTERIA2)" != "1" ]] && save_state "INST_HYSTERIA2" "1" || true
-    command -v caddy-naive &>/dev/null && [[ "$(get_step INST_NAIVE)"    != "1" ]] && save_state "INST_NAIVE"    "1" || true
-    command -v wgcf       &>/dev/null && [[ "$(get_step INST_WARP)"      != "1" ]] && save_state "INST_WARP"      "1" || true
-    command -v unbound  &>/dev/null && [[ "$(get_step INST_UNBOUND)" != "1" ]] && save_state "INST_UNBOUND" "1" || true
-    systemctl is-active --quiet nginx    2>/dev/null && [[ -f /etc/nginx/conf.d/servers.conf ]] && [[ "$(get_step CONF_NGINX)"   != "1" ]] && save_state "CONF_NGINX"   "1" || true
-    systemctl is-active --quiet xray     2>/dev/null && [[ -f /usr/local/etc/xray/config.json ]]    && [[ "$(get_step CONF_XRAY)"    != "1" ]] && save_state "CONF_XRAY"    "1" || true
-    systemctl is-active --quiet sing-box 2>/dev/null && [[ -f /etc/sing-box/config.json ]]          && [[ "$(get_step CONF_SINGBOX)"   != "1" ]] && save_state "CONF_SINGBOX"   "1" || true
-    systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f /etc/hysteria/config.yaml ]]   && [[ "$(get_step CONF_HYSTERIA2)" != "1" ]] && save_state "CONF_HYSTERIA2" "1" || true
-    systemctl is-active --quiet caddy-naive 2>/dev/null && [[ -f /etc/caddy-naive/Caddyfile ]]       && [[ "$(get_step CONF_NAIVE)"     != "1" ]] && save_state "CONF_NAIVE"     "1" || true
-    [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]] && \
-        [[ "$(get_step CONF_WARP)" != "1" ]] && save_state "CONF_WARP" "1" || true
+    if command -v nginx &>/dev/null; then _sync_state_if_needed "INST_NGINX"; fi
+    if command -v xray &>/dev/null; then _sync_state_if_needed "INST_XRAY"; fi
+    if command -v sing-box &>/dev/null; then _sync_state_if_needed "INST_SINGBOX"; fi
+    if command -v hysteria &>/dev/null; then _sync_state_if_needed "INST_HYSTERIA2"; fi
+    if command -v caddy-naive &>/dev/null; then _sync_state_if_needed "INST_NAIVE"; fi
+    if command -v wgcf &>/dev/null; then _sync_state_if_needed "INST_WARP"; fi
+    if command -v unbound &>/dev/null; then _sync_state_if_needed "INST_UNBOUND"; fi
+
+    if systemctl is-active --quiet nginx 2>/dev/null && [[ -f /etc/nginx/conf.d/servers.conf ]]; then
+        _sync_state_if_needed "CONF_NGINX"
+    fi
+    if systemctl is-active --quiet xray 2>/dev/null && [[ -f /usr/local/etc/xray/config.json ]]; then
+        _sync_state_if_needed "CONF_XRAY"
+    fi
+    if systemctl is-active --quiet sing-box 2>/dev/null && [[ -f /etc/sing-box/config.json ]]; then
+        _sync_state_if_needed "CONF_SINGBOX"
+    fi
+    if systemctl is-active --quiet hysteria-server 2>/dev/null && [[ -f /etc/hysteria/config.yaml ]]; then
+        _sync_state_if_needed "CONF_HYSTERIA2"
+    fi
+    if systemctl is-active --quiet caddy-naive 2>/dev/null && [[ -f /etc/caddy-naive/Caddyfile ]]; then
+        _sync_state_if_needed "CONF_NAIVE"
+    fi
+    if [[ -f /etc/wgcf/wgcf-profile.conf ]] && [[ -n "$(get_state WGCF_PRIVATE_KEY)" ]]; then
+        _sync_state_if_needed "CONF_WARP"
+    fi
     _sync_cert_state
 }
 
@@ -488,6 +1100,7 @@ HW_MEM_GB=''
 HW_BANDWIDTH=''
 HW_DUAL_STACK=''
 HW_DISK_TYPE=''
+HW_REGION=''
 UNBOUND_SERVICE_NAME=''
 
 XRAY_PADDING=''
@@ -503,6 +1116,7 @@ ALL_DOMAINS=''
 CDN_DOMAINS=''
 DIRECT_DOMAINS=''
 XHTTP_PATH=''
+GRPC_SERVICE_NAME=''
 
 XRAY_UUID=''
 XRAY_PUBLIC_KEY=''
@@ -512,6 +1126,8 @@ REALITY_SNI=''
 REALITY_SERVER_NAMES=''
 REALITY_SHORT_ID=''
 REALITY_SPIDER_X=''
+XHTTP_REALITY_SNI=''
+XHTTP_REALITY_DOMAIN=''
 
 SINGBOX_PASSWORD=''
 
@@ -550,12 +1166,14 @@ ENV
     OS_ID=$(get_state "OS_ID")
     OS_NAME=$(get_state "OS_NAME")
     PKG_MANAGER=$(get_state "PKG_MANAGER")
+    # shellcheck disable=SC2034
     KERNEL_UPGRADED=$(get_state "KERNEL_UPGRADED")
     HW_CPU_CORES=$(get_state "HW_CPU_CORES")
     HW_MEM_GB=$(get_state "HW_MEM_GB")
     HW_BANDWIDTH=$(get_state "HW_BANDWIDTH")
     HW_DUAL_STACK=$(get_state "HW_DUAL_STACK")
     HW_DISK_TYPE=$(get_state "HW_DISK_TYPE")
+    HW_REGION=$(get_state "HW_REGION")
     UNBOUND_SERVICE_NAME=$(get_state "UNBOUND_SERVICE_NAME")
     XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
@@ -564,10 +1182,13 @@ ENV
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     XHTTP_PATH=$(get_state "XHTTP_PATH")
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
     XRAY_UUID=$(get_state "XRAY_UUID")
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XRAY_PADDING=$(get_state "XRAY_PADDING")
+    XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
+    XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
 
     # ── BUG FIX：恢复 REALITY_SERVER_NAMES 数组 ──────────────
     # 原代码只保存了 REALITY_SNI（第一个元素），导致 do_conf_nginx
@@ -620,12 +1241,20 @@ load_os_info() {
     if [[ -n "${OS_ID:-}" ]]; then
         case "$OS_ID" in
             ubuntu|debian)
+                # shellcheck disable=SC2034
                 PKG_UPDATE="apt-get update -y"
+                # shellcheck disable=SC2034
                 PKG_INSTALL="apt-get install -y"
                 ;;
             centos|rhel|rocky|almalinux|fedora)
+                # shellcheck disable=SC2034
                 PKG_UPDATE="dnf makecache -y"
+                # shellcheck disable=SC2034
                 PKG_INSTALL="dnf install -y"
+                ;;
+            *)
+                log_error "不支持的系统: $OS_ID"
+                return 1
                 ;;
         esac
         return
@@ -645,6 +1274,7 @@ show_status() {
     local s_kernel s_system s_unbound s_nginx s_cert s_xray s_singbox s_hysteria2 s_naive s_warp
     local c_nginx c_xray c_singbox c_hysteria2 c_naive c_warp
     restore_domain_arrays 2>/dev/null || true
+    # shellcheck disable=SC2034
     local cf_ini_for_domain=""
 
     { [[ "$(get_step INST_KERNEL)"  == "1" ]] || \
@@ -713,7 +1343,9 @@ show_status() {
 
     local cached_count=0
     for m in "${ALL_MODULES[@]}"; do
-        [[ -f "${LOCAL_MODULES_DIR}/${m}.sh" ]] && (( cached_count++ )) || true
+        if [[ -f "${LOCAL_MODULES_DIR}/${m}.sh" ]]; then
+            cached_count=$((cached_count + 1))
+        fi
     done
     local total_modules=${#ALL_MODULES[@]}
 
@@ -762,7 +1394,7 @@ show_status() {
     if [[ -n "${HW_CPU_CORES:-}" ]]; then
         echo ""
         echo "  [硬件]"
-        echo "    CPU: ${HW_CPU_CORES} | MEM: ${HW_MEM_GB}GB | BW: ${HW_BANDWIDTH} | STACK: ${HW_DUAL_STACK} | DISK: ${HW_DISK_TYPE}"
+        echo "    CPU: ${HW_CPU_CORES} | MEM: ${HW_MEM_GB}GB | BW: ${HW_BANDWIDTH} | STACK: ${HW_DUAL_STACK} | DISK: ${HW_DISK_TYPE} | REGION: ${HW_REGION:-eu}"
     fi
 
     echo ""
@@ -774,12 +1406,7 @@ show_status() {
 
 do_sync_modules() {
     echo ""
-    log_warn "将从 GitHub 下载所有模块覆盖本地缓存，需要网络连接。"
-    read -rp "确认继续？[y/N]: " confirm
-    if [[ "${confirm,,}" != "y" ]]; then
-        return
-    fi
-    echo ""
+    log_info "从 GitHub 下载所有模块覆盖本地缓存..."
     sync_modules
     done_return
 }
@@ -810,7 +1437,16 @@ _ensure_wgcf() {
 
 done_return() {
     echo ""
-    read -rp "按回车返回主菜单..." _
+    read -rp "按回车返回主菜单..." _ || true
+}
+
+run_menu_action() {
+    local name="$1"
+    shift
+    "$@" || {
+        log_warn "${name} 执行失败或中断，已返回主菜单"
+        sleep 1
+    }
 }
 
 save_system_optimization_state() {
@@ -832,6 +1468,7 @@ save_system_optimization_state() {
     save_state "HW_BANDWIDTH"  "${HW_BANDWIDTH}"
     save_state "HW_DUAL_STACK" "${HW_DUAL_STACK}"
     save_state "HW_DISK_TYPE"  "${HW_DISK_TYPE}"
+    save_state "HW_REGION"     "${HW_REGION:-}"
     save_state "XRAY_PADDING"  "${XRAY_PADDING:-128-2048}"
     save_state "INST_SYSTEM"   "1"
 }
@@ -889,7 +1526,7 @@ do_inst_nginx() {
 
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
+    generate_fake_site "/var/www/trap" 2
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -910,8 +1547,9 @@ do_inst_cert() {
     save_state "ALL_DOMAINS"    "${ALL_DOMAINS[*]:-}"
     save_state "CDN_DOMAINS"    "${CDN_DOMAINS[*]:-}"
     save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
-    save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
-    save_state "INST_CERT"      "1"
+    save_state "XHTTP_PATH"          "${XHTTP_PATH:-}"
+    save_state "GRPC_SERVICE_NAME"   "${GRPC_SERVICE_NAME:-}"
+    save_state "INST_CERT"           "1"
 
     XHTTP_DOMAIN="${XHTTP_DOMAIN:-}"
     GRPC_DOMAIN="${GRPC_DOMAIN:-}"
@@ -1013,6 +1651,7 @@ do_inst_naive() {
     fi
 
     install_naive
+    naive_record_forwardproxy_commit
     save_state "INST_NAIVE" "1"
 
     log_info "NaiveProxy 安装完成"
@@ -1042,21 +1681,71 @@ do_conf_nginx() {
     load_os_info
     restore_domain_arrays   # 内含 REALITY_SERVER_NAMES 恢复
 
+    # ── state 健全性检查 ────────────────────────────────────────
+    # restore_domain_arrays 只读 state，不重建；若 state 陈旧会导致
+    # XHTTP_DOMAIN / GRPC_DOMAIN 为空，使 generate_servers_conf 静默
+    # 跳过 gRPC merged-location，令 gRPC 节点在 :8380 上无 location 匹配。
+    #
+    # rebuild_protocol_domains 才是"从注册表重建并写回 state"的函数，
+    # 只在 collect_domains(b/c) 和 add_domain_and_cert 里被调用；
+    # 直接调 do_conf_nginx 时不会触发，state 可能持有旧值。
+    _cdn_state_stale=false
+    if [[ ${#CDN_DOMAINS[@]} -gt 0 && -z "${XHTTP_DOMAIN:-}" ]]; then
+        _cdn_state_stale=true
+    fi
+    if [[ "$_cdn_state_stale" == false && -z "${GRPC_DOMAIN:-}" ]]; then
+        local _sreg _sd _ss _sp
+        _sreg=$(get_state "DOMAIN_REGISTRY" "")
+        for _sd in $_sreg; do
+            _ss=$(echo "$_sd" | tr '.' '_')
+            _sp=$(get_state "DOMAIN_PROTO_${_ss}" "")
+            case ",${_sp}," in
+                *,xray-grpc,*) _cdn_state_stale=true; break ;;
+            esac
+        done
+    fi
+    if [[ "$_cdn_state_stale" == true ]]; then
+        log_warn "CDN 协议域名 state 陈旧，自动修复中..."
+        [[ -z "${XHTTP_DOMAIN:-}" ]] && log_warn "  XHTTP_DOMAIN 为空"
+        [[ -z "${GRPC_DOMAIN:-}"  ]] && log_warn "  GRPC_DOMAIN  为空"
+        # rebuild_protocol_domains：纯 state 读写，幂等，无交互、无证书申请、无网络调用
+        rebuild_protocol_domains
+        # 修复后复查：若仍为空说明 DOMAIN_REGISTRY 本身未初始化，无法自愈
+        if [[ ${#CDN_DOMAINS[@]} -gt 0 && -z "${XHTTP_DOMAIN:-}" ]]; then
+            log_error "自动修复失败：CDN_DOMAINS 非空但 XHTTP_DOMAIN 仍为空。"
+            log_warn  "请先运行菜单选项 5（申请证书 / 重新收集域名）初始化域名配置。"
+            done_return
+            return
+        fi
+        log_info "state 修复完成：XHTTP_DOMAIN=${XHTTP_DOMAIN:-<空>}  GRPC_DOMAIN=${GRPC_DOMAIN:-<空>}"
+    fi
+
     XHTTP_PATH=$(get_state "XHTTP_PATH")
     if [[ -z "${XHTTP_PATH}" ]]; then
-        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        XHTTP_PATH="/$(tr -d '-' < /proc/sys/kernel/random/uuid)"
         save_state "XHTTP_PATH" "${XHTTP_PATH}"
         log_info "生成 XHTTP_PATH: ${XHTTP_PATH}"
     else
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    if [[ -z "${GRPC_SERVICE_NAME}" ]]; then
+        GRPC_SERVICE_NAME="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+        save_state "GRPC_SERVICE_NAME" "${GRPC_SERVICE_NAME}"
+        log_info "生成 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    else
+        log_info "复用已有 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    fi
+
+    if ! preflight_config_check "do_conf_nginx"; then
+        done_return
+        return
+    fi
+
     load_module nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
-    fi
+    generate_fake_site "/var/www/trap" 2
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -1108,6 +1797,20 @@ do_conf_xray() {
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
 
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    if [[ -z "${GRPC_SERVICE_NAME}" ]]; then
+        GRPC_SERVICE_NAME="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+        save_state "GRPC_SERVICE_NAME" "${GRPC_SERVICE_NAME}"
+        log_info "生成 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    else
+        log_info "复用已有 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    fi
+
+    if ! preflight_config_check "do_conf_xray"; then
+        done_return
+        return
+    fi
+
     generate_xray_params
     collect_reality_params
     generate_xray_config
@@ -1117,11 +1820,14 @@ do_conf_xray() {
     save_state "XRAY_PUBLIC_KEY"       "${XRAY_PUBLIC_KEY:-}"
     save_state "XRAY_PRIVATE_KEY"      "${XRAY_PRIVATE_KEY:-}"
     save_state "XHTTP_PATH"            "${XHTTP_PATH:-}"
+    save_state "GRPC_SERVICE_NAME"     "${GRPC_SERVICE_NAME:-}"
     save_state "REALITY_DEST"          "${REALITY_DEST:-}"
     save_state "REALITY_SNI"           "${REALITY_SERVER_NAMES[0]:-}"
+    save_state "XHTTP_REALITY_SNI"     "${XHTTP_REALITY_SNI:-}"
+    save_state "XHTTP_REALITY_DOMAIN"  "${XHTTP_REALITY_DOMAIN:-}"
     # ── BUG FIX：保存完整 serverNames 数组供 nginx 生成 SNI map 使用 ──
     save_state "REALITY_SERVER_NAMES"  "${REALITY_SERVER_NAMES[*]:-}"
-    save_state "REALITY_SHORT_ID"      "${REALITY_SHORT_IDS[1]:-}"
+    save_state "REALITY_SHORT_ID"      "${REALITY_SHORT_IDS[0]:-}"
     save_state "REALITY_SHORT_IDS" "${REALITY_SHORT_IDS[*]:-}"
     save_state "REALITY_SPIDER_X"      "${REALITY_SPIDER_X:-}"
     save_state "CONF_XRAY"             "1"
@@ -1155,8 +1861,14 @@ do_conf_singbox() {
     load_os_info
     restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    # shellcheck disable=SC2034
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
+
+    if ! preflight_config_check "do_conf_singbox"; then
+        done_return
+        return
+    fi
 
     _ensure_wgcf
 
@@ -1193,6 +1905,12 @@ do_conf_hysteria2() {
 
     load_os_info
     restore_domain_arrays
+
+    if ! preflight_config_check "do_conf_hysteria2"; then
+        done_return
+        return
+    fi
+
     load_module hysteria2
     configure_hysteria2
 
@@ -1233,6 +1951,12 @@ do_conf_naive() {
 
     load_os_info
     restore_domain_arrays
+
+    if ! preflight_config_check "do_conf_naive"; then
+        done_return
+        return
+    fi
+
     load_module naive
     configure_naive || return
 
@@ -1259,12 +1983,409 @@ do_reconf_naive() {
     do_conf_naive
 }
 
+do_preflight_report() {
+    load_os_info
+    restore_domain_arrays 2>/dev/null || true
+    echo ""
+    log_step "配置健康检查（preflight）"
+    if preflight_config_check "manual_report"; then
+        echo ""
+        log_info "结果：通过"
+    else
+        echo ""
+        log_warn "结果：有硬失败项，请按上述提示修复后再运行 do_conf_*"
+    fi
+    done_return
+}
+
 do_client() {
     load_module sync
     sync_before_client_links
     load_module client
     run_client
     done_return
+}
+
+_new_uuid() {
+    if command -v xray &>/dev/null; then
+        xray uuid
+    else
+        cat /proc/sys/kernel/random/uuid 2>/dev/null || uuidgen
+    fi
+}
+
+_new_xray_short_ids() {
+    printf '%s %s %s %s %s' \
+        "$(openssl rand -hex 4)" \
+        "$(openssl rand -hex 4)" \
+        "$(openssl rand -hex 4)" \
+        "$(openssl rand -hex 6)" \
+        "$(openssl rand -hex 8)"
+}
+
+_new_xhttp_path() {
+    printf '/%s' "$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+}
+
+_new_subscription_path() {
+    local old_path machine_name sub_name new_path
+    old_path=$(get_state "SUBSCRIPTION_PATH" "")
+    if [[ "${old_path}" =~ ^/[A-Za-z0-9._-]+$ ]]; then
+        rm -f "/var/www/html${old_path}"
+    fi
+
+    machine_name=$(hostname -s 2>/dev/null || echo "server")
+    sub_name=$(printf '%s' "${machine_name:-server}" | tr -c 'A-Za-z0-9._-' '-')
+    sub_name="${sub_name:-server}"
+    new_path="/sub-${sub_name}-$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+    save_state "SUBSCRIPTION_PATH" "${new_path}"
+    log_info "已生成新订阅路径: ${new_path}"
+}
+
+_is_conf_step_enabled() {
+    local step="$1"
+    [[ "$(get_step "$step")" == "1" ]]
+}
+
+_restart_rotated_service() {
+    local service="$1" backup="$2" config="$3" keep_backup="${4:-0}"
+
+    if ! systemctl cat "$service" >/dev/null 2>&1; then
+        log_warn "${service} 单元不存在，跳过重启（配置已更新）"
+        [[ "$keep_backup" == "1" ]] || rm -f "$backup"
+        return 0
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl restart "$service"; then
+        [[ "$keep_backup" == "1" ]] || rm -f "$backup"
+        return 0
+    fi
+
+    log_error "${service} 重启失败，恢复旧配置"
+    mv -f "$backup" "$config" 2>/dev/null || true
+    systemctl restart "$service" 2>/dev/null || true
+    return 1
+}
+
+_sync_nginx_after_credential_reset() {
+    _is_conf_step_enabled "CONF_NGINX" || return 0
+
+    log_step "同步 Nginx 协议入口配置..."
+    load_os_info
+    restore_domain_arrays
+
+    if ! preflight_config_check "credential_reset_nginx_sync"; then
+        log_error "Nginx 同步前检查失败，已停止安全重置"
+        return 1
+    fi
+
+    load_module nginx
+    generate_upstreams_conf
+    generate_fallback_conf
+    generate_servers_conf || return 1
+    generate_nginx_conf
+    if ! nginx -t; then
+        log_error "Nginx 配置验证失败，已停止安全重置"
+        return 1
+    fi
+    if ! systemctl restart nginx; then
+        log_error "Nginx 重启失败，已停止安全重置"
+        return 1
+    fi
+    log_info "Nginx 已同步新 XHTTP 路径"
+}
+
+_restore_xray_after_nginx_sync_failure() {
+    local config="/usr/local/etc/xray/config.json"
+    [[ -n "${RESET_XRAY_BACKUP:-}" && -f "${RESET_XRAY_BACKUP}" ]] || return 0
+
+    log_error "Nginx 同步失败，恢复 Xray 旧配置和旧 XHTTP 路径"
+    mv -f "${RESET_XRAY_BACKUP}" "$config" 2>/dev/null || true
+    save_state "XRAY_UUID" "${RESET_OLD_XRAY_UUID:-}"
+    save_state "XRAY_PRIVATE_KEY" "${RESET_OLD_XRAY_PRIVATE_KEY:-}"
+    save_state "XRAY_PUBLIC_KEY" "${RESET_OLD_XRAY_PUBLIC_KEY:-}"
+    save_state "REALITY_SHORT_IDS" "${RESET_OLD_REALITY_SHORT_IDS:-}"
+    save_state "REALITY_SHORT_ID" "${RESET_OLD_REALITY_SHORT_ID:-}"
+    [[ -n "${RESET_OLD_XHTTP_PATH:-}" ]] && save_state "XHTTP_PATH" "${RESET_OLD_XHTTP_PATH}"
+    systemctl restart xray.service 2>/dev/null || true
+}
+
+_rotate_xray_credentials() {
+    local config="/usr/local/etc/xray/config.json"
+    _is_conf_step_enabled "CONF_XRAY" || return 0
+    [[ -f "${config}" ]] || { log_warn "跳过 Xray：未找到 ${config}"; return 0; }
+
+    if ! command -v xray &>/dev/null; then
+        log_warn "跳过 Xray：未找到 xray 命令"
+        return 0
+    fi
+
+    log_step "轮换 Xray UUID / Reality 密钥 / shortIds..."
+    local new_uuid keypair new_private new_public new_short_ids new_xhttp_path tmp backup
+    new_uuid=$(_new_uuid)
+    keypair=$(xray x25519)
+    new_private=$(echo "$keypair" | grep -i "private" | awk '{print $NF}')
+    new_public=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
+    new_short_ids=$(_new_xray_short_ids)
+    new_xhttp_path=$(_new_xhttp_path)
+    tmp="${config}.tmp.$$.json"
+    backup="${config}.bak.$$"
+
+    if ! NEW_XRAY_UUID="${new_uuid}" \
+        NEW_XRAY_PRIVATE_KEY="${new_private}" \
+        NEW_XRAY_SHORT_IDS="${new_short_ids}" \
+        NEW_XHTTP_PATH="${new_xhttp_path}" \
+        python3 - "$config" "$tmp" << 'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+tmp = Path(sys.argv[2])
+with path.open() as f:
+    config = json.load(f)
+
+new_uuid = os.environ["NEW_XRAY_UUID"]
+new_private_key = os.environ["NEW_XRAY_PRIVATE_KEY"]
+new_short_ids = os.environ["NEW_XRAY_SHORT_IDS"].split()
+new_xhttp_path = os.environ["NEW_XHTTP_PATH"]
+
+changed = 0
+for inbound in config.get("inbounds", []):
+    for client in inbound.get("settings", {}).get("clients", []):
+        if "id" in client:
+            client["id"] = new_uuid
+            changed += 1
+
+    reality = inbound.get("streamSettings", {}).get("realitySettings")
+    if reality:
+        reality["privateKey"] = new_private_key
+        reality["shortIds"] = new_short_ids
+        changed += 1
+
+    xhttp = inbound.get("streamSettings", {}).get("xhttpSettings")
+    if xhttp and "path" in xhttp:
+        xhttp["path"] = new_xhttp_path
+        changed += 1
+
+if changed == 0:
+    sys.exit("no Xray client or Reality credential fields matched")
+
+with tmp.open("w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+    then
+        rm -f "$tmp"
+        log_error "Xray 配置字段匹配失败，已停止安全重置"
+        exit 1
+    fi
+
+    if ! xray run -test -config "$tmp"; then
+        rm -f "$tmp"
+        log_error "Xray 配置验证失败，已停止安全重置"
+        exit 1
+    fi
+    cp -p "$config" "$backup"
+    mv -f "$tmp" "$config"
+
+    RESET_OLD_XRAY_UUID=$(get_state "XRAY_UUID" "")
+    RESET_OLD_XRAY_PRIVATE_KEY=$(get_state "XRAY_PRIVATE_KEY" "")
+    RESET_OLD_XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY" "")
+    RESET_OLD_REALITY_SHORT_IDS=$(get_state "REALITY_SHORT_IDS" "")
+    RESET_OLD_REALITY_SHORT_ID=$(get_state "REALITY_SHORT_ID" "")
+    RESET_OLD_XHTTP_PATH=$(get_state "XHTTP_PATH" "")
+    RESET_XRAY_BACKUP="$backup"
+    _restart_rotated_service "xray.service" "$backup" "$config" "1" || exit 1
+    save_state "XRAY_UUID" "${new_uuid}"
+    save_state "XRAY_PRIVATE_KEY" "${new_private}"
+    save_state "XRAY_PUBLIC_KEY" "${new_public}"
+    save_state "XHTTP_PATH" "${new_xhttp_path}"
+    save_state "REALITY_SHORT_IDS" "${new_short_ids}"
+    save_state "REALITY_SHORT_ID" "$(awk '{print $2}' <<< "${new_short_ids}")"
+    log_info "Xray 凭据已轮换"
+
+}
+
+_rotate_singbox_credentials() {
+    local config="/etc/sing-box/config.json"
+    _is_conf_step_enabled "CONF_SINGBOX" || return 0
+    [[ -f "${config}" ]] || { log_warn "跳过 Sing-Box：未找到 ${config}"; return 0; }
+
+    log_step "轮换 Sing-Box AnyTLS 密码..."
+    local new_password tmp backup
+    new_password=$(openssl rand -base64 24 | tr -d '=+/' | cut -c1-20)
+    new_password="${new_password}-$(openssl rand -hex 4)"
+    tmp="${config}.tmp.$$"
+    backup="${config}.bak.$$"
+
+    if ! NEW_SINGBOX_PASSWORD="${new_password}" python3 - "$config" "$tmp" << 'PY'
+import json
+import os
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+tmp = Path(sys.argv[2])
+with path.open() as f:
+    config = json.load(f)
+
+new_password = os.environ["NEW_SINGBOX_PASSWORD"]
+changed = 0
+for inbound in config.get("inbounds", []):
+    if inbound.get("type") == "anytls":
+        for user in inbound.get("users", []):
+            user["password"] = new_password
+            changed += 1
+
+if changed == 0:
+    sys.exit("no Sing-Box AnyTLS users matched")
+
+with tmp.open("w") as f:
+    json.dump(config, f, indent=2, ensure_ascii=False)
+    f.write("\n")
+PY
+    then
+        rm -f "$tmp"
+        log_error "Sing-Box 配置字段匹配失败，已停止安全重置"
+        exit 1
+    fi
+
+    if command -v sing-box &>/dev/null && ! sing-box check -c "$tmp"; then
+        rm -f "$tmp"
+        log_error "Sing-Box 配置验证失败，已停止安全重置"
+        exit 1
+    fi
+    cp -p "$config" "$backup"
+    mv -f "$tmp" "$config"
+
+    _restart_rotated_service "sing-box.service" "$backup" "$config" || exit 1
+    save_state "SINGBOX_PASSWORD" "${new_password}"
+    log_info "Sing-Box AnyTLS 密码已轮换"
+}
+
+_rotate_hysteria2_credentials() {
+    local config="/etc/hysteria/config.yaml"
+    _is_conf_step_enabled "CONF_HYSTERIA2" || return 0
+    [[ -f "${config}" ]] || { log_warn "跳过 Hysteria2：未找到 ${config}"; return 0; }
+
+    log_step "轮换 Hysteria2 密码..."
+    local new_password tmp backup
+    new_password=$(openssl rand -base64 18)
+    tmp="${config}.tmp.$$"
+    backup="${config}.bak.$$"
+
+    if ! NEW_HYSTERIA2_PASSWORD="${new_password}" python3 - "$config" "$tmp" << 'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+tmp = Path(sys.argv[2])
+new_password = os.environ["NEW_HYSTERIA2_PASSWORD"]
+text = path.read_text()
+text, password_count = re.subn(r"^(\s+password:\s*).*$", rf"\g<1>{new_password}", text, flags=re.MULTILINE)
+text, secret_count = re.subn(r"^(\s+secret:\s*).*$", rf"\g<1>{new_password}", text, flags=re.MULTILINE)
+if password_count + secret_count == 0:
+    sys.exit("no Hysteria2 password or secret fields matched")
+tmp.write_text(text)
+PY
+    then
+        rm -f "$tmp"
+        log_error "Hysteria2 配置字段匹配失败，已停止安全重置"
+        exit 1
+    fi
+    cp -p "$config" "$backup"
+    mv -f "$tmp" "$config"
+
+    _restart_rotated_service "hysteria-server.service" "$backup" "$config" || exit 1
+    save_state "HYSTERIA2_PASSWORD" "${new_password}"
+    log_info "Hysteria2 密码已轮换"
+}
+
+_rotate_naive_credentials() {
+    local config="/etc/caddy-naive/Caddyfile"
+    _is_conf_step_enabled "CONF_NAIVE" || return 0
+    [[ -f "${config}" ]] || { log_warn "跳过 NaiveProxy：未找到 ${config}"; return 0; }
+
+    log_step "轮换 NaiveProxy 用户名 / 密码 / probe_resistance..."
+    local new_user new_password new_probe tmp backup
+    new_user="u$(openssl rand -hex 6)"
+    new_password="$(openssl rand -hex 10)"
+    new_probe=$(openssl rand -hex 8)
+    tmp="${config}.tmp.$$"
+    backup="${config}.bak.$$"
+
+    if ! NEW_NAIVE_USER="${new_user}" \
+        NEW_NAIVE_PASS="${new_password}" \
+        NEW_NAIVE_PROBE="${new_probe}" \
+        python3 - "$config" "$tmp" << 'PY'
+import os
+import re
+import sys
+from pathlib import Path
+
+path = Path(sys.argv[1])
+tmp = Path(sys.argv[2])
+text = path.read_text()
+text, auth_count = re.subn(
+    r"^(\s*basic_auth\s+)\S+\s+\S+\s*$",
+    rf"\g<1>{os.environ['NEW_NAIVE_USER']} {os.environ['NEW_NAIVE_PASS']}",
+    text,
+    flags=re.MULTILINE,
+)
+text, probe_count = re.subn(
+    r"^(\s*probe_resistance\s+)[^.]+(\..*)$",
+    rf"\g<1>{os.environ['NEW_NAIVE_PROBE']}\2",
+    text,
+    flags=re.MULTILINE,
+)
+if auth_count == 0 or probe_count == 0:
+    sys.exit("no NaiveProxy basic_auth or probe_resistance fields matched")
+tmp.write_text(text)
+PY
+    then
+        rm -f "$tmp"
+        log_error "NaiveProxy 配置字段匹配失败，已停止安全重置"
+        exit 1
+    fi
+
+    if command -v caddy-naive &>/dev/null && ! caddy-naive validate --config "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        log_error "NaiveProxy 配置验证失败，已停止安全重置"
+        exit 1
+    fi
+    cp -p "$config" "$backup"
+    mv -f "$tmp" "$config"
+
+    _restart_rotated_service "caddy-naive.service" "$backup" "$config" || exit 1
+    save_state "NAIVE_USER" "${new_user}"
+    save_state "NAIVE_PASS" "${new_password}"
+    save_state "NAIVE_PROBE_LINK" "${new_probe}"
+    log_info "NaiveProxy 凭据已轮换"
+}
+
+do_reset_client_credentials() {
+    log_warn "这会重置所有已配置节点的客户端凭据，旧订阅和旧节点链接将失效。"
+    read -rp "确认继续？[y/N]: " c
+    [[ "${c,,}" != "y" ]] && return
+
+    _rotate_xray_credentials
+    _rotate_singbox_credentials
+    _rotate_hysteria2_credentials
+    _rotate_naive_credentials
+    _sync_nginx_after_credential_reset || {
+        _restore_xray_after_nginx_sync_failure
+        exit 1
+    }
+    rm -f "${RESET_XRAY_BACKUP:-}"
+    RESET_XRAY_BACKUP=""
+    _new_subscription_path
+
+    do_client
 }
 
 do_warp() {
@@ -1284,9 +2405,46 @@ do_warp() {
     done_return
 }
 
+do_security_ssh() {
+    load_module security
+    run_security_ssh
+    done_return
+}
+
+do_security_keys() {
+    load_module security
+    run_security_keys
+    done_return
+}
+
+do_firewall_nftables() {
+    load_module firewall
+    run_firewall_nftables
+    done_return
+}
+
+do_crowdsec_install_config() {
+    load_module crowdsec
+    run_crowdsec_install_config
+    done_return
+}
+
+do_crowdsec_update() {
+    load_module crowdsec
+    run_crowdsec_update
+    done_return
+}
+
 upgrade_component_method() {
     case "$1" in
-        nginx|singbox) echo "系统仓库安装" ;;
+        nginx)
+            if command -v nginx &>/dev/null && [[ "$(nginx_install_method)" == "compiled" ]]; then
+                echo "编译安装"
+            else
+                echo "系统仓库安装"
+            fi
+            ;;
+        singbox) echo "系统仓库安装" ;;
         xray|hysteria2) echo "脚本安装" ;;
         naive) echo "编译安装" ;;
         *) echo "未知" ;;
@@ -1299,7 +2457,7 @@ upgrade_component_label() {
         xray) echo "Xray" ;;
         singbox) echo "Sing-Box" ;;
         hysteria2) echo "Hysteria2" ;;
-        naive) echo "NaiveProxy" ;;
+        naive) echo "NaiveProxy(Caddy)" ;;
         all) echo "全部组件" ;;
         *) echo "$1" ;;
     esac
@@ -1320,7 +2478,7 @@ upgrade_github_latest() {
     curl -fsSL --max-time 5 "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
         | grep -oP '"tag_name"\s*:\s*"\K[^"]+' \
         | head -1 \
-        | sed 's/^v//'
+        | grep -oP '[0-9]+(\.[0-9]+)+'
 }
 
 upgrade_apt_candidate() {
@@ -1333,11 +2491,17 @@ upgrade_apt_candidate() {
 
 upgrade_remote_version() {
     case "$1" in
-        nginx)     upgrade_apt_candidate nginx ;;
-        singbox)   upgrade_apt_candidate sing-box ;;
+        nginx)
+            curl -fsSL --max-time 8 "https://nginx.org/en/CHANGES" 2>/dev/null \
+                | grep -m1 'Changes with nginx' \
+                | grep -oP '[0-9]+\.[0-9]+\.[0-9]+'
+            ;;
+        singbox)
+            upgrade_github_latest SagerNet/sing-box
+            ;;
         xray)      upgrade_github_latest XTLS/Xray-core ;;
         hysteria2) upgrade_github_latest apernet/hysteria ;;
-        naive)     upgrade_github_latest klzgrad/naiveproxy ;;
+        naive)     upgrade_github_latest caddyserver/caddy ;;
     esac
 }
 
@@ -1366,7 +2530,7 @@ restart_service_if_configured() {
         return 0
     fi
 
-    if systemctl list-unit-files 2>/dev/null | grep -q "^${service}"; then
+    if systemctl cat "$service" >/dev/null 2>&1; then
         systemctl restart "$service" || {
             log_warn "${service} 重启失败，请查看: journalctl -u ${service} --no-pager -n 50"
             return 0
@@ -1383,8 +2547,12 @@ upgrade_repo_component() {
     load_os_info
     case "$component" in
         nginx)
-            load_module nginx
-            install_nginx
+            if [[ "$(nginx_install_method)" == "compiled" ]]; then
+                upgrade_nginx_compiled
+            else
+                load_module nginx
+                install_nginx
+            fi
             restart_service_if_configured "nginx.service" "nginx -t >/dev/null 2>&1"
             save_state "INST_NGINX" "1"
             ;;
@@ -1420,19 +2588,182 @@ upgrade_script_component() {
     esac
 }
 
+# ── Nginx 安装方式检测 ─────────────────────────────────────────
+# 返回 "pkg"（包管理器）/ "compiled"（编译安装）/ "none"（未安装）
+nginx_install_method() {
+    if dpkg -l nginx 2>/dev/null | grep -q '^ii'; then echo "pkg"; return; fi
+    if rpm -q nginx 2>/dev/null | grep -qv 'is not installed'; then echo "pkg"; return; fi
+    if command -v nginx &>/dev/null; then echo "compiled"; return; fi
+    echo "none"
+}
+
+# ── Nginx 编译依赖 ─────────────────────────────────────────────
+nginx_install_build_deps() {
+    log_step "安装 Nginx 编译依赖..."
+    case "$OS_ID" in
+        ubuntu|debian)
+            apt-get install -y build-essential libpcre3-dev libssl-dev zlib1g-dev >/dev/null 2>&1 ;;
+        centos|rhel|rocky|almalinux|fedora)
+            dnf install -y gcc make pcre-devel openssl-devel zlib-devel >/dev/null 2>&1 ;;
+    esac
+}
+
+# ── Nginx 编译升级 ─────────────────────────────────────────────
+upgrade_nginx_compiled() {
+    local target_ver current_ver configure_args tmp_dir src_dir
+    local sbin_path pid_path old_pid waited
+
+    # ── 版本检测，已是最新则跳过 ─────────────────────────────────
+    target_ver=$(upgrade_remote_version nginx)
+    [[ -z "$target_ver" ]] && { log_error "无法获取 Nginx 最新版本"; exit 1; }
+    current_ver=$(upgrade_command_version nginx)
+    if [[ -n "$current_ver" && "$current_ver" == "$target_ver" ]]; then
+        log_info "Nginx 已是最新版本 ${current_ver}，跳过"
+        return 0
+    fi
+    log_info "当前: ${current_ver:-未知}  →  目标: ${target_ver}"
+
+    # ── 提取原始 configure 参数（路径全部保留）────────────────────
+    configure_args=$(nginx -V 2>&1 | grep -oP '(?<=configure arguments:).*' | sed 's/^ //')
+    [[ -z "$configure_args" ]] && { log_error "无法提取 Nginx 编译参数（nginx -V 输出异常）"; exit 1; }
+    log_info "原编译参数: ${configure_args}"
+
+    # 从 configure 参数中提取关键路径
+    sbin_path=$(echo "$configure_args" | grep -oP '(?<=--sbin-path=)\S+')
+    [[ -z "$sbin_path" ]] && sbin_path=$(command -v nginx)
+    pid_path=$(echo "$configure_args" | grep -oP '(?<=--pid-path=)\S+')
+    [[ -z "$pid_path" ]] && pid_path="/var/run/nginx.pid"
+    log_info "二进制: ${sbin_path}  PID: ${pid_path}"
+
+    # 检查外部 --add-module= 路径是否存在
+    while IFS= read -r mod; do
+        [[ -n "$mod" && ! -d "$mod" ]] && log_warn "外部模块目录不存在: $mod（configure 可能失败）"
+    done < <(echo "$configure_args" | grep -oP '(?<=--add-module=)[^ ]+')
+
+    nginx_install_build_deps
+
+    tmp_dir=$(mktemp -d)
+    trap 'rm -rf "$tmp_dir"' RETURN
+
+    # ── 下载源码 ──────────────────────────────────────────────────
+    log_step "下载 nginx-${target_ver} 源码..."
+    curl -fsSL --max-time 120 \
+        "https://nginx.org/download/nginx-${target_ver}.tar.gz" \
+        -o "${tmp_dir}/nginx.tar.gz" \
+        || { log_error "下载 Nginx 源码失败"; exit 1; }
+
+    tar -xzf "${tmp_dir}/nginx.tar.gz" -C "$tmp_dir"
+    src_dir=$(find "$tmp_dir" -maxdepth 1 -name 'nginx-*' -type d | head -1)
+    [[ -z "$src_dir" ]] && { log_error "源码解压失败"; exit 1; }
+
+    # ── 编译（复用原始 configure 参数，路径与原安装完全一致）──────
+    pushd "$src_dir" >/dev/null
+    log_step "configure..."
+    # shellcheck disable=SC2086
+    ./configure $configure_args 2>&1 || { popd >/dev/null; log_error "Nginx configure 失败"; exit 1; }
+
+    log_step "make（$(nproc) 线程）..."
+    make -j"$(nproc)" 2>&1 || { popd >/dev/null; log_error "Nginx make 失败"; exit 1; }
+
+    # ── 热升级：只替换二进制，不覆盖配置 ────────────────────────
+    log_step "替换二进制文件..."
+    cp -f "$sbin_path" "${sbin_path}.old"   # 备份，供回滚
+    cp -f objs/nginx "$sbin_path"
+    chmod 755 "$sbin_path"
+    popd >/dev/null
+
+    # nginx 未在运行时直接启动，跳过热重启流程
+    if [[ ! -f "$pid_path" ]] || ! kill -0 "$(cat "$pid_path" 2>/dev/null)" 2>/dev/null; then
+        log_warn "Nginx 未在运行，直接启动新版本"
+        systemctl start nginx 2>/dev/null || nginx 2>/dev/null || true
+        rm -f "${sbin_path}.old"
+        log_info "Nginx 编译升级完成: $(nginx -v 2>&1 | grep -oP '[0-9.]+' | head -1)"
+        return 0
+    fi
+
+    # ── USR2：让 nginx 以新二进制启动新 master，保持旧 master 在线
+    old_pid=$(cat "$pid_path")
+    log_step "发送 USR2 启动新 master（旧 PID: ${old_pid}）..."
+    kill -USR2 "$old_pid" || { log_error "USR2 发送失败"; cp -f "${sbin_path}.old" "$sbin_path"; exit 1; }
+
+    # 等待新 master 生成 .oldbin PID 文件（最多 15 秒）
+    waited=0
+    while [[ ! -f "${pid_path}.oldbin" && $waited -lt 15 ]]; do
+        sleep 1; (( waited++ ))
+    done
+
+    if [[ ! -f "${pid_path}.oldbin" ]]; then
+        log_warn "新 master 启动超时，回滚二进制"
+        cp -f "${sbin_path}.old" "$sbin_path"
+        log_error "Nginx 热升级失败"
+        exit 1
+    fi
+
+    # ── WINCH：旧 worker 停止接受新连接，优雅排干
+    log_step "WINCH 旧 worker，等待连接排干..."
+    kill -WINCH "$old_pid" 2>/dev/null || true
+    sleep 3
+
+    # ── QUIT：旧 master 退出，完成升级
+    kill -QUIT "$old_pid" 2>/dev/null || true
+
+    rm -f "${sbin_path}.old"
+    log_info "Nginx 编译升级完成: $(nginx -v 2>&1 | grep -oP '[0-9.]+' | head -1)"
+}
+
 upgrade_compiled_component() {
     local component="$1"
 
     load_os_info
     case "$component" in
         naive)
+            if naive_upgrade_up_to_date; then
+                log_info "Caddy 与 forwardproxy@naive 均为最新，跳过重新编译"
+                save_state "INST_NAIVE" "1"
+                return 0
+            fi
             load_module naive
             install_naive
+            naive_record_forwardproxy_commit
             restart_service_if_configured "caddy-naive.service" \
                 '[[ ! -f /etc/caddy-naive/Caddyfile ]] || /usr/local/bin/caddy-naive validate --config /etc/caddy-naive/Caddyfile >/dev/null 2>&1'
             save_state "INST_NAIVE" "1"
             ;;
     esac
+}
+
+# ── NaiveProxy(Caddy) 升级辅助：判定是否真的需要重新编译 ──
+# 两个上游：caddyserver/caddy（latest release tag）+ klzgrad/forwardproxy@naive（HEAD commit）
+# 任一变化即返回 1（需升级）；都未变返回 0（跳过）；网络失败时返回 1（保守触发编译）
+naive_upgrade_up_to_date() {
+    local current_caddy latest_caddy current_fp_commit latest_fp_commit
+    current_caddy=$(upgrade_command_version naive 2>/dev/null || true)
+    latest_caddy=$(upgrade_github_latest caddyserver/caddy 2>/dev/null || true)
+    current_fp_commit=$(get_state "FORWARDPROXY_NAIVE_COMMIT" "")
+    latest_fp_commit=$(curl -fsSL --max-time 5 \
+        "https://api.github.com/repos/klzgrad/forwardproxy/commits/naive" 2>/dev/null \
+        | grep -oP '"sha"\s*:\s*"\K[^"]+' | head -1 || true)
+
+    local cur_fp_short="${current_fp_commit:0:12}" lat_fp_short="${latest_fp_commit:0:12}"
+    log_info "Caddy: 当前=${current_caddy:-未知} 最新=${latest_caddy:-未知}"
+    log_info "forwardproxy@naive: 当前=${cur_fp_short:-未知} 最新=${lat_fp_short:-未知}"
+
+    [[ -z "$current_caddy" || -z "$latest_caddy" || -z "$latest_fp_commit" ]] && return 1
+    [[ "$current_caddy" != "$latest_caddy" ]] && return 1
+    [[ "$current_fp_commit" != "$latest_fp_commit" ]] && return 1
+    return 0
+}
+
+# 编译成功后记录 forwardproxy@naive 的 HEAD commit，作为下次比对的基线
+naive_record_forwardproxy_commit() {
+    local sha
+    sha=$(curl -fsSL --max-time 5 \
+        "https://api.github.com/repos/klzgrad/forwardproxy/commits/naive" 2>/dev/null \
+        | grep -oP '"sha"\s*:\s*"\K[^"]+' | head -1 || true)
+    if [[ -n "$sha" ]]; then
+        save_state "FORWARDPROXY_NAIVE_COMMIT" "$sha"
+        log_info "已记录 forwardproxy@naive commit: ${sha:0:12}"
+    fi
 }
 
 run_upgrade_component() {
@@ -1474,12 +2805,13 @@ run_upgrade_component() {
 
 start_upgrade_job() {
     local component="$1"
-    local label session log_file status_file runner script_path runner_script
+    local label session log_file status_file pid_file runner script_path runner_script
 
     label=$(upgrade_component_label "$component")
     session="xray-upgrade-${component}"
     log_file="/var/log/xray-deploy/upgrade-${component}-$(date +%Y%m%d%H%M%S).log"
     status_file="/var/log/xray-deploy/upgrade-${component}.status"
+    pid_file="/var/log/xray-deploy/upgrade-${component}.pid"
     runner="/tmp/xray-deploy-upgrade-${component}-$$.sh"
     script_path="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || true)"
 
@@ -1493,7 +2825,10 @@ start_upgrade_job() {
 
     cat > "$runner" << RUNNER
 #!/usr/bin/env bash
+# 此 set -euo pipefail 属于独立的后台 runner 子脚本（写入 \$runner），
+# 与本文件顶部第 2 行的 set -euo pipefail 是两个进程，互不影响。
 set -euo pipefail
+echo \$\$ > "$pid_file"
 exec >>"$log_file" 2>&1
 finish() {
     local code="\$?"
@@ -1504,12 +2839,12 @@ finish() {
         echo "FAILED $label \$(date '+%F %T') code=\$code log=$log_file" > "$status_file"
         echo "[ERROR] 升级任务失败: $label (exit=\$code)"
     fi
-    rm -f "$runner"
+    rm -f "$pid_file" "$runner"
 }
 trap finish EXIT
-echo "[INFO] 升级任务启动: $label"
+echo "[INFO] 升级任务启动: $label (PID=\$\$)"
 echo "[INFO] 日志文件: $log_file"
-echo "RUNNING $label \$(date '+%F %T') log=$log_file" > "$status_file"
+echo "RUNNING $label \$(date '+%F %T') log=$log_file pid=\$\$" > "$status_file"
 $runner_script
 echo "[INFO] 升级任务结束: $label"
 RUNNER
@@ -1525,6 +2860,94 @@ RUNNER
     fi
     log_info "升级日志: ${log_file}"
     log_info "状态文件: ${status_file}"
+
+    upgrade_job_initial_feedback "$component" "$label" "$log_file" "$status_file" "$pid_file"
+}
+
+upgrade_job_is_alive() {
+    local pid_file="$1"
+    [[ -f "$pid_file" ]] || return 1
+    local pid
+    pid=$(cat "$pid_file" 2>/dev/null || true)
+    [[ -n "$pid" ]] || return 1
+    kill -0 "$pid" 2>/dev/null
+}
+
+upgrade_job_initial_feedback() {
+    local component="$1" label="$2" log_file="$3" status_file="$4" pid_file="$5"
+    local i=0
+    # 等待 runner 写入 PID 与首行日志（最多 5 秒）
+    while [[ $i -lt 10 ]]; do
+        [[ -f "$pid_file" && -f "$log_file" ]] && break
+        sleep 0.5
+        i=$((i+1))
+    done
+
+    echo ""
+    echo -e "${BLUE}================ ${label} 任务启动反馈 ================${NC}"
+    if upgrade_job_is_alive "$pid_file"; then
+        local pid
+        pid=$(cat "$pid_file" 2>/dev/null || echo "?")
+        echo -e "  运行状态: ${GREEN}RUNNING${NC} (PID=${pid})"
+    elif [[ -f "$status_file" ]]; then
+        echo "  运行状态: $(cat "$status_file")"
+    else
+        echo -e "  运行状态: ${YELLOW}尚未写入 PID/状态，可能仍在初始化${NC}"
+    fi
+    echo ""
+    echo "  实时跟踪: tail -f ${log_file}"
+    echo "  快速查询: cat ${status_file}"
+    echo "  菜单跟踪: 主菜单 → v → t（实时跟踪，Ctrl+C 仅退出查看）"
+    echo ""
+    echo -e "${BLUE}---------------- 当前日志（最后 20 行）----------------${NC}"
+    if [[ -f "$log_file" ]]; then
+        tail -n 20 "$log_file" 2>/dev/null || true
+    else
+        echo "  （日志尚未生成，稍候片刻可用上面的 tail 命令查看）"
+    fi
+    echo -e "${BLUE}-------------------------------------------------------${NC}"
+}
+
+tail_upgrade_log() {
+    local status_dir="/var/log/xray-deploy"
+    local latest_log component status_file pid_file
+
+    if ! compgen -G "${status_dir}/upgrade-*.log" >/dev/null; then
+        log_warn "暂无升级日志"
+        return
+    fi
+
+    latest_log=$(find "$status_dir" -maxdepth 1 -type f -name 'upgrade-*.log' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn \
+        | awk 'NR == 1 { $1=""; sub(/^ /, ""); print }')
+    component=$(basename "$latest_log" | sed -E 's/^upgrade-([^-]+)-.*\.log$/\1/')
+    status_file="${status_dir}/upgrade-${component}.status"
+    pid_file="${status_dir}/upgrade-${component}.pid"
+
+    echo ""
+    echo -e "${BLUE}================ 实时跟踪升级日志 ================${NC}"
+    echo "  组件: ${component}"
+    echo "  日志: ${latest_log}"
+    [[ -f "$status_file" ]] && echo "  状态: $(cat "$status_file")"
+    echo ""
+
+    if upgrade_job_is_alive "$pid_file"; then
+        echo -e "  ${GREEN}任务运行中${NC}，按 ${YELLOW}Ctrl+C${NC} 退出查看（不会终止后台任务）"
+        echo ""
+        sleep 1
+        trap : INT
+        tail -n 50 -f "$latest_log" || true
+        trap - INT
+        echo ""
+        if [[ -f "$status_file" ]]; then
+            echo "  最新状态: $(cat "$status_file")"
+        fi
+    else
+        echo -e "  ${YELLOW}任务已结束${NC}，显示最终日志（最后 80 行）"
+        echo ""
+        tail -n 80 "$latest_log" 2>/dev/null || true
+    fi
+    echo ""
 }
 
 show_upgrade_status() {
@@ -1543,7 +2966,9 @@ show_upgrade_status() {
         echo "  暂无升级状态文件"
     fi
 
-    latest_log=$(ls -t "${status_dir}"/upgrade-*.log 2>/dev/null | head -1 || true)
+    latest_log=$(find "$status_dir" -maxdepth 1 -type f -name 'upgrade-*.log' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -rn \
+        | awk 'NR == 1 { $1=""; sub(/^ /, ""); print }')
     if [[ -n "$latest_log" ]]; then
         echo ""
         echo "  最新日志: ${latest_log}"
@@ -1582,87 +3007,96 @@ do_upgrade_menu() {
     echo -e "${BLUE}================ 升级组件 ================${NC}"
     echo "  正在查询远程版本（5s 超时）..."
     upgrade_collect_remote_versions
-    clear
-    echo ""
-    echo -e "${BLUE}================ 升级组件 ================${NC}"
-    upgrade_menu_line 1 "Nginx"      nginx
-    upgrade_menu_line 2 "Xray"       xray
-    upgrade_menu_line 3 "Sing-Box"   singbox
-    upgrade_menu_line 4 "Hysteria2"  hysteria2
-    upgrade_menu_line 5 "NaiveProxy" naive
-    echo "  6. 全部升级（仅升级有更新的组件）"
-    echo "  l. 查看最近升级状态/日志"
-    echo "  q. 返回主菜单"
-    echo ""
-    echo "  升级会在 screen 或 nohup 后台运行，SSH 断开不影响任务。"
-    echo ""
 
-    local upgrade_choice component
-    read -rp "  请选择: " upgrade_choice
-    echo ""
+    while true; do
+        clear
+        echo ""
+        echo -e "${BLUE}================ 升级组件 ================${NC}"
+        upgrade_menu_line 1 "Nginx"      nginx
+        upgrade_menu_line 2 "Xray"       xray
+        upgrade_menu_line 3 "Sing-Box"   singbox
+        upgrade_menu_line 4 "Hysteria2"  hysteria2
+        upgrade_menu_line 5 "NaiveProxy" naive
+        echo "  6. 全部升级（仅升级有更新的组件）"
+        echo "  l. 查看最近升级状态/日志"
+        echo "  t. 实时跟踪最近一次升级（tail -f）"
+        echo "  q. 返回主菜单"
+        echo ""
+        echo "  升级会在 screen 或 nohup 后台运行，SSH 断开不影响任务。"
+        echo ""
 
-    case "$upgrade_choice" in
-        1) component="nginx" ;;
-        2) component="xray" ;;
-        3) component="singbox" ;;
-        4) component="hysteria2" ;;
-        5) component="naive" ;;
-        6) component="all" ;;
-        l|L)
-            show_upgrade_status
-            done_return
-            return
-            ;;
-        q|Q) return ;;
-        *)
-            log_error "无效选择"
-            sleep 1
-            return
-            ;;
-    esac
+        local upgrade_choice component
+        read -rp "  请选择: " upgrade_choice
+        echo ""
 
-    if [[ "$component" == "all" ]]; then
-        local pending=() c cur rem
-        for c in nginx xray singbox hysteria2 naive; do
-            cur=$(upgrade_command_version "$c")
-            rem="${UPGRADE_REMOTE_VERSIONS[$c]:-}"
-            if [[ -n "$rem" && -n "$cur" && "$cur" != "$rem" ]]; then
-                pending+=("$c")
+        case "$upgrade_choice" in
+            1) component="nginx" ;;
+            2) component="xray" ;;
+            3) component="singbox" ;;
+            4) component="hysteria2" ;;
+            5) component="naive" ;;
+            6) component="all" ;;
+            l|L)
+                show_upgrade_status
+                read -rp "按回车继续..." _
+                continue
+                ;;
+            t|T)
+                tail_upgrade_log
+                read -rp "按回车继续..." _
+                continue
+                ;;
+            q|Q) return ;;
+            *)
+                log_error "无效选择"
+                sleep 1
+                continue
+                ;;
+        esac
+
+        if [[ "$component" == "all" ]]; then
+            local pending=() c cur rem
+            for c in nginx xray singbox hysteria2 naive; do
+                cur=$(upgrade_command_version "$c")
+                rem="${UPGRADE_REMOTE_VERSIONS[$c]:-}"
+                if [[ -n "$rem" && -n "$cur" && "$cur" != "$rem" ]]; then
+                    pending+=("$c")
+                fi
+            done
+            if [[ ${#pending[@]} -eq 0 ]]; then
+                log_info "所有组件均已是最新版本"
+                read -rp "按回车继续..." _
+                continue
             fi
-        done
-        if [[ ${#pending[@]} -eq 0 ]]; then
-            log_info "所有组件均已是最新版本"
-            done_return
-            return
+            log_info "待升级: ${pending[*]}"
+            local confirm
+            read -rp "  确认升级以上组件？[y/N]: " confirm
+            if [[ "${confirm,,}" != "y" ]]; then
+                read -rp "按回车继续..." _
+                continue
+            fi
+            for c in "${pending[@]}"; do
+                start_upgrade_job "$c"
+            done
+            read -rp "按回车继续..." _
+            continue
         fi
-        log_info "待升级: ${pending[*]}"
-        local confirm
-        read -rp "  确认升级以上组件？[y/N]: " confirm
-        if [[ "${confirm,,}" != "y" ]]; then
-            done_return
-            return
-        fi
-        for c in "${pending[@]}"; do
-            start_upgrade_job "$c"
-        done
-        done_return
-        return
-    fi
 
-    local current remote
-    current=$(upgrade_command_version "$component")
-    remote="${UPGRADE_REMOTE_VERSIONS[$component]:-}"
-    if [[ -n "$remote" && -n "$current" && "$current" == "$remote" ]]; then
-        local force
-        read -rp "  ${component} 已是最新（${current}），强制重装？[y/N]: " force
-        if [[ "${force,,}" != "y" ]]; then
-            done_return
-            return
+        local current remote
+        current=$(upgrade_command_version "$component")
+        remote="${UPGRADE_REMOTE_VERSIONS[$component]:-}"
+        if [[ -n "$remote" && -n "$current" && "$current" == "$remote" ]]; then
+            local force
+            read -rp "  ${component} 已是最新（${current}），强制重装？[y/N]: " force
+            if [[ "${force,,}" != "y" ]]; then
+                read -rp "按回车继续..." _
+                continue
+            fi
         fi
-    fi
 
-    start_upgrade_job "$component"
-    done_return
+        start_upgrade_job "$component"
+        read -rp "按回车继续..." _
+    done
 }
 
 do_uninstall_menu() {
@@ -1736,7 +3170,7 @@ run_full_install_flow() {
     load_module nginx
     install_nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
+    generate_fake_site "/var/www/trap" 2
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -1751,19 +3185,29 @@ run_full_install_flow() {
     save_state "ALL_DOMAINS"    "${ALL_DOMAINS[*]:-}"
     save_state "CDN_DOMAINS"    "${CDN_DOMAINS[*]:-}"
     save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
-    save_state "XHTTP_PATH"     "${XHTTP_PATH:-}"
-    save_state "INST_CERT"      "1"
+    save_state "XHTTP_PATH"          "${XHTTP_PATH:-}"
+    save_state "GRPC_SERVICE_NAME"   "${GRPC_SERVICE_NAME:-}"
+    save_state "INST_CERT"           "1"
 
 
 
     restore_domain_arrays
     XHTTP_PATH=$(get_state "XHTTP_PATH")
     if [[ -z "${XHTTP_PATH}" ]]; then
-        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        XHTTP_PATH="/$(tr -d '-' < /proc/sys/kernel/random/uuid)"
         save_state "XHTTP_PATH" "${XHTTP_PATH}"
         log_info "生成 XHTTP_PATH: ${XHTTP_PATH}"
     else
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
+    fi
+
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    if [[ -z "${GRPC_SERVICE_NAME}" ]]; then
+        GRPC_SERVICE_NAME="$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+        save_state "GRPC_SERVICE_NAME" "${GRPC_SERVICE_NAME}"
+        log_info "生成 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
+    else
+        log_info "复用已有 GRPC_SERVICE_NAME: ${GRPC_SERVICE_NAME}"
     fi
 
     load_module warp
@@ -1794,21 +3238,21 @@ run_full_install_flow() {
     save_state "XRAY_PUBLIC_KEY"      "${XRAY_PUBLIC_KEY:-}"
     save_state "XRAY_PRIVATE_KEY"     "${XRAY_PRIVATE_KEY:-}"
     save_state "XHTTP_PATH"           "${XHTTP_PATH:-}"
+    save_state "GRPC_SERVICE_NAME"    "${GRPC_SERVICE_NAME:-}"
     save_state "REALITY_DEST"         "${REALITY_DEST:-}"
     save_state "REALITY_SNI"          "${REALITY_SERVER_NAMES[0]:-}"
+    save_state "XHTTP_REALITY_SNI"    "${XHTTP_REALITY_SNI:-}"
+    save_state "XHTTP_REALITY_DOMAIN" "${XHTTP_REALITY_DOMAIN:-}"
     save_state "REALITY_SERVER_NAMES" "${REALITY_SERVER_NAMES[*]:-}"
     save_state "REALITY_SHORT_IDS" "${REALITY_SHORT_IDS[*]:-}"
-    save_state "REALITY_SHORT_ID"     "${REALITY_SHORT_IDS[1]:-}"
+    save_state "REALITY_SHORT_ID"     "${REALITY_SHORT_IDS[0]:-}"
     save_state "REALITY_SPIDER_X"     "${REALITY_SPIDER_X:-}"
     save_state "CONF_XRAY"            "1"
 
     # nginx 在 xray 之后生成，确保 REALITY_SERVER_NAMES 已保存
     load_module nginx
     create_nginx_dirs
-    generate_fake_site "/var/www/html" "Welcome"
-    if [[ -n "${GRPC_DOMAIN:-}" ]]; then
-        generate_fake_site "/var/www/${GRPC_DOMAIN}" "${GRPC_DOMAIN}"
-    fi
+    generate_fake_site "/var/www/trap" 2
     generate_cf_realip_conf
     generate_ssl_conf
     generate_upstreams_conf
@@ -1828,6 +3272,7 @@ run_full_install_flow() {
 
     restore_domain_arrays
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
+    # shellcheck disable=SC2034
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
     generate_singbox_params
@@ -1866,6 +3311,47 @@ do_reconf_nginx() {
 	log_info "Nginx 配置清理完成，开始重新生成..."
 
 	do_conf_nginx
+
+	# ── 端口一致性检查：nginx 期望的内部端口 vs xray/singbox 实际配置 ──
+	local mismatch=0
+	# xray xhttp 应监听 8300
+	if [[ -f /usr/local/etc/xray/config.json ]]; then
+		if ! grep -q '"port":\s*8300' /usr/local/etc/xray/config.json && \
+		   ! grep -q '"port": 8300'   /usr/local/etc/xray/config.json; then
+			log_warn "检测到端口不一致：Xray config.json 中未找到 xhttp inbound 端口 8300"
+			mismatch=1
+		fi
+		if ! grep -q '"port":\s*8310' /usr/local/etc/xray/config.json && \
+		   ! grep -q '"port": 8310'   /usr/local/etc/xray/config.json; then
+			log_warn "检测到端口不一致：Xray config.json 中未找到 gRPC inbound 端口 8310"
+			mismatch=1
+		fi
+		if ! grep -q '"port":\s*8320' /usr/local/etc/xray/config.json && \
+		   ! grep -q '"port": 8320'   /usr/local/etc/xray/config.json; then
+			log_warn "检测到端口不一致：Xray config.json 中未找到 Reality inbound 端口 8320"
+			mismatch=1
+		fi
+		if ! grep -q '"port":\s*8325' /usr/local/etc/xray/config.json && \
+		   ! grep -q '"port": 8325'   /usr/local/etc/xray/config.json; then
+			log_warn "检测到端口不一致：Xray config.json 中未找到 XHTTP-Reality inbound 端口 8325"
+			mismatch=1
+		fi
+	fi
+	# singbox anytls 应监听 8330
+	if [[ -f /etc/sing-box/config.json ]]; then
+		if ! grep -q '"listen_port":\s*8330' /etc/sing-box/config.json && \
+		   ! grep -q '"listen_port": 8330'   /etc/sing-box/config.json; then
+			log_warn "检测到端口不一致：sing-box config.json 中未找到 AnyTLS inbound 端口 8330"
+			mismatch=1
+		fi
+	fi
+	if [[ "$mismatch" -eq 1 ]]; then
+		log_warn "━━━ 内部端口不一致，Nginx 无法正确转发请求 ━━━"
+		log_warn "需要重新配置 Xray / Sing-Box 以对齐端口，否则相关协议无法工作"
+		log_warn "请从主菜单依次执行："
+		log_warn "  x → 重新配置 Xray"
+		log_warn "  g → 重新配置 Sing-Box（如已安装）"
+	fi
 }
 
 do_reconf_xray() {
@@ -1882,6 +3368,8 @@ do_reconf_xray() {
 	save_state "XRAY_PRIVATE_KEY"     ""
 	save_state "REALITY_DEST"         ""
 	save_state "REALITY_SNI"          ""
+	save_state "XHTTP_REALITY_SNI"    ""
+	save_state "XHTTP_REALITY_DOMAIN" ""
 	save_state "REALITY_SERVER_NAMES" ""
 	save_state "REALITY_SHORT_ID"     ""
 	save_state "REALITY_SHORT_IDS"    ""
@@ -1932,7 +3420,7 @@ do_selinux_mgmt() {
     if command -v semanage >/dev/null 2>&1; then
         local existing
         existing=$(semanage port -l 2>/dev/null | grep '^http_port_t' || true)
-        local ports=(20443 20445 20880 18443 9443 8443)
+        local ports=(8380 8390 8400 8360 8320 8330)
         for port in "${ports[@]}"; do
             if ! echo "$existing" | grep -qw "\\b${port}\\b"; then
                 echo "  ! 端口 ${port}/tcp 缺少 http_port_t 标签"
@@ -1967,9 +3455,11 @@ do_selinux_mgmt() {
             read -rp "  请选择 [1/q]: " mgmt_choice
             case "${mgmt_choice:-}" in
                 1)
-                    setenforce 0 2>/dev/null && \
-                        log_info "已切换到 Permissive 模式" || \
+                    if setenforce 0 2>/dev/null; then
+                        log_info "已切换到 Permissive 模式"
+                    else
                         log_error "切换失败"
+                    fi
                     ;;
             esac
             ;;
@@ -1981,9 +3471,11 @@ do_selinux_mgmt() {
                 read -rp "  请选择 [1/q]: " mgmt_choice
                 case "${mgmt_choice:-}" in
                     1)
-                        setenforce 1 2>/dev/null && \
-                            log_info "已切换到 Enforcing 模式" || \
+                        if setenforce 1 2>/dev/null; then
+                            log_info "已切换到 Enforcing 模式"
+                        else
                             log_error "切换失败"
+                        fi
                         ;;
                 esac
             else
@@ -1997,9 +3489,11 @@ do_selinux_mgmt() {
                         log_warn "端口标签或布尔值不完整，强制切换 Enforcing 可能导致服务异常"
                         read -rp "确认切换？[y/N]: " c
                         if [[ "${c,,}" == "y" ]]; then
-                            setenforce 1 2>/dev/null && \
-                                log_info "已切换到 Enforcing 模式" || \
+                            if setenforce 1 2>/dev/null; then
+                                log_info "已切换到 Enforcing 模式"
+                            else
                                 log_error "切换失败"
+                            fi
                         fi
                         ;;
                     2)
@@ -2073,7 +3567,14 @@ main_menu_loop() {
         echo ""
         echo "  === 其他 ==="
         echo "  a. 生成客户端链接"
+        echo "  k. 重置所有节点凭据并生成新订阅"
         echo "  b. 查看当前状态"
+        echo "  c. 检查配置健康（preflight）"
+        echo "  d. SSH 登录安全检查/加固"
+        echo "  m. SSH 公钥管理（查看/追加/替换）"
+        echo "  f. nftables 防火墙安装/配置"
+        echo "  e. CrowdSec 安装/配置"
+        echo "  j. CrowdSec 更新"
         echo "  s. 同步/更新模块到本地缓存"
         echo "  v. 升级组件（后台运行）"
         echo "  w. 配置 WARP WireGuard 凭证（步骤 11/12 的前置依赖）"
@@ -2089,37 +3590,44 @@ main_menu_loop() {
         echo ""
 
         case "$choice" in
-            1) do_upgrade_kernel ;;
-            2) do_optimize_system ;;
-            3) do_inst_unbound ;;
-            4) do_inst_nginx ;;
-            5) do_inst_cert ;;
-            6) do_inst_xray ;;
-            7) do_inst_singbox ;;
-            8) do_inst_hysteria2 ;;
-            9) do_inst_naive ;;
-           10) do_conf_nginx ;;
-           11) do_conf_xray ;;
-           12) do_conf_singbox ;;
-           13) do_conf_hysteria2 ;;
-           14) do_conf_naive ;;
-          n|N) do_reconf_nginx ;;
-          x|X) do_reconf_xray ;;
-          g|G) do_reconf_singbox ;;
-          h|H) do_reconf_hysteria2 ;;
-          i|I) do_reconf_naive ;;
-            a|A) do_client ;;
+            1) run_menu_action "内核升级"          do_upgrade_kernel ;;
+            2) run_menu_action "系统优化"          do_optimize_system ;;
+            3) run_menu_action "安装 Unbound"      do_inst_unbound ;;
+            4) run_menu_action "安装 Nginx"        do_inst_nginx ;;
+            5) run_menu_action "申请证书"          do_inst_cert ;;
+            6) run_menu_action "安装 Xray"         do_inst_xray ;;
+            7) run_menu_action "安装 Sing-Box"     do_inst_singbox ;;
+            8) run_menu_action "安装 Hysteria2"    do_inst_hysteria2 ;;
+            9) run_menu_action "安装 NaiveProxy"   do_inst_naive ;;
+           10) run_menu_action "配置 Nginx"        do_conf_nginx ;;
+           11) run_menu_action "配置 Xray"         do_conf_xray ;;
+           12) run_menu_action "配置 Sing-Box"     do_conf_singbox ;;
+           13) run_menu_action "配置 Hysteria2"    do_conf_hysteria2 ;;
+           14) run_menu_action "配置 NaiveProxy"   do_conf_naive ;;
+          n|N) run_menu_action "重新配置 Nginx"      do_reconf_nginx ;;
+          x|X) run_menu_action "重新配置 Xray"       do_reconf_xray ;;
+          g|G) run_menu_action "重新配置 Sing-Box"   do_reconf_singbox ;;
+          h|H) run_menu_action "重新配置 Hysteria2"  do_reconf_hysteria2 ;;
+          i|I) run_menu_action "重新配置 NaiveProxy" do_reconf_naive ;;
+            a|A) run_menu_action "生成客户端链接"   do_client ;;
+            k|K) run_menu_action "重置所有节点凭据并生成新订阅" do_reset_client_credentials ;;
             b|B)
-                show_status
+                run_menu_action "查看状态" show_status
                 read -rp "按回车返回主菜单..." _
                 ;;
-            s|S) do_sync_modules ;;
-            v|V) do_upgrade_menu ;;
-            w|W) do_warp ;;
-            u|U) do_uninstall_menu ;;
-            p|P) do_selinux_mgmt ;;
-            r|R) do_reinstall_all ;;
-            0) run_full_install_flow ;;
+            c|C) run_menu_action "配置健康检查"   do_preflight_report ;;
+            d|D) run_menu_action "SSH 登录安全检查/加固" do_security_ssh ;;
+            m|M) run_menu_action "SSH 公钥管理" do_security_keys ;;
+            f|F) run_menu_action "nftables 防火墙安装/配置" do_firewall_nftables ;;
+            e|E) run_menu_action "CrowdSec 安装/配置" do_crowdsec_install_config ;;
+            j|J) run_menu_action "CrowdSec 更新" do_crowdsec_update ;;
+            s|S) run_menu_action "同步模块"        do_sync_modules ;;
+            v|V) run_menu_action "升级组件"        do_upgrade_menu ;;
+            w|W) run_menu_action "配置 WARP"       do_warp ;;
+            u|U) run_menu_action "卸载/清理"       do_uninstall_menu ;;
+            p|P) run_menu_action "SELinux 管理"    do_selinux_mgmt ;;
+            r|R) run_menu_action "全部重装"        do_reinstall_all ;;
+            0) run_menu_action "一键安装"          run_full_install_flow ;;
             q|Q) exit 0 ;;
             *)
                 log_error "无效选择"

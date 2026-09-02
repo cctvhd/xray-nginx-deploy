@@ -15,12 +15,15 @@ load_existing_params() {
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
     REALITY_SNI=$(get_state "REALITY_SNI")
+    REALITY_DEST=$(get_state "REALITY_DEST")
+    XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
     REALITY_SHORT_ID=$(get_state "REALITY_SHORT_ID")
     REALITY_SPIDER_X=$(get_state "REALITY_SPIDER_X")
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XHTTP_PADDING=$(get_state "XHTTP_PADDING")
     REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
+    XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     HYSTERIA2_PASSWORD=$(get_state "HYSTERIA2_PASSWORD")
     HYSTERIA2_PH_START=$(get_state "HYSTERIA2_PH_START")
@@ -33,6 +36,10 @@ load_existing_params() {
     NAIVE_USER=$(get_state "NAIVE_USER")
     NAIVE_PASS=$(get_state "NAIVE_PASS")
     NAIVE_PROBE_LINK=$(get_state "NAIVE_PROBE_LINK")
+    SUBSCRIPTION_PATH=$(get_state "SUBSCRIPTION_PATH")
+    VLESS_ENC_CLIENT=$(get_state "VLESS_ENC_CLIENT")
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
@@ -42,10 +49,13 @@ load_existing_params() {
             XHTTP_PATH=$(grep -oP '"path":\s*"\K[^"]+' "$xray_config" | head -1)
         [[ -n "${XHTTP_DOMAIN:-}" ]] || \
             XHTTP_DOMAIN=$(grep -oP '"host":\s*"\K[^"]+' "$xray_config" | head -1)
-        REALITY_DEST=$(grep -oP '"dest":\s*"\K[^"]+' "$xray_config" | head -1 || true)
         XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1 || true)
         XHTTP_EXTRA_JSON=$(python3 -c "
 import json
+# 仅导出客户端有意义的字段：enc / xPaddingBytes / xmux
+# 服务端 extra 中的 scStreamUpServerSecs（上行流时长）与 headers（响应头）
+# 仅服务端使用；新版 Xray-core 客户端默认动态 Chrome UA，无需 headers
+CLIENT_KEYS = ('enc', 'xPaddingBytes', 'xmux')
 with open('${xray_config}') as f:
     c = json.load(f)
 for inb in c.get('inbounds', []):
@@ -53,7 +63,8 @@ for inb in c.get('inbounds', []):
     if xs.get('network') == 'xhttp':
         xhs = xs.get('xhttpSettings', {})
         extra = xhs.get('extra', {})
-        print(json.dumps(extra, indent=2, ensure_ascii=False) if extra else '')
+        client_extra = {k: extra[k] for k in CLIENT_KEYS if k in extra}
+        print(json.dumps(client_extra, indent=2, ensure_ascii=False) if client_extra else '')
         break
 " 2>/dev/null || echo '')
 
@@ -102,6 +113,15 @@ for inb in c['inbounds']:
             fi
         fi
 
+        # VLESS Encryption：state 缺失时从 config.json 的 decryption Seed 推导 Client
+        if [[ -z "${VLESS_ENC_CLIENT:-}" ]]; then
+            local enc_seed
+            enc_seed=$(grep -oP '"decryption":\s*"mlkem768x25519plus\.[^"]+' "$xray_config" | head -1 | grep -oP '[^.]+$' || true)
+            if [[ -n "${enc_seed:-}" ]]; then
+                VLESS_ENC_CLIENT=$(xray mlkem768 -i "${enc_seed}" 2>/dev/null | grep -i "client" | awk '{print $NF}' || true)
+            fi
+        fi
+
         # gRPC 域名从 nginx 配置读取
         if [[ -z "${GRPC_DOMAIN:-}" ]]; then
             GRPC_DOMAIN=$(grep -oP 'server_name\s+\K\S+' \
@@ -134,6 +154,12 @@ for inb in c['inbounds']:
     fi
 
     XHTTP_PADDING="${XHTTP_PADDING:-100-300}"
+
+    # CDN 节点分享链接的 encryption 参数（字符均为 URI 安全字符，无需编码）
+    VLESS_ENC_PARAM=""
+    if [[ -n "${VLESS_ENC_CLIENT:-}" ]]; then
+        VLESS_ENC_PARAM="mlkem768x25519plus.native.0rtt.${VLESS_ENC_CLIENT}"
+    fi
 }
 
 # ── 获取服务器IP ─────────────────────────────────────────────
@@ -159,7 +185,7 @@ print(urllib.parse.quote('${XHTTP_PATH}'))
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_URL="vless://${XRAY_UUID}@${XHTTP_DOMAIN}:443?\
-encryption=none\
+encryption=${VLESS_ENC_PARAM:-none}\
 &security=tls\
 &sni=${XHTTP_DOMAIN}\
 &fp=chrome\
@@ -178,14 +204,47 @@ gen_grpc_url() {
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
     GRPC_URL="vless://${XRAY_UUID}@${GRPC_DOMAIN}:443?\
-encryption=none\
+encryption=${VLESS_ENC_PARAM:-none}\
 &security=tls\
 &sni=${GRPC_DOMAIN}\
 &fp=chrome\
 &type=grpc\
-&serviceName=grpc.Service\
+&serviceName=${GRPC_SERVICE_NAME}\
 &mode=gun\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-grpc-${_hn}'))" 2>/dev/null)"
+}
+
+# ── 生成 VLESS-XHTTP-REALITY 直连节点链接 ────────────────────
+gen_xhttp_reality_url() {
+    local _xhttp_r_sni="${XHTTP_REALITY_DOMAIN:-${XHTTP_REALITY_SNI:-}}"
+    if [[ -z "${_xhttp_r_sni}" ]] || [[ -z "${XRAY_UUID:-}" ]] || [[ -z "${XHTTP_PATH:-}" ]]; then
+        return
+    fi
+
+    local path_encoded reality_host _hn
+    path_encoded=$(python3 -c "
+import urllib.parse
+print(urllib.parse.quote('${XHTTP_PATH}'))
+" 2>/dev/null || echo "${XHTTP_PATH}")
+
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+        reality_host="${XHTTP_REALITY_DOMAIN}"
+    else
+        # 公共 SNI 模式：优先用自有直连域名（支持双栈），不使用公共 SNI
+        reality_host="${REALITY_DOMAIN:-${ANYTLS_DOMAIN:-${SERVER_IP}}}"
+    fi
+    _hn=$(hostname -s 2>/dev/null || echo "server")
+    XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
+path=${path_encoded}\
+&mode=stream-one\
+&type=xhttp\
+&encryption=none\
+&fp=chrome\
+&pbk=${XRAY_PUBLIC_KEY}\
+&sid=${REALITY_SHORT_ID}\
+&security=reality\
+&sni=${_xhttp_r_sni}\
+#$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-xhttp-reality-${_hn}'))" 2>/dev/null)"
 }
 
 # ── 生成 Reality 直连节点链接 ────────────────────────────────
@@ -200,7 +259,8 @@ import urllib.parse
 print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
 " 2>/dev/null || echo "%2Fapi%2Fhealth")
 
-    local reality_host="${REALITY_DOMAIN:-${REALITY_SNI:-$SERVER_IP}}"
+    # 优先用自有直连域名（支持双栈），不使用公共 SNI 作连接地址
+    local reality_host="${REALITY_DOMAIN:-${ANYTLS_DOMAIN:-${SERVER_IP}}}"
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
     REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
@@ -285,6 +345,60 @@ print(urllib.parse.quote('${NAIVE_PASS}', safe=''))
     NAIVE_URL="naive+https://${NAIVE_USER}:${pass_encoded}@${NAIVE_DOMAIN}:443?${naive_params}#$(python3 -c "import urllib.parse; print(urllib.parse.quote('naive-${_hn}'))" 2>/dev/null || echo "naive-${_hn}")"
 }
 
+# ── 生成机场风格订阅文件 ─────────────────────────────────────
+write_subscription_file() {
+    local sub_domain="${XHTTP_DOMAIN:-${GRPC_DOMAIN:-}}"
+    # 订阅文件必须放在对应域名的 webroot 下，nginx try_files 才能正确服务
+    local sub_dir="/var/www/${sub_domain}"
+    local machine_name sub_name sub_prefix
+
+    SUBSCRIPTION_URL=""
+    if [[ -z "${sub_domain}" ]]; then
+        return
+    fi
+
+    machine_name=$(hostname -s 2>/dev/null || echo "server")
+    sub_name=$(printf '%s' "${machine_name:-server}" | tr -c 'A-Za-z0-9._-' '-')
+    sub_name="${sub_name:-server}"
+    sub_prefix="/sub-${sub_name}-"
+    SUBSCRIPTION_NAME="${machine_name:-server}"
+
+    if [[ -z "${SUBSCRIPTION_PATH:-}" || ! "${SUBSCRIPTION_PATH}" =~ ^/[A-Za-z0-9._-]+$ || "${SUBSCRIPTION_PATH}" != "${sub_prefix}"* ]]; then
+        SUBSCRIPTION_PATH="${sub_prefix}$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+        save_state "SUBSCRIPTION_PATH" "${SUBSCRIPTION_PATH}"
+    fi
+
+    mkdir -p "$sub_dir"
+    # 清理旧位置（之前错误地写到 /var/www/html/）
+    if [[ "$sub_dir" != "/var/www/html" ]]; then
+        rm -f "/var/www/html${SUBSCRIPTION_PATH}" 2>/dev/null || true
+    fi
+    local sub_file="${sub_dir}${SUBSCRIPTION_PATH}"
+    local tmp_links
+    tmp_links=$(mktemp)
+    {
+        [[ -n "${XHTTP_URL:-}" ]] && echo "$XHTTP_URL"
+        [[ -n "${GRPC_URL:-}" ]] && echo "$GRPC_URL"
+        [[ -n "${XHTTP_REALITY_URL:-}" ]] && echo "$XHTTP_REALITY_URL"
+        [[ -n "${REALITY_URL:-}" ]] && echo "$REALITY_URL"
+        [[ -n "${ANYTLS_URL:-}" ]] && echo "$ANYTLS_URL"
+        [[ -n "${HYSTERIA2_URL:-}" ]] && echo "$HYSTERIA2_URL"
+        [[ -n "${NAIVE_URL:-}" ]] && echo "$NAIVE_URL"
+    } > "$tmp_links"
+
+    if [[ ! -s "$tmp_links" ]]; then
+        rm -f "$tmp_links"
+        return
+    fi
+
+    base64 -w 0 "$tmp_links" > "$sub_file"
+    echo >> "$sub_file"
+    chmod 644 "$sub_file"
+    rm -f "$tmp_links"
+
+    SUBSCRIPTION_URL="https://${sub_domain}${SUBSCRIPTION_PATH}"
+}
+
 # ── 保存并展示所有链接 ───────────────────────────────────────
 show_client_links() {
     local output_file="/root/xray_client_links.txt"
@@ -303,6 +417,18 @@ show_client_links() {
         echo "# ============================================================"
         echo ""
     } > "$output_file"
+
+    if [[ -n "${SUBSCRIPTION_URL:-}" ]]; then
+        echo -e "${GREEN}[订阅链接: ${SUBSCRIPTION_NAME}]${NC}"
+        echo "$SUBSCRIPTION_URL"
+        echo ""
+        {
+            echo "# 订阅名称: ${SUBSCRIPTION_NAME}"
+            echo "# 订阅链接"
+            echo "$SUBSCRIPTION_URL"
+            echo ""
+        } >> "$output_file"
+    fi
 
     # xhttp CDN
     if [[ -n "${XHTTP_URL:-}" ]]; then
@@ -334,13 +460,25 @@ show_client_links() {
         } >> "$output_file"
     fi
 
+    # XHTTP-REALITY 直连
+    if [[ -n "${XHTTP_REALITY_URL:-}" ]]; then
+        echo -e "${GREEN}[XHTTP-Reality 直连]${NC}"
+        echo "$XHTTP_REALITY_URL"
+        echo ""
+        {
+            echo "# XHTTP-Reality 直连"
+            echo "$XHTTP_REALITY_URL"
+            echo ""
+        } >> "$output_file"
+    fi
+
     # Reality 直连
     if [[ -n "${REALITY_URL:-}" ]]; then
-        echo -e "${GREEN}[Reality 直连]${NC}"
+        echo -e "${GREEN}[Reality 直连 (TCP+Vision)]${NC}"
         echo "$REALITY_URL"
         echo ""
         {
-            echo "# Reality 直连"
+            echo "# Reality 直连 (TCP+Vision)"
             echo "$REALITY_URL"
             echo ""
         } >> "$output_file"
@@ -401,6 +539,7 @@ show_client_links() {
         echo "# ============================================================"
         echo "UUID:            ${XRAY_UUID:-}"
         echo "公钥(PublicKey): ${XRAY_PUBLIC_KEY:-}"
+        echo "VLESS Encryption(CDN 节点 encryption 填): ${VLESS_ENC_PARAM:-none}"
         echo "xhttp路径:       ${XHTTP_PATH:-}"
         echo "xhttp域名:       ${XHTTP_DOMAIN:-}"
         echo "gRPC域名:        ${GRPC_DOMAIN:-}"
@@ -420,10 +559,12 @@ run_client() {
     get_server_ip
     gen_xhttp_url
     gen_grpc_url
+    gen_xhttp_reality_url
     gen_reality_url
     gen_anytls_url
     gen_hysteria2_url
     gen_naive_url
+    write_subscription_file
     show_client_links
     log_info "========== 客户端链接生成完成 =========="
 }

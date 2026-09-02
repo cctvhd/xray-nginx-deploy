@@ -5,7 +5,7 @@
 # warp 出站：内嵌 wireguard（由 warp.sh 提供凭证），不依赖本地 SOCKS5
 # ============================================================
 
-# ── 安装 Xray（官方脚本）────────────────────────────────────
+# ── 安装 Xray（官方脚本，稳定版）────────────────────────────
 install_xray() {
     log_step "安装 Xray（官方脚本）..."
 
@@ -73,13 +73,41 @@ generate_xray_params() {
         log_info "生成新密钥对"
     fi
 
+    # ── VLESS Encryption（ML-KEM-768 后量子认证，用于 CDN 入站端到端加密）──
+    local saved_enc_seed
+    saved_enc_seed=$(get_state "VLESS_ENC_SEED" "")
+    if ! xray mlkem768 &>/dev/null; then
+        VLESS_ENC_SEED=""
+        VLESS_ENC_CLIENT=""
+        log_warn "当前 Xray 内核不支持 mlkem768，CDN 入站 VLESS Encryption 已禁用（decryption=none）"
+    elif [[ -n "${saved_enc_seed}" ]]; then
+        VLESS_ENC_SEED="${saved_enc_seed}"
+        VLESS_ENC_CLIENT=$(get_state "VLESS_ENC_CLIENT" "")
+        if [[ -z "${VLESS_ENC_CLIENT}" ]]; then
+            VLESS_ENC_CLIENT=$(xray mlkem768 -i "${VLESS_ENC_SEED}" | grep -i "client" | awk '{print $NF}')
+            save_state "VLESS_ENC_CLIENT" "${VLESS_ENC_CLIENT}"
+            log_warn "从 Seed 重新推导 ML-KEM-768 Client"
+        fi
+        log_info "复用已有 VLESS Encryption 密钥"
+    else
+        local mlkem_out
+        mlkem_out=$(xray mlkem768)
+        VLESS_ENC_SEED=$(echo "$mlkem_out" | grep -i "seed" | awk '{print $NF}')
+        VLESS_ENC_CLIENT=$(echo "$mlkem_out" | grep -i "client" | awk '{print $NF}')
+        # 与 XHTTP_PATH 同理：立即写入 state，保证 client.sh 等
+        # 后续步骤无论执行顺序都能读到同一份密钥
+        save_state "VLESS_ENC_SEED"   "${VLESS_ENC_SEED}"
+        save_state "VLESS_ENC_CLIENT" "${VLESS_ENC_CLIENT}"
+        log_info "生成新 VLESS Encryption 密钥（ML-KEM-768）"
+    fi
+
     local saved_path
     saved_path=$(get_state "XHTTP_PATH" "")
     if [[ -n "${saved_path}" ]]; then
         XHTTP_PATH="${saved_path}"
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     else
-        XHTTP_PATH="/$(cat /proc/sys/kernel/random/uuid | tr -d '-')"
+        XHTTP_PATH="/$(tr -d '-' < /proc/sys/kernel/random/uuid)"
         # ── BUG FIX：生成新路径后立即写入 config.env ──────────
         # 原代码只赋值给 shell 变量，install.sh 在步骤8结束后才
         # save_state，如果步骤7（nginx）在步骤8之前执行，nginx
@@ -92,12 +120,19 @@ generate_xray_params() {
 
     local saved_short_ids
     saved_short_ids=$(get_state "REALITY_SHORT_IDS" "")
+    REALITY_SHORT_IDS=()
     if [[ -n "${saved_short_ids}" ]]; then
-        read -ra REALITY_SHORT_IDS <<< "$saved_short_ids"
-        log_info "复用已有 Short IDs (${#REALITY_SHORT_IDS[@]} 个)"
-    else
+        local _raw_ids _sid
+        read -ra _raw_ids <<< "$saved_short_ids"
+        for _sid in "${_raw_ids[@]}"; do
+            [[ -n "$_sid" ]] && REALITY_SHORT_IDS+=("$_sid")
+        done
+        if (( ${#REALITY_SHORT_IDS[@]} > 0 )); then
+            log_info "复用已有 Short IDs (${#REALITY_SHORT_IDS[@]} 个)"
+        fi
+    fi
+    if (( ${#REALITY_SHORT_IDS[@]} == 0 )); then
         REALITY_SHORT_IDS=(
-            ""
             "$(openssl rand -hex 4)"
             "$(openssl rand -hex 4)"
             "$(openssl rand -hex 4)"
@@ -114,97 +149,159 @@ generate_xray_params() {
     log_info "xhttp path:  ${XHTTP_PATH}"
 }
 
+# ── 探测伪装域名可用路径（用于 Reality spiderX）─────────────────
+# 用法: detect_spider_path <domain>
+# 依次测试常见路径，echo 第一个返回 200 的路径并返回 0；全部失败返回 1
+detect_spider_path() {
+    local domain="$1"
+    local path code
+    for path in / /index.html /favicon.ico /robots.txt /sitemap.xml; do
+        code=$(curl -o /dev/null -s -w "%{http_code}" --max-time 5 "https://${domain}${path}")
+        if [[ "$code" == "200" ]]; then
+            echo "$path"
+            return 0
+        fi
+    done
+    return 1
+}
+
 # ── 收集 Reality 伪装参数 ────────────────────────────────────
+# Current correct values on this server: dest=www.mpg.de:443, spiderX=/
+# When re-running, select: Europe(2) -> mpg.de(5), then input spiderX=/
 collect_reality_params() {
     echo ""
     log_step "配置 Reality 伪装参数"
     echo ""
 
-    echo "请选择服务器所在地区："
-    echo "  1. 美国 / 北美"
-    echo "  2. 欧洲"
-    echo "  3. 亚洲"
-    echo "  4. 自定义"
-    echo ""
-    read -rp "请选择地区 [1-4，默认1]: " region_choice
+    # 从 HW_REGION 前缀自动推断地区，避免重复手动选择
+    local region_choice
+    local _hw_prefix="${HW_REGION%%/*}"
+    case "$_hw_prefix" in
+        na) region_choice=1
+            log_info "从 HW_REGION=${HW_REGION} 自动选择地区：美国/北美" ;;
+        eu) region_choice=2
+            log_info "从 HW_REGION=${HW_REGION} 自动选择地区：欧洲" ;;
+        as) region_choice=3
+            log_info "从 HW_REGION=${HW_REGION} 自动选择地区：亚洲" ;;
+        *)
+            echo "请选择服务器所在地区："
+            echo "  1. 美国 / 北美"
+            echo "  2. 欧洲"
+            echo "  3. 亚洲"
+            echo "  4. 自定义"
+            echo ""
+            read -rp "请选择地区 [1-4，默认2]: " region_choice
+            ;;
+    esac
 
-    case "${region_choice:-1}" in
+    case "${region_choice:-2}" in
 
         # ── 美国 / 北美 ──────────────────────────────────────
         1)
+            local -a _us_labels=(
+                "solanolibrary.com:443（洛杉矶公共图书馆）"
+                "www.siliconvalley.com:443（硅谷媒体）"
+                "business.ca.gov:443（加州政府）"
+                "openclaw.ai:443（AI 平台）"
+                "www.oxy.edu:443（奥克西登特学院）"
+                "film.ca.gov:443（加州电影委员会）"
+                "www.lapl.org:443（洛杉矶公共图书馆官网）"
+            )
+            local -a _us_dests=(
+                "solanolibrary.com:443"
+                "www.siliconvalley.com:443"
+                "business.ca.gov:443"
+                "openclaw.ai:443"
+                "www.oxy.edu:443"
+                "film.ca.gov:443"
+                "www.lapl.org:443"
+            )
+            local -a _us_servernames=(
+                "solanolibrary.com openclaw.ai www.lapl.org www.siliconvalley.com www.oxy.edu business.ca.gov film.ca.gov"
+                "www.siliconvalley.com solanolibrary.com www.oxy.edu business.ca.gov openclaw.ai film.ca.gov"
+                "business.ca.gov film.ca.gov solanolibrary.com www.oxy.edu openclaw.ai"
+                "openclaw.ai solanolibrary.com www.lapl.org www.siliconvalley.com www.oxy.edu"
+                "www.oxy.edu solanolibrary.com openclaw.ai business.ca.gov film.ca.gov"
+                "film.ca.gov business.ca.gov solanolibrary.com openclaw.ai www.oxy.edu"
+                "www.lapl.org solanolibrary.com openclaw.ai www.siliconvalley.com www.oxy.edu"
+            )
             echo ""
             echo "美国 / 北美伪装目标："
-            echo "  1. solanolibrary.com:443（洛杉矶公共图书馆）"
-            echo "  2. www.siliconvalley.com:443（硅谷媒体）"
-            echo "  3. business.ca.gov:443（加州政府）"
-            read -rp "请选择 [1-3，默认1]: " dest_choice
-            case "${dest_choice:-1}" in
-                1) REALITY_DEST="solanolibrary.com:443"
-                   REALITY_SERVER_NAMES=("solanolibrary.com" "openclaw.ai"
-                                         "www.lapl.org" "www.siliconvalley.com"
-                                         "www.oxy.edu" "business.ca.gov" "film.ca.gov") ;;
-                2) REALITY_DEST="www.siliconvalley.com:443"
-                   REALITY_SERVER_NAMES=("www.siliconvalley.com" "solanolibrary.com"
-                                         "www.oxy.edu" "business.ca.gov") ;;
-                3) REALITY_DEST="business.ca.gov:443"
-                   REALITY_SERVER_NAMES=("business.ca.gov" "film.ca.gov"
-                                         "solanolibrary.com" "www.oxy.edu") ;;
-            esac
+            local _i
+            for (( _i=0; _i<${#_us_labels[@]}; _i++ )); do
+                echo "  $(( _i+1 )). ${_us_labels[$_i]}"
+            done
+            read -rp "请选择 [1-${#_us_labels[@]}，默认1]: " dest_choice
+            local _di=$(( ${dest_choice:-1} - 1 ))
+            (( _di < 0 || _di >= ${#_us_dests[@]} )) && _di=0
+            REALITY_DEST="${_us_dests[$_di]}"
+            read -ra REALITY_SERVER_NAMES <<< "${_us_servernames[$_di]}"
             ;;
 
         # ── 欧洲 ─────────────────────────────────────────────
         2)
+            local -a _eu_labels=(
+                "ethz.ch:443（瑞士联邦理工学院）"
+                "www.ecb.europa.eu:443（欧洲中央银行）"
+                "opendata.cern.ch:443（欧洲核子研究中心）"
+                "yandex.com.tr:443（Yandex 土耳其）"
+                "www.mpg.de:443（马克斯普朗克学会）"
+                "sentinels.copernicus.eu:443（哥白尼计划）"
+            )
+            local -a _eu_dests=(
+                "ethz.ch:443"
+                "www.ecb.europa.eu:443"
+                "opendata.cern.ch:443"
+                "yandex.com.tr:443"
+                "www.mpg.de:443"
+                "sentinels.copernicus.eu:443"
+            )
+            local -a _eu_servernames=(
+                "ethz.ch m.ethz.ch debian.ethz.ch cuni.cz mff.cuni.cz www.mpg.de developer.trumpf.com"
+                "www.ecb.europa.eu api.ecb.europa.eu sentinels.copernicus.eu ethz.ch www.mpg.de"
+                "opendata.cern.ch ethz.ch m.ethz.ch www.mpg.de api.aalto.fi www.nic.funet.fi"
+                "yandex.com.tr ethz.ch www.ecb.europa.eu opendata.cern.ch"
+                "www.mpg.de developer.trumpf.com ethz.ch m.ethz.ch debian.ethz.ch cuni.cz mff.cuni.cz"
+                "sentinels.copernicus.eu www.ecb.europa.eu api.ecb.europa.eu opendata.cern.ch ethz.ch"
+            )
             echo ""
             echo "欧洲伪装目标："
-            echo "  1. ethz.ch:443（瑞士联邦理工学院）"
-            echo "  2. www.ecb.europa.eu:443（欧洲中央银行）"
-            echo "  3. opendata.cern.ch:443（欧洲核子研究中心）"
-            echo "  4. yandex.com.tr:443（Yandex 土耳其）"
-            echo "  5. www.mpg.de:443（马克斯普朗克学会）"
-            echo "  6. sentinels.copernicus.eu:443（哥白尼计划）"
-            read -rp "请选择 [1-6，默认1]: " dest_choice
-            case "${dest_choice:-1}" in
-                1) REALITY_DEST="ethz.ch:443"
-                   REALITY_SERVER_NAMES=("ethz.ch" "m.ethz.ch" "debian.ethz.ch"
-                                         "cuni.cz" "mff.cuni.cz"
-                                         "www.mpg.de" "developer.trumpf.com") ;;
-                2) REALITY_DEST="www.ecb.europa.eu:443"
-                   REALITY_SERVER_NAMES=("www.ecb.europa.eu" "api.ecb.europa.eu"
-                                         "sentinels.copernicus.eu"
-                                         "ethz.ch" "www.mpg.de") ;;
-                3) REALITY_DEST="opendata.cern.ch:443"
-                   REALITY_SERVER_NAMES=("opendata.cern.ch"
-                                         "ethz.ch" "m.ethz.ch"
-                                         "www.mpg.de" "api.aalto.fi"
-                                         "www.nic.funet.fi") ;;
-                4) REALITY_DEST="yandex.com.tr:443"
-                   REALITY_SERVER_NAMES=("yandex.com.tr"
-                                         "ethz.ch" "www.ecb.europa.eu"
-                                         "opendata.cern.ch") ;;
-                5) REALITY_DEST="www.mpg.de:443"
-                   REALITY_SERVER_NAMES=("www.mpg.de" "developer.trumpf.com"
-                                         "ethz.ch" "m.ethz.ch" "debian.ethz.ch"
-                                         "cuni.cz" "mff.cuni.cz") ;;
-                6) REALITY_DEST="sentinels.copernicus.eu:443"
-                   REALITY_SERVER_NAMES=("sentinels.copernicus.eu"
-                                         "www.ecb.europa.eu" "api.ecb.europa.eu"
-                                         "opendata.cern.ch" "ethz.ch") ;;
-            esac
+            local _i
+            for (( _i=0; _i<${#_eu_labels[@]}; _i++ )); do
+                echo "  $(( _i+1 )). ${_eu_labels[$_i]}"
+            done
+            read -rp "请选择 [1-${#_eu_labels[@]}，默认1]: " dest_choice
+            local _di=$(( ${dest_choice:-1} - 1 ))
+            (( _di < 0 || _di >= ${#_eu_dests[@]} )) && _di=0
+            REALITY_DEST="${_eu_dests[$_di]}"
+            read -ra REALITY_SERVER_NAMES <<< "${_eu_servernames[$_di]}"
             ;;
 
         # ── 亚洲 ─────────────────────────────────────────────
         3)
+            local -a _as_labels=(
+                "www.lovelive-anime.jp:443（日本动画）"
+                "www.nintendo.co.jp:443（任天堂日本）"
+            )
+            local -a _as_dests=(
+                "www.lovelive-anime.jp:443"
+                "www.nintendo.co.jp:443"
+            )
+            local -a _as_servernames=(
+                "www.lovelive-anime.jp www.nintendo.co.jp"
+                "www.nintendo.co.jp www.lovelive-anime.jp"
+            )
             echo ""
             echo "亚洲伪装目标："
-            echo "  1. www.lovelive-anime.jp:443（日本）"
-            echo "  2. www.nintendo.co.jp:443（任天堂日本）"
-            read -rp "请选择 [1-2，默认1]: " dest_choice
-            case "${dest_choice:-1}" in
-                1) REALITY_DEST="www.lovelive-anime.jp:443"
-                   REALITY_SERVER_NAMES=("www.lovelive-anime.jp") ;;
-                2) REALITY_DEST="www.nintendo.co.jp:443"
-                   REALITY_SERVER_NAMES=("www.nintendo.co.jp" "www.lovelive-anime.jp") ;;
-            esac
+            local _i
+            for (( _i=0; _i<${#_as_labels[@]}; _i++ )); do
+                echo "  $(( _i+1 )). ${_as_labels[$_i]}"
+            done
+            read -rp "请选择 [1-${#_as_labels[@]}，默认1]: " dest_choice
+            local _di=$(( ${dest_choice:-1} - 1 ))
+            (( _di < 0 || _di >= ${#_as_dests[@]} )) && _di=0
+            REALITY_DEST="${_as_dests[$_di]}"
+            read -ra REALITY_SERVER_NAMES <<< "${_as_servernames[$_di]}"
             ;;
 
         # ── 自定义 ───────────────────────────────────────────
@@ -236,8 +333,92 @@ collect_reality_params() {
     done
     REALITY_SERVER_NAMES=("${deduped_server_names[@]}")
 
-    read -rp "Reality spiderX [默认 /api/health]: " spider_x
-    REALITY_SPIDER_X="${spider_x:-/api/health}"
+    local reality_dest_domain="${REALITY_DEST%%:*}"
+    echo ""
+    log_step "探测伪装域名 ${reality_dest_domain} 的可用路径..."
+    local detected_path
+    if detected_path=$(detect_spider_path "${reality_dest_domain}"); then
+        REALITY_SPIDER_X="${detected_path}"
+        log_info "spiderX 自动设为 ${detected_path}（${reality_dest_domain} 返回 200）"
+    else
+        log_warn "未探测到任何返回 200 的路径"
+        read -rp "请手动输入 Reality spiderX [默认 /]: " spider_x
+        REALITY_SPIDER_X="${spider_x:-/}"
+        log_warn "请确认该路径在目标网站返回 200，否则流量特征异常"
+    fi
+
+    # ── 选择 XHTTP-Reality 专用 SNI ────────────────────────────
+    # serverNames[0] 留给 TCP+Vision（REALITY_SNI），
+    # 从剩余条目里选一个给 XHTTP-Reality（8325）
+    XHTTP_REALITY_SNI=""
+    if (( ${#REALITY_SERVER_NAMES[@]} > 1 )); then
+        echo ""
+        echo "请选择 XHTTP-Reality 直连节点使用的伪装 SNI："
+        echo "  （与 TCP+Vision 使用不同 SNI，nginx 据此分流到不同端口）"
+        local _idx=1
+        for sn in "${REALITY_SERVER_NAMES[@]:1}"; do
+            echo "  ${_idx}. ${sn}"
+            (( _idx++ ))
+        done
+        echo "  （默认 1：${REALITY_SERVER_NAMES[1]}）"
+        read -rp "请选择 [1-$(( ${#REALITY_SERVER_NAMES[@]} - 1 ))，默认1]: " _sni_choice
+        local _sni_idx=$(( ${_sni_choice:-1} - 1 ))
+        # 越界则回退到 1
+        if (( _sni_idx < 0 || _sni_idx >= ${#REALITY_SERVER_NAMES[@]} - 1 )); then
+            _sni_idx=0
+        fi
+        XHTTP_REALITY_SNI="${REALITY_SERVER_NAMES[$(( _sni_idx + 1 ))]}"
+        # 防呆：不允许与 TCP+Vision SNI（[0]）相同
+        if [[ "${XHTTP_REALITY_SNI}" == "${REALITY_SERVER_NAMES[0]}" ]]; then
+            log_warn "所选 SNI 与 TCP+Vision 相同，已自动清空——XHTTP-Reality 节点不可用"
+            XHTTP_REALITY_SNI=""
+        else
+            log_info "XHTTP-Reality SNI 设为: ${XHTTP_REALITY_SNI}"
+        fi
+    else
+        log_warn "serverNames 只有一个条目，XHTTP-Reality 节点不可用（与 TCP+Vision 共用同一 SNI 无法分流）"
+    fi
+
+    # ── 选择 XHTTP-Reality 域名模式 ──────────────────────────────
+    # 有自有域名：dest → 本地 nginx 8326（真实证书 + 伪装站），更可控
+    # 无/公共 SNI：dest → dokodemo 4432 → 借用第三方域名（默认行为）
+    XHTTP_REALITY_DOMAIN=""
+    if [[ -n "${XHTTP_REALITY_SNI:-}" ]]; then
+        echo ""
+        echo "XHTTP-Reality 伪装域名模式："
+        echo "  1. 公共 SNI（${XHTTP_REALITY_SNI}）——借用第三方域名，无需自有证书（推荐）"
+        echo "  2. 自有域名——需拥有该域名证书，服务器自建伪装站"
+        read -rp "请选择 [1/2，默认1]: " _xhr_mode
+        if [[ "${_xhr_mode}" == "2" ]]; then
+            local -a _avail_direct=()
+            for _d in "${DIRECT_DOMAINS[@]:-}"; do
+                [[ "$_d" == "${REALITY_DOMAIN:-}"   ]] && continue
+                [[ "$_d" == "${XHTTP_DOMAIN:-}"    ]] && continue
+                [[ "$_d" == "${GRPC_DOMAIN:-}"     ]] && continue
+                [[ "$_d" == "${NAIVE_DOMAIN:-}"    ]] && continue
+                [[ "$_d" == "${ANYTLS_DOMAIN:-}"   ]] && continue
+                [[ "$_d" == "${HYSTERIA2_DOMAIN:-}" ]] && continue
+                _avail_direct+=("$_d")
+            done
+            if [[ ${#_avail_direct[@]} -gt 0 ]]; then
+                echo "可用自有域名："
+                local _di=1
+                for _d in "${_avail_direct[@]}"; do echo "  ${_di}. ${_d}"; (( _di++ )); done
+                echo "  ${_di}. 手动输入"
+                read -rp "请选择 [1-${_di}，默认1]: " _dom_choice
+                if [[ "${_dom_choice}" == "${_di}" ]]; then
+                    read -rp "输入域名: " XHTTP_REALITY_DOMAIN
+                else
+                    local _dom_idx=$(( ${_dom_choice:-1} - 1 ))
+                    (( _dom_idx < 0 || _dom_idx >= ${#_avail_direct[@]} )) && _dom_idx=0
+                    XHTTP_REALITY_DOMAIN="${_avail_direct[$_dom_idx]}"
+                fi
+            else
+                read -rp "输入 xhttp-reality 自有域名: " XHTTP_REALITY_DOMAIN
+            fi
+            [[ -n "${XHTTP_REALITY_DOMAIN}" ]] && log_info "XHTTP-Reality 自有域名: ${XHTTP_REALITY_DOMAIN}"
+        fi
+    fi
 
     log_info "Reality dest:        ${REALITY_DEST}"
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
@@ -283,6 +464,15 @@ WGJSON
 generate_xray_config() {
     log_step "生成 Xray 配置文件..."
 
+    # 读取延迟档位参数（无 state 时使用中延迟默认值）
+    if declare -F load_latency_params &>/dev/null; then
+        load_latency_params
+    else
+        LATENCY_XMUX_CONCURRENCY="16-32"
+        LATENCY_XMUX_REQUEST_TIMES="600-900"
+        LATENCY_XMUX_REUSABLE_SECS="1800-3000"
+    fi
+
     local x_padding="${XRAY_PADDING:-}"
     case "${x_padding}" in
         ""|"128-2048"|"128-1024") x_padding="100-1000" ;;
@@ -292,29 +482,118 @@ generate_xray_config() {
 
     local user_timeout=30000
 
-    # 修复1：serverNames 必须包含自有域名 REALITY_DOMAIN，
-    # 否则 xray 在握手时找不到对应 serverName 会拒绝连接。
-    # REALITY_DOMAIN 放在首位，公共域名跟在后面。
     local sn_json=""
-    local sn_seen=""
-    # 先加自有域名
-    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        sn_json+="\"${REALITY_DOMAIN}\","
-        sn_seen+=" ${REALITY_DOMAIN}"
-    fi
     for sn in "${REALITY_SERVER_NAMES[@]}"; do
         [[ -n "$sn" ]] || continue
-        [[ " ${sn_seen} " == *" ${sn} "* ]] && continue
         sn_json+="\"${sn}\","
-        sn_seen+=" ${sn}"
     done
     sn_json="${sn_json%,}"
+
+    # XHTTP_REALITY_SNI / XHTTP_REALITY_DOMAIN 由 collect_reality_params() 交互式设置并已赋值
+    # 此处只做持久化；两者互斥：设了 DOMAIN 则 SNI 不生效
+    save_state "XHTTP_REALITY_SNI"    "${XHTTP_REALITY_SNI:-}"
+    save_state "XHTTP_REALITY_DOMAIN" "${XHTTP_REALITY_DOMAIN:-}"
+
+    # ── 防偷流量：reality-direct ──────────────────────────────────
+    # 有自有域名（REALITY_DOMAIN 已设置）：
+    #   dest → 本地 nginx 8321（由 nginx 模块生成，携带真实证书 + 伪装网站）
+    #   serverNames 仅含自有域名，非 Xray 访客直接看到本地网站，无外部流量可偷
+    # 无自有域名（仅公共 SNI）：
+    #   dest → dokodemo 4431 → 路由决定：serverNames 内的域名 direct，其余 block
+    local _reality_direct_dest _reality_direct_sn
+    local _dokodemo_reality_routing="" _dokodemo_reality_inbound=""
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        _reality_direct_dest="127.0.0.1:8321"
+        _reality_direct_sn="\"${REALITY_DOMAIN}\""
+    else
+        local _rdest_host="${REALITY_DEST%%:*}"
+        local _rdest_port="${REALITY_DEST##*:}"
+        _reality_direct_dest="127.0.0.1:4431"
+        _reality_direct_sn="${sn_json}"
+        _dokodemo_reality_routing='            {
+                "type":        "field",
+                "inboundTag":  ["dokodemo-reality"],
+                "domain":      ['"${sn_json}"'],
+                "outboundTag": "direct"
+            },
+            {
+                "type":        "field",
+                "inboundTag":  ["dokodemo-reality"],
+                "outboundTag": "block"
+            },'
+        _dokodemo_reality_inbound=',
+        {
+            "tag":      "dokodemo-reality",
+            "listen":   "127.0.0.1",
+            "port":     4431,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "'"${_rdest_host}"'",
+                "port":    '"${_rdest_port}"',
+                "network": "tcp"
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["tls"],
+                "routeOnly":    true
+            }
+        }'
+    fi
+
+    # ── 防偷流量：vless-xhttp-reality ────────────────────────────
+    # 自有域名：dest → 本地 nginx 8326（真实证书 + 伪装站），无外部流量可偷
+    # 公共 SNI ：dest → dokodemo 4432 → 借用第三方域名（公共 SNI 不能用本地 nginx，
+    #            因为没有该域名的证书，TLS 指纹会与真实域名不符）
+    local _dokodemo_xhttp_routing="" _dokodemo_xhttp_inbound=""
+    local _xhttp_reality_dest="" _xhttp_reality_sn=""
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+        _xhttp_reality_dest="127.0.0.1:8326"
+        _xhttp_reality_sn="\"${XHTTP_REALITY_DOMAIN}\""
+    elif [[ -n "${XHTTP_REALITY_SNI:-}" ]]; then
+        _xhttp_reality_dest="127.0.0.1:4432"
+        _xhttp_reality_sn="\"${XHTTP_REALITY_SNI}\""
+        _dokodemo_xhttp_routing='            {
+                "type":        "field",
+                "inboundTag":  ["dokodemo-xhttp-reality"],
+                "domain":      ["'"${XHTTP_REALITY_SNI}"'"],
+                "outboundTag": "direct"
+            },
+            {
+                "type":        "field",
+                "inboundTag":  ["dokodemo-xhttp-reality"],
+                "outboundTag": "block"
+            },'
+        _dokodemo_xhttp_inbound=',
+        {
+            "tag":      "dokodemo-xhttp-reality",
+            "listen":   "127.0.0.1",
+            "port":     4432,
+            "protocol": "dokodemo-door",
+            "settings": {
+                "address": "'"${XHTTP_REALITY_SNI}"'",
+                "port":    443,
+                "network": "tcp"
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["tls"],
+                "routeOnly":    true
+            }
+        }'
+    fi
 
     local sid_json=""
     for sid in "${REALITY_SHORT_IDS[@]}"; do
         sid_json+="\"${sid}\","
     done
     sid_json="${sid_json%,}"
+
+    # CDN 入站 VLESS Encryption：TLS 在 nginx/CDN 终结，启用后 CDN 无法明文窥探；
+    # reality-direct 保持 none（REALITY 已端到端加密，叠加属冗余）
+    local vless_decryption="none"
+    if [[ -n "${VLESS_ENC_SEED:-}" ]]; then
+        vless_decryption="mlkem768x25519plus.native.600s.${VLESS_ENC_SEED}"
+    fi
 
     local warp_outbound
     warp_outbound=$(_build_warp_outbound_json)
@@ -328,6 +607,7 @@ generate_xray_config() {
 
     mkdir -p /usr/local/etc/xray
 
+    # Fix: grpc initial_windows_size 4194304 (4MB) prevents CDN GOAWAY on high-BDP paths; default 65536 too small
     cat > /usr/local/etc/xray/config.json << CONF
 {
     "log": {
@@ -372,6 +652,8 @@ generate_xray_config() {
     "routing": {
         "domainStrategy": "IPIfNonMatch",
         "rules": [
+${_dokodemo_reality_routing}
+${_dokodemo_xhttp_routing}
             {
                 "type":        "field",
                 "ip":          ["127.0.0.1"],
@@ -400,11 +682,11 @@ generate_xray_config() {
         {
             "tag":      "vless-xhttp-cdn",
             "listen":   "127.0.0.1",
-            "port":     8001,
+            "port":     8300,
             "protocol": "vless",
             "settings": {
                 "clients":     [{"id": "${XRAY_UUID}"}],
-                "decryption":  "none"
+                "decryption":  "${vless_decryption}"
             },
             "streamSettings": {
                 "network":  "xhttp",
@@ -412,18 +694,18 @@ generate_xray_config() {
                 "xhttpSettings": {
                     "path": "${XHTTP_PATH}",
                     "host": "${XHTTP_DOMAIN:-}",
+                    "mode": "auto",
                     "extra": {
-                        "enc":                    "packet",
                         "xPaddingBytes":          "${x_padding}",
                         "scStreamUpServerSecs":   "20-80",
-                        "headers":                {"User-Agent": "chrome"},
+                        "headers":                {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"},
                         "xmux": {
-                            "maxConcurrency":   "16-32",
+                            "maxConcurrency":   "${LATENCY_XMUX_CONCURRENCY}",
                             "maxConnections":   0,
                             "cMaxReuseTimes":   0,
-                            "hMaxRequestTimes": "600-900",
-                            "hMaxReusableSecs": "1800-3000",
-                            "hKeepAlivePeriod": 0
+                            "hMaxRequestTimes": "${LATENCY_XMUX_REQUEST_TIMES}",
+                            "hMaxReusableSecs": "${LATENCY_XMUX_REUSABLE_SECS}",
+                            "hKeepAlivePeriod": 60
                         }
                     }
                 },
@@ -441,22 +723,21 @@ generate_xray_config() {
         {
             "tag":      "vless-grpc-cdn",
             "listen":   "127.0.0.1",
-            "port":     8002,
+            "port":     8310,
             "protocol": "vless",
             "settings": {
                 "clients":    [{"id": "${XRAY_UUID}"}],
-                "decryption": "none"
+                "decryption": "${vless_decryption}"
             },
             "streamSettings": {
                 "network":  "grpc",
                 "security": "none",
                 "grpcSettings": {
-                    "serviceName":          "grpc.Service",
-                    "multiMode":            true,
-                    "idle_timeout":         60,
-                    "health_check_timeout": 20,
-                    "permit_without_stream": false,
-                    "initial_windows_size":  65536
+                    "serviceName":           "${GRPC_SERVICE_NAME}",
+                    "multiMode":             false,
+                    "idle_timeout":          60,
+                    "health_check_timeout":  20,
+                    "permit_without_stream": false
                 }
             },
             "sniffing": {
@@ -469,7 +750,7 @@ generate_xray_config() {
         {
             "tag":      "reality-direct",
             "listen":   "127.0.0.1",
-            "port":     9443,
+            "port":     8320,
             "protocol": "vless",
             "settings": {
                 "clients": [
@@ -482,16 +763,16 @@ generate_xray_config() {
                 "fallbacks":  [
                     {
                         "path": "${XHTTP_PATH}",
-                        "dest": "127.0.0.1:10080",
+                        "dest": "127.0.0.1:8325",
                         "xver": 0
                     },
                     {
-                        "path": "/grpc.Service",
-                        "dest": "127.0.0.1:10080",
+                        "path": "/${GRPC_SERVICE_NAME}",
+                        "dest": "127.0.0.1:8350",
                         "xver": 0
                     },
                     {
-                        "dest": "127.0.0.1:10080",
+                        "dest": "127.0.0.1:8350",
                         "xver": 0
                     }
                 ]
@@ -501,9 +782,9 @@ generate_xray_config() {
                 "security": "reality",
                 "realitySettings": {
                     "show":        false,
-                    "dest":        "${REALITY_DEST}",
+                    "dest":        "${_reality_direct_dest}",
                     "xver":        0,
-                    "serverNames": [${sn_json}],
+                    "serverNames": [${_reality_direct_sn}],
                     "privateKey":  "${XRAY_PRIVATE_KEY}",
                     "shortIds":    [${sid_json}],
                     "spiderX":     "${REALITY_SPIDER_X}"
@@ -522,7 +803,48 @@ generate_xray_config() {
                 "destOverride": ["http", "tls", "quic"],
                 "metadataOnly": false
             }
-        }
+        },
+
+        {
+            "tag":      "vless-xhttp-reality",
+            "listen":   "127.0.0.1",
+            "port":     8325,
+            "protocol": "vless",
+            "settings": {
+                "clients":    [{"id": "${XRAY_UUID}"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network":  "xhttp",
+                "security": "reality",
+                "xhttpSettings": {
+                    "path": "${XHTTP_PATH}",
+                    "mode": "stream-one",
+                    "extra": {
+                        "xPaddingBytes":        "${x_padding}",
+                        "scStreamUpServerSecs": "20-80"
+                    }
+                },
+                "realitySettings": {
+                    "show":        false,
+                    "dest":        "${_xhttp_reality_dest}",
+                    "xver":        0,
+                    "serverNames": [${_xhttp_reality_sn}],
+                    "privateKey":  "${XRAY_PRIVATE_KEY}",
+                    "shortIds":    [${sid_json}]
+                },
+                "sockopt": {
+                    "acceptProxyProtocol": true,
+                    "tcpMptcp":            true,
+                    "tcpNoDelay":          true
+                }
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": false
+            }
+        }${_dokodemo_reality_inbound}${_dokodemo_xhttp_inbound}
     ],
 
     "outbounds": [
@@ -567,7 +889,8 @@ mkdir -p /var/log/xray
     fi
 
     configure_xray_service_limits
-    systemctl enable --now xray
+    systemctl enable xray
+    systemctl restart xray
 
     sleep 2
     if systemctl is-active --quiet xray; then
@@ -595,4 +918,8 @@ run_xray() {
     echo "  私钥:         ${XRAY_PRIVATE_KEY}"
     echo "  xhttp路径:    ${XHTTP_PATH}"
     echo "  Reality dest: ${REALITY_DEST}"
+    if [[ -n "${VLESS_ENC_CLIENT:-}" ]]; then
+        echo "  VLESS Encryption（CDN 节点客户端 encryption 填）:"
+        echo "    mlkem768x25519plus.native.0rtt.${VLESS_ENC_CLIENT}"
+    fi
 }

@@ -64,8 +64,33 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 **These guidelines are working if:** fewer unnecessary changes in diffs, fewer rewrites due to overcomplication, and clarifying questions come before implementation rather than after mistakes.
 
-## 严格禁止事项
+---
 
+## 项目当前状态（2026-06-18）
+
+### 已完成
+- `modules/naive.sh`：Caddyfile 禁 h3（`servers { protocols h1 h2 }`）、证书直引用 letsencrypt、certaccess 组权限、certbot hook 改 reload
+- `modules/nginx.sh`：`generate_cf_realip_conf()` 补 `is_media_ext` + `redirect_to_fake` map；xhttp/gRPC server block webroot 改为 `/var/www/${DOMAIN}`，`if ($from_cf = 0)` 改为 `if ($redirect_to_fake)`；生成时自动 `mkdir` 并复制 `index.html`
+- `modules/xray.sh`：Reality dest 防偷流量（有域名 → nginx 8321，无域名 → dokodemo 4431）；xhttp-reality 防偷流量（dokodemo 4432）
+- `.gitignore`：补充排除 `.claude/` 和 `.understand-anything/`
+- `modules/nginx.sh`：`generate_fake_site()` 改为模板驱动（eu/na-cia/na-la）；Reality dest 8321 webroot 对齐
+- `assets/fake-site-eu.html`：欧洲档案馆主题（lietuva-heritage，无本地媒体引用）
+- `assets/fake-site-na/cia/index.html`：North America CIA 主题（Stillwater）
+- `assets/fake-site-na/la/index.html`：North America LA 主题（California Indigenous Heritage）
+- `assets/download-media.sh`：Baltic/Native American 媒体文件下载脚本（yt-dlp + FMA）
+- `/var/www/Example/North America/cia/cia_index.html` → `index.html`（已重命名）
+- `/var/www/Example/North America/la/la_index.html` → `index.html`（已重命名）
+
+### 媒体文件策略
+- **不入 git**：mp4 视频（15–70 MB，共 ~133 MB）；Native American mp3（~28 MB）
+- **不入 git**：Baltic mp3 也改用下载脚本，保持仓库轻量
+- 下载入口：`assets/download-media.sh`（需 yt-dlp；默认目标 `/var/www/Example/`）
+- `ltu/` 和 `lu/` HTML 模板仍引用本地短名称文件，需在对应 webroot 目录链接或重命名
+
+### 待续任务
+（无未完成的功能性任务）
+
+### 严格禁止事项
 - **永远不要** `git add`、`git commit`、`git push` `server-audit/` 目录下的任何文件
 - `server-audit/` 包含服务器敏感审计数据，必须始终保持在 `.gitignore` 中
 - 执行任何 git 操作前，先确认 `server-audit/` 不在暂存区
