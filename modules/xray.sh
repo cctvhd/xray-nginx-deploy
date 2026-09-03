@@ -173,6 +173,21 @@ collect_reality_params() {
     log_step "配置 Reality 伪装参数"
     echo ""
 
+    # ── Reality-direct 模式提示：模式由域名分配决定，非下方交互决定 ──
+    # reality-direct 节点（vless-reality）实际用哪种 SNI，取决于域名管理里
+    # 是否有 xray-reality 标签域（REALITY_DOMAIN）：
+    #   在册 → 自建域名模式（SNI=自有域，dest=本地伪装站 8321）
+    #   无   → 公共 SNI 模式（SNI/dest=下方所选公共伪装目标）
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        log_info "Reality-direct 模式：自建域名（SNI=${REALITY_DOMAIN}，dest→本地伪装站 8321）"
+        log_info "下方公共伪装目标仅作 xhttp-reality 的公共 SNI 候选池，不会改变 reality-direct 的 SNI"
+        log_info "若要改为公共 SNI 模式，请在域名管理中解除 ${REALITY_DOMAIN} 的 xray-reality 标签后重跑"
+    else
+        log_info "Reality-direct 模式：公共 SNI（未分配自有 Reality 域名）"
+        log_info "下方所选 dest 与 serverNames 即 reality-direct 的伪装目标与 SNI"
+    fi
+    echo ""
+
     # 从 HW_REGION 前缀自动推断地区，避免重复手动选择
     local region_choice
     local _hw_prefix="${HW_REGION%%/*}"
@@ -311,16 +326,6 @@ collect_reality_params() {
             ;;
     esac
 
-    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        echo ""
-        log_info "检测到自有 Reality 域名: ${REALITY_DOMAIN}"
-        log_warn "建议默认不要把自有域名加入 Reality serverNames；公共 serverNames 通常更隐蔽"
-        read -rp "是否把自有域名也加入 Reality serverNames？[y/N]: " include_own_reality_domain
-        if [[ "${include_own_reality_domain,,}" == "y" ]]; then
-            REALITY_SERVER_NAMES=("${REALITY_DOMAIN}" "${REALITY_SERVER_NAMES[@]}")
-        fi
-    fi
-
     local deduped_server_names=()
     local seen_server_names=""
     local sn
@@ -418,6 +423,14 @@ collect_reality_params() {
             fi
             [[ -n "${XHTTP_REALITY_DOMAIN}" ]] && log_info "XHTTP-Reality 自有域名: ${XHTTP_REALITY_DOMAIN}"
         fi
+    fi
+
+    # ── 自建域名模式收敛：reality-direct 参数以 REALITY_DOMAIN 为准 ──
+    # 生成器在自建域名模式把 SNI 固定为 REALITY_DOMAIN、dest 固定为本地伪装站，
+    # 此处同步收敛内存变量与后续 state 持久化，避免 nginx stream map 残留公共死路由。
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        REALITY_DEST="127.0.0.1:8321"
+        REALITY_SERVER_NAMES=("${REALITY_DOMAIN}")
     fi
 
     log_info "Reality dest:        ${REALITY_DEST}"
