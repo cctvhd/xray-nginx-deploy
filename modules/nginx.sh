@@ -971,7 +971,7 @@ generate_sni_map() {
 
     # Reality 自有域名
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality（自有域名 + 公共 serverNames 全部路由到 8320）--"
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality 自建域名 → 8320 --------------------------"
         echo "        ${REALITY_DOMAIN}     127.0.0.1:8320;"
         seen_sni["${REALITY_DOMAIN}"]=1
         had_output=1
@@ -986,11 +986,13 @@ generate_sni_map() {
         had_output=1
     fi
 
-    # Reality 公共 serverNames：除预留给 xhttp-reality(8325) 的 SNI 外，其余路由到 8320
+    # Reality 公共 serverNames：仅公共 SNI 模式（未分配自有 Reality 域名）才路由到 8320
+    # 自建域名模式：serverNames 已收敛为 REALITY_DOMAIN；即便 state 残留公共名
+    #   （旧版本产物），也绝不写 8320 死路由——公共名此时只可能是 xhttp-reality SNI(8325)。
     # P4修复：Reality serverNames 里的公共域名加进 stream map 指向 8320，
     #         但 XHTTP_REALITY_SNI / XHTTP_REALITY_DOMAIN 必须留给 8325，
     #         否则 seen_sni 去重会把 8325 的 xhttp-reality 路由吞掉（节点不可达）。
-    if [[ -n "${REALITY_SERVER_NAMES:-}" ]]; then
+    if [[ -z "${REALITY_DOMAIN:-}" && -n "${REALITY_SERVER_NAMES:-}" ]]; then
         [[ $had_output -eq 0 ]] && echo "        # -- Reality serverNames 全部路由到 8320 ---------------"
         for sn in "${REALITY_SERVER_NAMES[@]}"; do
             [[ -n "$sn" ]] || continue
