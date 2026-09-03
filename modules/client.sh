@@ -395,6 +395,12 @@ write_subscription_file() {
         return
     fi
 
+    # 凭据轮换后旧订阅已失效：写新订阅前清掉同 webroot 同前缀的历史 sub-*，
+    # 否则旧 URL 仍能拉到已死凭据的节点，误导用户以为又坏了。
+    # 保留当前即将写入的文件（UUID 命名不可能撞名，! -name 仅作保险）。
+    find "$sub_dir" -maxdepth 1 -type f -name "sub-${sub_name}-*" \
+        ! -name "$(basename "$sub_file")" -delete 2>/dev/null || true
+
     base64 -w 0 "$tmp_links" > "$sub_file"
     echo >> "$sub_file"
     chmod 644 "$sub_file"
