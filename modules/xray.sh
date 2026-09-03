@@ -179,12 +179,13 @@ collect_reality_params() {
     #   在册 → 自建域名模式（SNI=自有域，dest=本地伪装站 8321）
     #   无   → 公共 SNI 模式（SNI/dest=下方所选公共伪装目标）
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        log_info "Reality-direct 模式：自建域名（SNI=${REALITY_DOMAIN}，dest→本地伪装站 8321）"
-        log_info "下方公共伪装目标仅作 xhttp-reality 的公共 SNI 候选池，不会改变 reality-direct 的 SNI"
-        log_info "若要改为公共 SNI 模式，请在域名管理中解除 ${REALITY_DOMAIN} 的 xray-reality 标签后重跑"
+        log_info "节点 vless-reality（Reality-direct）当前为自建域名模式：SNI=${REALITY_DOMAIN}，dest→本地伪装站 8321"
+        log_info "下方公共伪装目标列表仅供节点 vless-xhttp-reality 挑选公共 SNI，不会改变 vless-reality 的 SNI"
+        log_info "若要 vless-reality 改用公共 SNI，请在域名管理中解除 ${REALITY_DOMAIN} 的 xray-reality 标签后重跑"
     else
-        log_info "Reality-direct 模式：公共 SNI（未分配自有 Reality 域名）"
-        log_info "下方所选 dest 与 serverNames 即 reality-direct 的伪装目标与 SNI"
+        log_info "节点 vless-reality（Reality-direct）当前为公共 SNI 模式"
+        log_info "下方第 1 步所选伪装目标行，行首域名即 vless-reality 的 SNI（与该行 dest 同站）"
+        log_info "第 2 步再从该行的其余域名中，单独为 vless-xhttp-reality 选一个 SNI（nginx 按 SNI 分流两个节点）"
     fi
     echo ""
 
@@ -352,14 +353,14 @@ collect_reality_params() {
         log_warn "请确认该路径在目标网站返回 200，否则流量特征异常"
     fi
 
-    # ── 选择 XHTTP-Reality 专用 SNI ────────────────────────────
-    # serverNames[0] 留给 TCP+Vision（REALITY_SNI），
-    # 从剩余条目里选一个给 XHTTP-Reality（8325）
+    # ── 选择 vless-xhttp-reality 专用 SNI ─────────────────────
+    # serverNames[0] 留给 vless-reality（TCP+Vision / reality-direct，REALITY_SNI），
+    # 从剩余条目里选一个给 vless-xhttp-reality（8325）
     XHTTP_REALITY_SNI=""
     if (( ${#REALITY_SERVER_NAMES[@]} > 1 )); then
         echo ""
-        echo "请选择 XHTTP-Reality 直连节点使用的伪装 SNI："
-        echo "  （与 TCP+Vision 使用不同 SNI，nginx 据此分流到不同端口）"
+        echo "请选择 vless-xhttp-reality 节点（XHTTP-Reality 协议）使用的伪装 SNI："
+        echo "  （两 Reality 节点须用不同 SNI：首域名=vless-reality(8320)，本项=vless-xhttp-reality(8325)，nginx 据此分流）"
         local _idx=1
         for sn in "${REALITY_SERVER_NAMES[@]:1}"; do
             echo "  ${_idx}. ${sn}"
@@ -373,15 +374,15 @@ collect_reality_params() {
             _sni_idx=0
         fi
         XHTTP_REALITY_SNI="${REALITY_SERVER_NAMES[$(( _sni_idx + 1 ))]}"
-        # 防呆：不允许与 TCP+Vision SNI（[0]）相同
+        # 防呆：不允许与 vless-reality 的 SNI（[0]）相同
         if [[ "${XHTTP_REALITY_SNI}" == "${REALITY_SERVER_NAMES[0]}" ]]; then
-            log_warn "所选 SNI 与 TCP+Vision 相同，已自动清空——XHTTP-Reality 节点不可用"
+            log_warn "所选 SNI 与 vless-reality 相同，已自动清空——vless-xhttp-reality 节点不可用"
             XHTTP_REALITY_SNI=""
         else
-            log_info "XHTTP-Reality SNI 设为: ${XHTTP_REALITY_SNI}"
+            log_info "vless-xhttp-reality SNI 设为: ${XHTTP_REALITY_SNI}"
         fi
     else
-        log_warn "serverNames 只有一个条目，XHTTP-Reality 节点不可用（与 TCP+Vision 共用同一 SNI 无法分流）"
+        log_warn "serverNames 只有一个条目，vless-xhttp-reality 节点不可用（与 vless-reality 共用同一 SNI 无法分流）"
     fi
 
     # ── 选择 XHTTP-Reality 域名模式 ──────────────────────────────
@@ -435,6 +436,8 @@ collect_reality_params() {
 
     log_info "Reality dest:        ${REALITY_DEST}"
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
+    log_info "vless-reality       的 SNI: ${REALITY_SERVER_NAMES[0]:-（无）}"
+    log_info "vless-xhttp-reality 的 SNI: ${XHTTP_REALITY_SNI:-（未启用，与 vless-reality 无法分流）}"
 }
 
 # ── 构建 wireguard 出站 JSON ──────────────────────────────────
