@@ -1428,6 +1428,122 @@ show_status() {
     echo ""
 }
 
+# ── 查看域名分配与证书到期 ─────────────────────────────────
+# 分配以 DOMAIN_PRIMARY_* 主槽位为权威来源（与“刷新域名协议分配”写出的一致），
+# 注册表中未承载协议的域名标为「备用」，避免把 ca.ccpv.tk 这类备胎误读成在用。
+show_domain_allocation() {
+    restore_domain_arrays 2>/dev/null || true
+    local registry
+    registry=$(get_state "DOMAIN_REGISTRY")
+
+    # 协议主槽位：(展示名, DOMAIN_PRIMARY_* 键, state 回落 *_DOMAIN 键)
+    local entries=(
+        "Reality:DOMAIN_PRIMARY_XRAY_REALITY:REALITY_DOMAIN"
+        "xhttp:DOMAIN_PRIMARY_XRAY_XHTTP:XHTTP_DOMAIN"
+        "gRPC:DOMAIN_PRIMARY_XRAY_GRPC:GRPC_DOMAIN"
+        "AnyTLS:DOMAIN_PRIMARY_SINGBOX:ANYTLS_DOMAIN"
+        "Hysteria2:DOMAIN_PRIMARY_HYSTERIA2:HYSTERIA2_DOMAIN"
+        "NaiveProxy:DOMAIN_PRIMARY_NAIVEPROXY:NAIVE_DOMAIN"
+    )
+    declare -A role=() mode=()
+    local entry name rest key fb dom
+    for entry in "${entries[@]}"; do
+        name=${entry%%:*}; rest=${entry#*:}
+        key=${rest%%:*};  fb=${rest#*:}
+        dom=$(get_state "$key")
+        [[ -z "$dom" ]] && dom="${!fb:-}"
+        [[ -z "$dom" ]] && continue
+        role["$dom"]+="${role["$dom"]:+" + "}$name"
+        if [[ " ${CDN_DOMAINS[*]:-} " == *" $dom "* ]]; then
+            mode["$dom"]="CDN"
+        else
+            mode["$dom"]="直连"
+        fi
+    done
+
+    # xhttp-reality 若占用自有域名则单独挂一行（公共 SNI 场景不消耗我们的域名）
+    local xr_sni xr_dom
+    xr_sni=$(get_state "XHTTP_REALITY_SNI")
+    xr_dom=$(get_state "XHTTP_REALITY_DOMAIN")
+    if [[ -n "${xr_sni:-}" && -n "${xr_dom:-}" ]]; then
+        role["$xr_dom"]+="${role["$xr_dom"]:+" + "}xhttp-reality(SNI ${xr_sni})"
+        [[ -n "${mode[$xr_dom]:-}" ]] || mode["$xr_dom"]="直连"
+    fi
+
+    # 注册表兜底：未承载协议的域名 → 备用
+    local sub
+    for d in $registry; do
+        [[ -n "${role[$d]:-}" ]] && continue
+        role["$d"]="备用（未承载协议）"
+        sub=${d//./_}
+        [[ "$(get_state "DOMAIN_MODE_${sub}")" == "cdn" ]] && mode["$d"]="CDN" || mode["$d"]="直连"
+    done
+
+    # 展示顺序：注册表在前，额外自有域（如 xhttp-reality 专用域）追加在后
+    local -a doms=()
+    local used d x
+    for d in $registry; do
+        [[ -n "${role[$d]:-}" ]] && doms+=("$d")
+    done
+    for d in "${!role[@]}"; do
+        used=false
+        for x in "${doms[@]}"; do [[ "$x" == "$d" ]] && used=true && break; done
+        $used || doms+=("$d")
+    done
+
+    echo ""
+    if (( ${#doms[@]} == 0 )); then
+        log_warn "暂无已注册域名"
+        return 0
+    fi
+
+    echo -e "${BLUE}==========================================${NC}"
+    echo "  [域名分配]  CDN=走 Cloudflare / 直连=指向服务器 IP"
+    for d in "${doms[@]}"; do
+        printf "  %-24s [%s] %s\n" "$d" "${mode[$d]}" "${role[$d]}"
+    done
+
+    # 公共 SNI 的 xhttp-reality 不占自有域名，单列说明避免误以为漏配置
+    if [[ -n "${xr_sni:-}" && -z "${xr_dom:-}" ]]; then
+        echo "  ※ xhttp-reality: SNI=${xr_sni}（公共 SNI 导流到 8325，不占用自有域名）"
+    fi
+
+    echo ""
+    echo "  [证书到期]  （wildcard，/etc/letsencrypt/live/<根域名>）"
+    declare -A root_done=()
+    local root cert expiry exp_ep exp_d days color state
+    for d in "${doms[@]}"; do
+        root=$(printf '%s' "$d" | awk -F. '{print $(NF-1)"."$NF}')
+        [[ -n "${root_done[$root]:-}" ]] && continue
+        root_done["$root"]=1
+        cert="/etc/letsencrypt/live/${root}/fullchain.pem"
+        if [[ ! -f "$cert" ]]; then
+            printf "  %-16s  %s\n" "*.${root}" "未申请"
+            continue
+        fi
+        expiry=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
+        if [[ -z "$expiry" ]]; then
+            printf "  %-16s  %s\n" "*.${root}" "读取失败"
+            continue
+        fi
+        exp_ep=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
+        exp_d=$(date -d "$expiry" +%F 2>/dev/null || printf '%s' "$expiry")
+        days=$(( (exp_ep - $(date +%s)) / 86400 ))
+        if (( days < 0 )); then
+            color=$RED;   state="已到期 $((-days)) 天"
+        elif (( days <= 7 )); then
+            color=$RED;   state="仅剩 ${days} 天"
+        elif (( days < 30 )); then
+            color=$YELLOW; state="剩 ${days} 天"
+        else
+            color=$GREEN; state="剩 ${days} 天"
+        fi
+        printf "  %-16s  %s  %b%s%b\n" "*.${root}" "$exp_d" "$color" "$state" "$NC"
+    done
+    echo -e "${BLUE}==========================================${NC}"
+    echo ""
+}
+
 do_sync_modules() {
     echo ""
     log_info "从 GitHub 下载所有模块覆盖本地缓存..."
@@ -3603,6 +3719,7 @@ main_menu_loop() {
         echo "  a. 生成客户端链接"
         echo "  k. 重置所有节点凭据并生成新订阅"
         echo "  b. 查看当前状态"
+        echo "  l. 查看域名分配与证书到期"
         echo "  c. 检查配置健康（preflight）"
         echo "  d. SSH 登录安全检查/加固"
         echo "  m. SSH 公钥管理（查看/追加/替换）"
@@ -3647,6 +3764,10 @@ main_menu_loop() {
             k|K) run_menu_action "重置所有节点凭据并生成新订阅" do_reset_client_credentials ;;
             b|B)
                 run_menu_action "查看状态" show_status
+                read -rp "按回车返回主菜单..." _
+                ;;
+            l|L)
+                run_menu_action "域名分配与证书到期" show_domain_allocation
                 read -rp "按回车返回主菜单..." _
                 ;;
             c|C) run_menu_action "配置健康检查"   do_preflight_report ;;
