@@ -799,6 +799,176 @@ rebuild_protocol_domains() {
     preflight_config_check "rebuild_protocol_domains" || true
 }
 
+# ── 域名分配变更 → 级联重建相关产物（通用，不含任何具体域名）────
+# 由 modules/cert.sh refresh_domain_assignments 在检测到任一槽位域变化后调用。
+# 用法: regen_after_domain_change <changed-slot>...
+#   <changed-slot> ∈ xhttp | grpc | reality | anytls | hysteria2 | naive
+# 派发规则：
+#   xhttp/reality → Xray config（无交互从 state 重建）
+#   anytls        → do_conf_singbox
+#   naive         → do_conf_naive
+#   hysteria2     → 重拷 letsencrypt 证书 + 重启（yaml 不变）
+#   grpc          → 无服务端产物，仅交给下方 nginx+订阅
+#   任一变化      → do_conf_nginx 全量重建（SNI map/servers/伪装 webroot），再 do_client
+# 全程守卫"服务已配置 + state 参数齐 → 无交互重建；缺则打印需手动跑的主菜单键"。
+# 函数自身不做 diff；是否触发由调用方决定。
+regen_after_domain_change() {
+    local slot
+    local do_xray=0 do_singbox=0 do_naive=0 do_hyst=0
+    local -a manual=()
+    for slot in "$@"; do
+        case "$slot" in
+            xhttp|reality) do_xray=1 ;;
+            anytls)        do_singbox=1 ;;
+            naive)         do_naive=1 ;;
+            hysteria2)     do_hyst=1 ;;
+            grpc)          : ;;   # gRPC 槽位域不进 xray config.json，无服务端产物
+            *)             log_warn "未知的域名分配槽位变化: ${slot}，已忽略" ;;
+        esac
+    done
+
+    # 从 state 新鲜装载域/凭据数组，保证下游生成器读到新值
+    restore_domain_arrays
+
+    # 1) 服务端产物：按变化槽位精确派发
+    if (( do_xray )); then
+        if { [[ "$(get_step CONF_XRAY)" == "1" ]] || [[ -s /usr/local/etc/xray/config.json ]]; } \
+            && _regen_xray_from_state; then
+            log_info "已重建: Xray config"
+        else
+            manual+=("Xray（主菜单 x 重新配置，或 11 配置）")
+        fi
+    fi
+    if (( do_singbox )); then
+        if [[ "$(get_step CONF_SINGBOX)" == "1" ]]; then
+            # 配置过的机器非交互，仅末尾一次按回车；失败不中断整个级联
+            do_conf_singbox && log_info "已重建: Sing-Box config" \
+                || log_warn "Sing-Box 重建失败，请手动运行主菜单 12"
+        else
+            manual+=("Sing-Box（主菜单 12 配置，或 g 重新配置）")
+        fi
+    fi
+    if (( do_naive )); then
+        if [[ "$(get_step CONF_NAIVE)" == "1" ]]; then
+            # 配置过的机器非交互，仅末尾一次按回车；失败不中断整个级联
+            do_conf_naive && log_info "已重建: NaiveProxy config" \
+                || log_warn "NaiveProxy 重建失败，请手动运行主菜单 14"
+        else
+            manual+=("NaiveProxy（主菜单 14 配置，或 i 重新配置）")
+        fi
+    fi
+    if (( do_hyst )); then
+        if { [[ "$(get_step CONF_HYSTERIA2)" == "1" ]] || [[ -f /etc/hysteria/config.yaml ]]; } \
+            && _regen_hysteria2_cert; then
+            log_info "已重建: Hysteria2 证书并重启服务"
+        else
+            manual+=("Hysteria2（主菜单 13 配置，或 h 重新配置）")
+        fi
+    fi
+
+    # 2) Nginx 全量重建（含 SNI map / servers / 伪装 webroot）；失败不中断整个级联
+    if [[ "$(get_step CONF_NGINX)" == "1" ]] || command -v nginx &>/dev/null; then
+        do_conf_nginx && log_info "已重建: Nginx 配置并 reload" \
+            || log_warn "Nginx 重建失败，请手动运行主菜单 10"
+    else
+        log_warn "Nginx 未配置，跳过 nginx 全量重建"
+    fi
+
+    # 3) 客户端订阅统一重建：SUBSCRIPTION_PATH 是独立 token，纯换域不变
+    #    → 同一订阅 URL 内容刷新，老客户端重拉即生效
+    if [[ "$(get_step CONF_XRAY)" == "1" || "$(get_step CONF_SINGBOX)" == "1" || \
+          "$(get_step CONF_HYSTERIA2)" == "1" || "$(get_step CONF_NAIVE)" == "1" ]]; then
+        do_client && log_info "已重建: 客户端订阅" \
+            || log_warn "客户端订阅重建失败，请手动运行主菜单 a"
+    else
+        log_warn "无任何协议已配置，跳过客户端订阅重建"
+    fi
+
+    echo ""
+    if (( ${#manual[@]} > 0 )); then
+        log_warn "以下项未自动重建，请在主菜单手动处理：${manual[*]}"
+    fi
+}
+
+# Xray config.json 无交互重建（state 驱动）。仅当 Xray 已配置且凭据齐全时调用。
+# 守卫严格：缺任一关键凭据即拒绝并提示手动——因为 generate_xray_params 对缺失
+# 字段会"现场生成"，域名级联中静默轮换 UUID/密钥/路径会作废所有客户端，绝不允许。
+_regen_xray_from_state() {
+    local _k _missing=()
+    for _k in XRAY_UUID XRAY_PRIVATE_KEY XHTTP_PATH GRPC_SERVICE_NAME \
+              WGCF_PRIVATE_KEY WGCF_PEER_PUBKEY WGCF_ADDRESS WGCF_ENDPOINT; do
+        [[ -z "$(get_state "$_k" "")" ]] && _missing+=("$_k")
+    done
+    # config.json 的 reality 入站始终生成（空 serverNames 即不启用）；
+    # 只要 Reality 在册就需要其伪装参数，否则生成器读到空值。
+    if [[ -n "$(get_state "REALITY_SERVER_NAMES" "")" || -n "$(get_state "REALITY_DOMAIN" "")" ]]; then
+        for _k in REALITY_DEST REALITY_SPIDER_X REALITY_SHORT_IDS; do
+            [[ -z "$(get_state "$_k" "")" ]] && _missing+=("$_k")
+        done
+    fi
+    # CDN 入站当前已启用 VLESS Encryption 时还需种子，否则重建会退化为 none。
+    if grep -q '"decryption": *"mlkem' /usr/local/etc/xray/config.json 2>/dev/null; then
+        [[ -z "$(get_state "VLESS_ENC_SEED" "")" ]] && _missing+=("VLESS_ENC_SEED")
+    fi
+    if (( ${#_missing[@]} > 0 )); then
+        log_warn "Xray state 缺关键字段: ${_missing[*]}，已跳过自动重建（避免误轮换凭据）"
+        log_warn "请手动运行主菜单 x（重新配置 Xray）补全后重建"
+        return 1
+    fi
+
+    restore_domain_arrays
+    XHTTP_PATH=$(get_state "XHTTP_PATH")
+    GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
+    XRAY_PADDING=$(get_state "XRAY_PADDING" "128-2048")
+    REALITY_DEST=$(get_state "REALITY_DEST")
+    REALITY_SPIDER_X=$(get_state "REALITY_SPIDER_X")
+    WGCF_PRIVATE_KEY=$(get_state "WGCF_PRIVATE_KEY")
+    WGCF_PEER_PUBKEY=$(get_state "WGCF_PEER_PUBKEY")
+    WGCF_ADDRESS=$(get_state "WGCF_ADDRESS")
+    WGCF_ENDPOINT=$(get_state "WGCF_ENDPOINT")
+    WGCF_ENDPOINT_HOST=$(get_state "WGCF_ENDPOINT_HOST" "")
+    WGCF_ENDPOINT_PORT=$(get_state "WGCF_ENDPOINT_PORT" "")
+
+    load_module xray
+    generate_xray_params
+    generate_xray_config
+    start_xray
+    return 0
+}
+
+# Hysteria2 证书重拷 + 重启（config.yaml 文本不变，无需交互收集）。
+# 证书源三段式与 configure_hysteria2 一致：域名 live 目录 → 根域 live 目录。
+_regen_hysteria2_cert() {
+    local hd root src_cert src_key
+    hd=$(get_state "HYSTERIA2_DOMAIN" "")
+    if [[ -z "$hd" ]]; then
+        log_warn "HYSTERIA2_DOMAIN 为空，无法重拷证书"
+        return 1
+    fi
+    if [[ -f "/etc/letsencrypt/live/${hd}/fullchain.pem" ]]; then
+        root="$hd"
+    else
+        root=$(echo "$hd" | awk -F. '{print $(NF-1)"."$NF}')
+    fi
+    src_cert="/etc/letsencrypt/live/${root}/fullchain.pem"
+    src_key="/etc/letsencrypt/live/${root}/privkey.pem"
+    if [[ ! -f "$src_cert" || ! -f "$src_key" ]]; then
+        log_warn "未找到 Hysteria2 证书源: ${src_cert}，请先在主菜单完成该域名证书申请"
+        return 1
+    fi
+
+    mkdir -p /etc/hysteria
+    cp "$src_cert" /etc/hysteria/fullchain.pem
+    cp "$src_key"  /etc/hysteria/privkey.pem
+    chown hysteria:hysteria /etc/hysteria/fullchain.pem /etc/hysteria/privkey.pem
+    if ! systemctl restart hysteria-server.service; then
+        log_warn "hysteria-server 重启失败，请检查: journalctl -u hysteria-server -n 20"
+        return 1
+    fi
+    log_info "Hysteria2 证书已重拷（源: ${root}）并重启服务"
+    return 0
+}
+
 load_domain_state() {
     ALL_DOMAINS=(); CDN_DOMAINS=(); DIRECT_DOMAINS=()
     local all_str cdn_str direct_str

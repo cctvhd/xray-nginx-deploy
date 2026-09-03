@@ -2153,6 +2153,14 @@ add_domain_and_cert() {
 refresh_domain_assignments() {
     log_step "刷新域名协议分配"
 
+    # 对 six slot 域做 before 快照（读 state 文件；末尾 diff 决定是否级联重建）
+    local -a _slot_names=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN ANYTLS_DOMAIN HYSTERIA2_DOMAIN NAIVE_DOMAIN)
+    local -A _before_dom=()
+    local _sn
+    for _sn in "${_slot_names[@]}"; do
+        _before_dom[$_sn]=$(get_state "$_sn" "")
+    done
+
     load_domain_state
     load_domain_config >/dev/null 2>&1 || true
 
@@ -2299,6 +2307,35 @@ refresh_domain_assignments() {
 
     log_info "HYSTERIA2_DOMAIN=${HYSTERIA2_DOMAIN:-}"
     log_info "NAIVE_DOMAIN=${NAIVE_DOMAIN:-}"
+
+    # ── 级联：槽位域有变化 → 打印对照 → 触发通用全量重建（install.sh）──
+    local -a _changed_slots=()
+    for _sn in "${_slot_names[@]}"; do
+        if [[ "${_before_dom[$_sn]:-}" != "$(get_state "$_sn" "")" ]]; then
+            _changed_slots+=("$_sn")
+        fi
+    done
+
+    if (( ${#_changed_slots[@]} == 0 )); then
+        log_info "域名分配无变化，跳过配置级联重建（幂等）"
+        return 0
+    fi
+
+    echo ""
+    log_warn "检测到域名分配变化，触发相关配置级联重建："
+    local -A _slot_tag=( [XHTTP_DOMAIN]=xhttp     [GRPC_DOMAIN]=grpc \
+                         [REALITY_DOMAIN]=reality [ANYTLS_DOMAIN]=anytls \
+                         [HYSTERIA2_DOMAIN]=hysteria2 [NAIVE_DOMAIN]=naive )
+    local _ch
+    for _ch in "${_changed_slots[@]}"; do
+        printf "  %-16s %s → %s\n" "${_ch}" "${_before_dom[$_ch]:-<空>}" "$(get_state "$_ch" "")"
+    done
+
+    local -a _changed_tags=()
+    for _ch in "${_changed_slots[@]}"; do
+        _changed_tags+=("${_slot_tag[$_ch]}")
+    done
+    regen_after_domain_change "${_changed_tags[@]}"
 }
 
 # ── 迁移旧 cf_account_N.ini 到域名命名格式 ──────────────────
