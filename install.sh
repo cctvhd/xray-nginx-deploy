@@ -2223,6 +2223,16 @@ PY
     RESET_OLD_XHTTP_PATH=$(get_state "XHTTP_PATH" "")
     RESET_XRAY_BACKUP="$backup"
     _restart_rotated_service "xray.service" "$backup" "$config" "1" || exit 1
+    # 关键：必须同步回 shell 内存变量，不能只 save_state 写文件。
+    # 后续同一次运行里的 _sync_nginx_after_credential_reset → generate_servers_conf/fallback_conf
+    # 直接内插 ${XHTTP_PATH}（nginx.sh 不重读 state）；若内存变量仍是旧值，
+    # nginx 的 xhttp location 会停留在旧 path，与已轮换的 config/订阅错位 → xhttp 节点全挂。
+    XRAY_UUID="${new_uuid}"
+    XRAY_PRIVATE_KEY="${new_private}"
+    XRAY_PUBLIC_KEY="${new_public}"
+    XHTTP_PATH="${new_xhttp_path}"
+    REALITY_SHORT_IDS="${new_short_ids}"
+    REALITY_SHORT_ID="$(awk '{print $2}' <<< "${new_short_ids}")"
     save_state "XRAY_UUID" "${new_uuid}"
     save_state "XRAY_PRIVATE_KEY" "${new_private}"
     save_state "XRAY_PUBLIC_KEY" "${new_public}"
