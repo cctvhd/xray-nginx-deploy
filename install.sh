@@ -897,14 +897,19 @@ load_module() {
             fi
             source "$cached_path"
         else
-            log_warn "下载失败，使用缓存..."
-            [[ -f "$cached_path" ]] && source "$cached_path"
+            if [[ -f "$cached_path" ]]; then
+                log_warn "下载 ${module}.sh 失败，使用缓存（可能过期；若随后出错请重跑并选择 s 同步）"
+                source "$cached_path"
+            else
+                log_error "下载 ${module}.sh 失败且无缓存可用，无法继续"
+                exit 1
+            fi
         fi
         return
     fi
 
-    # 本地文件比缓存新时（git pull 后）优先使用本地版本
-    if [[ -f "$cached_path" && -f "$local_path" && "$local_path" -nt "$cached_path" ]]; then
+    # 本地 git 仓库模块始终优先于缓存（git pull 后立即生效，不做 mtime 猜测）
+    if [[ -f "$local_path" ]]; then
         cp "$local_path" "$cached_path"
         chmod 600 "$cached_path"
     fi
@@ -968,6 +973,8 @@ sync_modules() {
         local local_path="${MODULES_DIR}/${module}.sh"
         local remote_url="${BASE_URL}/modules/${module}.sh"
         echo -n "  ${module}.sh ... "
+        # 先删旧缓存：即便本次拉取失败也不残留过期模块文件
+        rm -f "$cached_path"
         # 优先从本地 git clone 目录复制（更快且不依赖网络）
         if [[ -f "$local_path" ]]; then
             cp "$local_path" "$cached_path"
@@ -991,6 +998,23 @@ sync_modules() {
     fi
     log_info "本地缓存目录: ${LOCAL_MODULES_DIR}"
     log_info "如需强制更新，再次选择 s 即可覆盖所有缓存"
+}
+
+# ── 远程(curl bash <(curl ...))模式启动时清空模块缓存 ──────
+# MODULES_DIR 非真实目录 → 说明脚本经管道/进程替换运行，模块只能来自远程。
+# 启动即清空缓存：让任何回退路径都取不到历史旧模块（该模式下每次加载本就强拉最新）。
+_clear_module_cache_if_remote() {
+    [[ -d "$MODULES_DIR" ]] && return 0
+    local cache_dir="$LOCAL_MODULES_DIR"
+    case "$cache_dir" in
+        */modules) ;;
+        *)
+            log_warn "缓存路径异常，跳过清理: ${cache_dir}"
+            return 1
+            ;;
+    esac
+    log_info "远程模式运行：清空本地模块缓存 ${cache_dir}"
+    rm -rf -- "${cache_dir}"
 }
 
 # ── 根据实际服务状态自动补全 state ──────────────────────────
@@ -3641,6 +3665,7 @@ if [[ "${1:-}" == "--upgrade-component" ]]; then
     check_root
     acquire_upgrade_lock
     init_state
+    _clear_module_cache_if_remote
     run_upgrade_component "${2:-}"
     exit 0
 fi
@@ -3648,4 +3673,5 @@ fi
 check_root
 acquire_lock
 init_state
+_clear_module_cache_if_remote
 main_menu_loop
