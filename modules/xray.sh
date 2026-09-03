@@ -165,12 +165,107 @@ detect_spider_path() {
     return 1
 }
 
+# ── vless-reality：自建域名 → 公共 SNI 模式切换 ──────────────
+# 用户在 menu x 内已明确选择"公共 SNI"。本函数摘除该自有域名上的
+# xray-reality 标签并重推派生，令 REALITY_DOMAIN 置空，使后续生成严格
+# 遵循用户刚选的第三方 SNI，不再被自有域名静默覆盖。
+#   · 域名若还带其它协议标签（naive/hysteria2 等）→ 仅摘 xray-reality，保留其余
+#   · 域名从此无任何标签 → 从 DOMAIN_REGISTRY 移除（不询问删 ini/证书，同编辑器语义）
+reality_untag_self_domain() {
+    local domain="$1"
+    local suffix mode protos new_protos="" new_mode d pl
+    suffix=$(printf '%s' "$domain" | tr '.' '_')
+
+    # cert 模块例程可能未加载（menu x 仅载 xray/nginx）；按需补齐
+    if ! declare -F _derive_mode_from_protocols >/dev/null 2>&1; then
+        declare -F load_module >/dev/null 2>&1 && load_module cert >/dev/null 2>&1 || true
+    fi
+
+    mode=$(get_state "DOMAIN_MODE_${suffix}" "")
+    protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+
+    # 摘除 xray-reality token，保留其余协议
+    if [[ -n "$protos" ]]; then
+        local -a _keep=() _pl=()
+        IFS=',' read -ra _pl <<< "$protos"
+        for pl in "${_pl[@]}"; do
+            [[ -n "$pl" && "$pl" != "xray-reality" ]] && _keep+=("$pl")
+        done
+        for pl in "${_keep[@]}"; do
+            new_protos="${new_protos:+$new_protos,}$pl"
+        done
+    fi
+
+    if [[ -z "$new_protos" ]]; then
+        # 无任何剩余协议 → 从注册表移除（保留 ini/证书，同 _editor_delete_domain 前半）
+        log_info "域名 ${domain} 已无协议角色，从注册表移除"
+        local registry new_reg=""
+        registry=$(get_state "DOMAIN_REGISTRY" "")
+        for d in $registry; do
+            [[ "$d" == "$domain" ]] && continue
+            new_reg="${new_reg:+$new_reg }$d"
+        done
+        save_state "DOMAIN_REGISTRY" "$new_reg"
+        save_state "DOMAIN_MODE_${suffix}"  ""
+        save_state "DOMAIN_PROTO_${suffix}" ""
+    else
+        # 剩余协议决定连接方式（编辑器语义：mode 由协议重推）
+        if declare -F _derive_mode_from_protocols >/dev/null 2>&1; then
+            new_mode=$(_derive_mode_from_protocols "$new_protos")
+        else
+            new_mode="${mode:-direct}"
+        fi
+        save_state "DOMAIN_MODE_${suffix}"  "$new_mode"
+        save_state "DOMAIN_PROTO_${suffix}" "$new_protos"
+        log_info "已摘除 ${domain} 的 xray-reality 标签，保留其余协议: ${new_protos} [${new_mode}]"
+    fi
+
+    # 重推派生：清空 REALITY_DOMAIN 与 DOMAIN_PRIMARY_XRAY_REALITY（写 state + 当前 shell）
+    declare -F rebuild_protocol_domains >/dev/null 2>&1 && rebuild_protocol_domains
+    declare -F load_domain_state >/dev/null 2>&1 && load_domain_state
+    # 镜像同步到 /etc/cloudflare/domain_map.conf（防旧值残留导致下次启动自愈回填）
+    declare -F save_domain_config >/dev/null 2>&1 && save_domain_config
+    log_info "vless-reality 已切换为公共 SNI 模式（REALITY_DOMAIN 已清空）"
+}
+
 # ── 收集 Reality 伪装参数 ────────────────────────────────────
 # Current correct values on this server: dest=www.mpg.de:443, spiderX=/
 # When re-running, select: Europe(2) -> mpg.de(5), then input spiderX=/
 collect_reality_params() {
     echo ""
     log_step "配置 Reality 伪装参数"
+    echo ""
+
+    # ── Reality-direct 模式提示：模式由域名分配决定，非下方交互决定 ──
+    # reality-direct 节点（vless-reality）实际用哪种 SNI，取决于域名管理里
+    # 是否有 xray-reality 标签域（REALITY_DOMAIN）：
+    #   在册 → 自建域名模式（SNI=自有域，dest=本地伪装站 8321）
+    #   无   → 公共 SNI 模式（SNI/dest=下方所选公共伪装目标）
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        # 显式二选一：vless-reality 用自有域名还是公共 SNI。
+        # 旧逻辑由 xray-reality 标签静默决定并把下方所选第三方覆盖成自有域名，
+        # 与"选什么=配什么"冲突；这里把决定权交回 menu x。
+        echo ""
+        echo "vless-reality 当前绑定自有域名 ${REALITY_DOMAIN}（自建域名模式：SNI=${REALITY_DOMAIN}，dest→本地伪装站 8321）"
+        echo "请选择 vless-reality 的伪装方式："
+        echo "  1. 公共 SNI —— 借用第三方域名：自动摘除 ${REALITY_DOMAIN} 的 xray-reality 标签，"
+        echo "                 你随后在下方列表里选哪个，vless-reality 就用哪个 SNI"
+        echo "  2. 自建域名 —— ${REALITY_DOMAIN}（真实证书；下方列表仅供 vless-xhttp-reality 选公共 SNI）"
+        read -rp "请选择 [1/2，默认2]: " _vless_mode
+        echo ""
+        if [[ "${_vless_mode:-2}" == "1" ]]; then
+            log_info "切换 vless-reality 为公共 SNI 模式：摘除 ${REALITY_DOMAIN} 的 xray-reality 标签并重建派生..."
+            reality_untag_self_domain "${REALITY_DOMAIN}"
+            log_info "REALITY_DOMAIN 已清空——以下所选公共目标即 vless-reality 的 dest/SNI"
+        else
+            log_info "vless-reality 保持自建域名模式（SNI=${REALITY_DOMAIN}，dest→本地伪装站 8321）"
+            log_info "下方公共伪装目标列表仅供 vless-xhttp-reality 挑选公共 SNI，不会改变 vless-reality 的 SNI"
+        fi
+    else
+        log_info "节点 vless-reality（Reality-direct）当前为公共 SNI 模式"
+        log_info "下方第 1 步所选伪装目标行，行首域名即 vless-reality 的 SNI（与该行 dest 同站）"
+        log_info "第 2 步再从该行的其余域名中，单独为 vless-xhttp-reality 选一个 SNI（nginx 按 SNI 分流两个节点）"
+    fi
     echo ""
 
     # 从 HW_REGION 前缀自动推断地区，避免重复手动选择
@@ -311,16 +406,6 @@ collect_reality_params() {
             ;;
     esac
 
-    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        echo ""
-        log_info "检测到自有 Reality 域名: ${REALITY_DOMAIN}"
-        log_warn "建议默认不要把自有域名加入 Reality serverNames；公共 serverNames 通常更隐蔽"
-        read -rp "是否把自有域名也加入 Reality serverNames？[y/N]: " include_own_reality_domain
-        if [[ "${include_own_reality_domain,,}" == "y" ]]; then
-            REALITY_SERVER_NAMES=("${REALITY_DOMAIN}" "${REALITY_SERVER_NAMES[@]}")
-        fi
-    fi
-
     local deduped_server_names=()
     local seen_server_names=""
     local sn
@@ -347,14 +432,14 @@ collect_reality_params() {
         log_warn "请确认该路径在目标网站返回 200，否则流量特征异常"
     fi
 
-    # ── 选择 XHTTP-Reality 专用 SNI ────────────────────────────
-    # serverNames[0] 留给 TCP+Vision（REALITY_SNI），
-    # 从剩余条目里选一个给 XHTTP-Reality（8325）
+    # ── 选择 vless-xhttp-reality 专用 SNI ─────────────────────
+    # serverNames[0] 留给 vless-reality（TCP+Vision / reality-direct，REALITY_SNI），
+    # 从剩余条目里选一个给 vless-xhttp-reality（8325）
     XHTTP_REALITY_SNI=""
     if (( ${#REALITY_SERVER_NAMES[@]} > 1 )); then
         echo ""
-        echo "请选择 XHTTP-Reality 直连节点使用的伪装 SNI："
-        echo "  （与 TCP+Vision 使用不同 SNI，nginx 据此分流到不同端口）"
+        echo "请选择 vless-xhttp-reality 节点（XHTTP-Reality 协议）使用的伪装 SNI："
+        echo "  （两 Reality 节点须用不同 SNI：首域名=vless-reality(8320)，本项=vless-xhttp-reality(8325)，nginx 据此分流）"
         local _idx=1
         for sn in "${REALITY_SERVER_NAMES[@]:1}"; do
             echo "  ${_idx}. ${sn}"
@@ -368,15 +453,15 @@ collect_reality_params() {
             _sni_idx=0
         fi
         XHTTP_REALITY_SNI="${REALITY_SERVER_NAMES[$(( _sni_idx + 1 ))]}"
-        # 防呆：不允许与 TCP+Vision SNI（[0]）相同
+        # 防呆：不允许与 vless-reality 的 SNI（[0]）相同
         if [[ "${XHTTP_REALITY_SNI}" == "${REALITY_SERVER_NAMES[0]}" ]]; then
-            log_warn "所选 SNI 与 TCP+Vision 相同，已自动清空——XHTTP-Reality 节点不可用"
+            log_warn "所选 SNI 与 vless-reality 相同，已自动清空——vless-xhttp-reality 节点不可用"
             XHTTP_REALITY_SNI=""
         else
-            log_info "XHTTP-Reality SNI 设为: ${XHTTP_REALITY_SNI}"
+            log_info "vless-xhttp-reality SNI 设为: ${XHTTP_REALITY_SNI}"
         fi
     else
-        log_warn "serverNames 只有一个条目，XHTTP-Reality 节点不可用（与 TCP+Vision 共用同一 SNI 无法分流）"
+        log_warn "serverNames 只有一个条目，vless-xhttp-reality 节点不可用（与 vless-reality 共用同一 SNI 无法分流）"
     fi
 
     # ── 选择 XHTTP-Reality 域名模式 ──────────────────────────────
@@ -420,8 +505,18 @@ collect_reality_params() {
         fi
     fi
 
+    # ── 自建域名模式收敛：reality-direct 参数以 REALITY_DOMAIN 为准 ──
+    # 生成器在自建域名模式把 SNI 固定为 REALITY_DOMAIN、dest 固定为本地伪装站，
+    # 此处同步收敛内存变量与后续 state 持久化，避免 nginx stream map 残留公共死路由。
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        REALITY_DEST="127.0.0.1:8321"
+        REALITY_SERVER_NAMES=("${REALITY_DOMAIN}")
+    fi
+
     log_info "Reality dest:        ${REALITY_DEST}"
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
+    log_info "vless-reality       的 SNI: ${REALITY_SERVER_NAMES[0]:-（无）}"
+    log_info "vless-xhttp-reality 的 SNI: ${XHTTP_REALITY_SNI:-（未启用，与 vless-reality 无法分流）}"
 }
 
 # ── 构建 wireguard 出站 JSON ──────────────────────────────────
