@@ -295,6 +295,22 @@ _build_own_domain_zones() {
     fi
 }
 
+# ── 版本敏感选项探测 ──────────────────────────────────────────
+# 老发行版（如 EL8 的 unbound 1.7.x）不识别较新的配置关键字，
+# unbound-checkconf 遇未知关键字会直接报错。以真实二进制为准探测，
+# 支持才输出该选项，避免"装的是老包却写新配置"导致校验/启动失败。
+# 用法：_unbound_supports <option> [sample-value]，默认值 yes。
+_unbound_supports() {
+    local opt="${1:-}" val="${2:-yes}" probe rc
+    command -v unbound-checkconf >/dev/null 2>&1 || return 1
+    probe=$(mktemp) || return 1
+    printf 'server:\n    %s: %s\n' "$opt" "$val" > "$probe"
+    unbound-checkconf "$probe" >/dev/null 2>&1
+    rc=$?
+    rm -f "$probe"
+    return "$rc"
+}
+
 # ── 生成主配置 /etc/unbound/unbound.conf ────────────────────
 generate_main_config() {
     log_step "生成主配置 /etc/unbound/unbound.conf..."
@@ -315,6 +331,16 @@ generate_main_config() {
     else
         unbound_prefer_ip6="no"
     fi
+
+    # 仅新版 unbound 支持的关键字：按真实二进制探测后条件输出，
+    # 老包自动省略（serve-expired / serve-expired-ttl 为老选项，恒输出）
+    local sec_tls="" sec_exp_client="" sec_exp_reply=""
+    _unbound_supports tls-system-cert && \
+        sec_tls=$'    # tls-system-cert：用系统 CA 包认证上游证书，防 ISP 窥探 DNS\n    tls-system-cert: yes'
+    _unbound_supports serve-expired-client-timeout 1800 && \
+        sec_exp_client="    serve-expired-client-timeout: 1800"
+    _unbound_supports serve-expired-reply-ttl 30 && \
+        sec_exp_reply="    serve-expired-reply-ttl: 30"
 
     cat > /etc/unbound/unbound.conf << MAIN_EOF
 # ============================================================
@@ -377,10 +403,12 @@ ${iface_ipv6}
     root-hints: "/etc/unbound/root.hints"
 
     # === 过期缓存容错（RFC 8767 stale-while-revalidate）===
+    # serve-expired-client-timeout / serve-expired-reply-ttl 需新版 unbound，
+    # 老包自动省略（探测见 _unbound_supports）
     serve-expired: yes
     serve-expired-ttl: 86400
-    serve-expired-client-timeout: 1800
-    serve-expired-reply-ttl: 30
+${sec_exp_client}
+${sec_exp_reply}
 
     # === 系统参数 ===
     username: "unbound"
@@ -394,8 +422,8 @@ ${iface_ipv6}
     include: "/etc/unbound/conf.d/*.conf"
 
     # === 上游 DNS（DNS-over-TLS）===
-    # tls-system-cert 使用系统 CA 包认证上游证书，防止 ISP 窥探 DNS
-    tls-system-cert: yes
+    # tls-system-cert 需新版 unbound，老包自动省略（探测见 _unbound_supports）
+${sec_tls}
 
 # === 远程控制 ===
 remote-control:
