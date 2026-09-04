@@ -1,5 +1,6 @@
 cert
 client
+cleanup
 crowdsec
 firewall
 hysteria2

@@ -28,7 +28,7 @@ STATE_DIR="/etc/xray-deploy"
 STATE_FILE="${STATE_DIR}/config.env"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync security firewall crowdsec uninstall upgrade)
+DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync security firewall crowdsec cleanup uninstall upgrade)
 ALL_MODULES=()
 
 init_module_list() {
@@ -3528,6 +3528,12 @@ do_uninstall_menu() {
     esac
 }
 
+do_cleanup() {
+    load_module cleanup
+    run_cleanup
+    done_return
+}
+
 run_full_install_flow() {
     log_step "开始全流程安装..."
     echo ""
@@ -3960,6 +3966,7 @@ main_menu_loop() {
         echo "  v. 升级组件（后台运行）"
         echo "  w. 配置 WARP WireGuard 凭证（步骤 11/12 的前置依赖）"
         echo "  u. 卸载 / 清理模块"
+        echo "  t. 系统清理 / 维护（日志·缓存·kdump·旧内核体检）"
         echo "  p. SELinux 管理"
         echo "  r. 全部重装（先清理再执行全流程）"
         echo "  0. 全流程一键安装（含内核升级与系统优化）"
@@ -4010,6 +4017,7 @@ main_menu_loop() {
             v|V) run_menu_action "升级组件"        do_upgrade_menu ;;
             w|W) run_menu_action "配置 WARP"       do_warp ;;
             u|U) run_menu_action "卸载/清理"       do_uninstall_menu ;;
+            t|T) run_menu_action "系统清理"         do_cleanup ;;
             p|P) run_menu_action "SELinux 管理"    do_selinux_mgmt ;;
             r|R) run_menu_action "全部重装"        do_reinstall_all ;;
             0) run_menu_action "一键安装"          run_full_install_flow ;;
