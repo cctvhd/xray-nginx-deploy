@@ -1447,8 +1447,12 @@ load_os_info() {
                 PKG_INSTALL="dnf install -y"
                 ;;
             *)
-                log_error "不支持的系统: $OS_ID"
-                return 1
+                # OS_ID 在 state 里但不在显式白名单时，可能是 detect_os 经
+                # ID_LIKE 认可的衍生系统（amzn/ol 等）。这里不能仅凭 OS_ID
+                # 判断 apt/dnf，交由 detect_os 依 /etc/os-release 权威判定；
+                # 真正陌生的系统会在 detect_os 内 exit 1。
+                load_module system
+                detect_os
                 ;;
         esac
         return
