@@ -3489,6 +3489,8 @@ do_uninstall_menu() {
     echo "  8. 清理 NaiveProxy"
     echo "  9. 清理 Cloudflare WARP"
     echo "  10. 清理全部"
+    echo "  11. 清理 CrowdSec"
+    echo "  12. 清理 nftables 防火墙"
     echo "  q. 返回主菜单"
     echo ""
     read -rp "  请选择: " cleanup_choice
@@ -3515,6 +3517,8 @@ do_uninstall_menu() {
             rm -f "$STATE_FILE"
             init_state
             ;;
+       11) cleanup_crowdsec_module ;;
+       12) cleanup_firewall_module ;;
         q|Q)
             ;;
         *)
