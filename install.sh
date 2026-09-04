@@ -2857,6 +2857,12 @@ upgrade_remote_version() {
             upgrade_nginx_stable
             ;;
         singbox)
+            # sing-box 由官方 sagernet 仓库安装（modules/singbox.sh，apt/dnf），
+            # 与 nginx 同理："最新"认本机仓库候选，避开 GitHub release→仓库打包的滞后窗口；
+            # 读不到候选（仓库未加/未装）→ 退回 GitHub latest。
+            local cand
+            cand=$(upgrade_repo_candidate sing-box)
+            [[ -n "$cand" ]] && { echo "$cand"; return; }
             upgrade_github_latest SagerNet/sing-box
             ;;
         xray)      upgrade_github_latest XTLS/Xray-core ;;
