@@ -14,8 +14,12 @@ install_nginx() {
                 curl -fsSL https://nginx.org/keys/nginx_signing.key | \
                     gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
 
+                # 优先读 /etc/os-release 的 VERSION_CODENAME：
+                # lsb_release 依赖 lsb-release 包，精简系统常未安装，
+                # 而 Debian/Ubuntu 的 VERSION_CODENAME 即 nginx.org 仓库 codename
                 local codename
-                codename=$(lsb_release -cs)
+                codename=$(grep "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+                [[ -z "${codename}" ]] && codename=$(lsb_release -cs 2>/dev/null)
                 echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
 http://nginx.org/packages/${OS_ID} ${codename} nginx" \
                     > /etc/apt/sources.list.d/nginx.list
@@ -58,6 +62,14 @@ REPO
                 log_info "nginx 官方 yum 仓库已存在，跳过"
             fi
 
+            dnf install -y nginx >/dev/null 2>&1
+            ;;
+
+        fedora)
+            # nginx.org 不发布 Fedora 软件包（仅有 centos/debian/ubuntu 等源），
+            # Fedora 走发行版自带 nginx；其仓库候选版本由 install.sh 的
+            # upgrade_repo_candidate(dnf) 读取，与安装通道一致。
+            log_info "Fedora 使用发行版仓库安装 nginx（nginx.org 无 Fedora 源）"
             dnf install -y nginx >/dev/null 2>&1
             ;;
     esac

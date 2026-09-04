@@ -26,17 +26,15 @@ remove_package_if_possible() {
     local pkg="$1"
     load_os_info
 
-    case "$OS_ID" in
-        ubuntu|debian)
-            apt-get purge -y "$pkg" >/dev/null 2>&1 || \
-            apt-get remove -y "$pkg" >/dev/null 2>&1 || true
-            apt-get autoremove -y >/dev/null 2>&1 || true
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            dnf remove -y "$pkg" >/dev/null 2>&1 || \
-            yum remove -y "$pkg" >/dev/null 2>&1 || true
-            ;;
-    esac
+    # 按包管理器分派，不依赖 OS_ID 字面量：amzn/ol 等 ID_LIKE 衍生系统也命中
+    if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]] || command -v apt-get >/dev/null 2>&1; then
+        apt-get purge -y "$pkg" >/dev/null 2>&1 || \
+        apt-get remove -y "$pkg" >/dev/null 2>&1 || true
+        apt-get autoremove -y >/dev/null 2>&1 || true
+    else
+        dnf remove -y "$pkg" >/dev/null 2>&1 || \
+        yum remove -y "$pkg" >/dev/null 2>&1 || true
+    fi
 }
 
 get_saved_root_domains() {
@@ -133,6 +131,24 @@ reset_naive_state() {
 reset_warp_state() {
     save_state "INST_WARP" "0"
     save_state "CONF_WARP" "0"
+}
+
+reset_firewall_state() {
+    save_state "CONF_FIREWALL" "0"
+    save_state "FIREWALL_BACKEND" ""
+    save_state "FIREWALL_NFT_CONFIG" ""
+    save_state "FIREWALL_SSH_PORTS" ""
+    save_state "FIREWALL_EXTRA_TCP" ""
+    save_state "FIREWALL_EXTRA_UDP" ""
+    save_state "FIREWALL_DUAL_STACK" ""
+}
+
+reset_crowdsec_state() {
+    save_state "INST_CROWDSEC" "0"
+    save_state "CONF_CROWDSEC" "0"
+    save_state "CROWDSEC_BOUNCER_CONF" ""
+    save_state "CROWDSEC_BOUNCER_IPV6" ""
+    save_state "CROWDSEC_NGINX_ACQUIS" ""
 }
 
 restore_default_resolv_conf() {
@@ -242,16 +258,13 @@ cleanup_nginx_module() {
 
     remove_package_if_possible "nginx"
 
-    case "$OS_ID" in
-        ubuntu|debian)
-            remove_path_if_exists "/etc/apt/sources.list.d/nginx.list"
-            remove_path_if_exists "/etc/apt/preferences.d/99nginx"
-            remove_path_if_exists "/usr/share/keyrings/nginx-archive-keyring.gpg"
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            remove_path_if_exists "/etc/yum.repos.d/nginx.repo"
-            ;;
-    esac
+    if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]] || command -v apt-get >/dev/null 2>&1; then
+        remove_path_if_exists "/etc/apt/sources.list.d/nginx.list"
+        remove_path_if_exists "/etc/apt/preferences.d/99nginx"
+        remove_path_if_exists "/usr/share/keyrings/nginx-archive-keyring.gpg"
+    else
+        remove_path_if_exists "/etc/yum.repos.d/nginx.repo"
+    fi
 
     reset_nginx_state
     log_info "Nginx 清理完成"
@@ -319,16 +332,13 @@ cleanup_singbox_module() {
     remove_path_if_exists "/var/lib/sing-box"
     remove_package_if_possible "sing-box"
 
-    case "$OS_ID" in
-        ubuntu|debian)
-            remove_path_if_exists "/etc/apt/keyrings/sagernet.asc"
-            remove_path_if_exists "/etc/apt/sources.list.d/sagernet.sources"
-            remove_path_if_exists "/etc/apt/sources.list.d/sagernet.list"
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            remove_path_if_exists "/etc/yum.repos.d/sing-box.repo"
-            ;;
-    esac
+    if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]] || command -v apt-get >/dev/null 2>&1; then
+        remove_path_if_exists "/etc/apt/keyrings/sagernet.asc"
+        remove_path_if_exists "/etc/apt/sources.list.d/sagernet.sources"
+        remove_path_if_exists "/etc/apt/sources.list.d/sagernet.list"
+    else
+        remove_path_if_exists "/etc/yum.repos.d/sing-box.repo"
+    fi
 
     reset_singbox_state
     log_info "Sing-Box 清理完成"
@@ -372,19 +382,71 @@ cleanup_warp_module() {
 
     remove_package_if_possible "cloudflare-warp"
 
-    case "$OS_ID" in
-        ubuntu|debian)
-            remove_path_if_exists "/etc/apt/sources.list.d/cloudflare-client.list"
-            remove_path_if_exists "/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
-            ;;
-        centos|rhel|rocky|almalinux|fedora)
-            remove_path_if_exists "/etc/yum.repos.d/cloudflare-warp.repo"
-            ;;
-    esac
+    if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]] || command -v apt-get >/dev/null 2>&1; then
+        remove_path_if_exists "/etc/apt/sources.list.d/cloudflare-client.list"
+        remove_path_if_exists "/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg"
+    else
+        remove_path_if_exists "/etc/yum.repos.d/cloudflare-warp.repo"
+    fi
 
     remove_path_if_exists "/var/lib/cloudflare-warp"
     reset_warp_state
     log_info "Cloudflare WARP 清理完成"
+}
+
+cleanup_crowdsec_module() {
+    log_step "清理 CrowdSec..."
+
+    systemctl disable --now crowdsec-firewall-bouncer >/dev/null 2>&1 || true
+    systemctl disable --now crowdsec >/dev/null 2>&1 || true
+
+    remove_package_if_possible "crowdsec-firewall-bouncer-nftables"
+    remove_package_if_possible "crowdsec"
+
+    # 移除 packagecloud 仓库与签名（与 modules/crowdsec.sh 写入路径对应）
+    if [[ "${OS_ID:-}" =~ ^(ubuntu|debian)$ ]] || command -v apt-get >/dev/null 2>&1; then
+        remove_path_if_exists "/etc/apt/sources.list.d/crowdsec_crowdsec.list"
+        remove_path_if_exists "/etc/apt/trusted.gpg.d/crowdsec_crowdsec.gpg"
+    else
+        remove_path_if_exists "/etc/yum.repos.d/crowdsec_crowdsec.repo"
+    fi
+
+    remove_path_if_exists "/etc/crowdsec"
+    remove_path_if_exists "/var/lib/crowdsec"
+    remove_path_if_exists "/var/log/crowdsec"
+    remove_path_if_exists "/var/log/crowdsec-firewall-bouncer"
+    remove_path_if_exists "/run/crowdsec"
+
+    reset_crowdsec_state
+    log_info "CrowdSec 清理完成"
+}
+
+cleanup_firewall_module() {
+    log_step "清理 nftables 防火墙..."
+
+    local config
+    config=$(get_state "FIREWALL_NFT_CONFIG" "")
+    if [[ -z "$config" ]]; then
+        # 未记 state 时按发行版惯例兜底（modules/firewall.sh 的路径）
+        if command -v rpm >/dev/null 2>&1; then
+            config="/etc/sysconfig/nftables.conf"
+        else
+            config="/etc/nftables.conf"
+        fi
+    fi
+
+    systemctl disable --now nftables >/dev/null 2>&1 || true
+    nft flush ruleset >/dev/null 2>&1 || true
+
+    remove_path_if_exists "$config"
+    # 清理自动备份：config.bak.<ts>
+    rm -f "${config}.bak."* 2>/dev/null || true
+
+    remove_package_if_possible "nftables"
+
+    reset_firewall_state
+    log_info "nftables 防火墙清理完成"
+    log_info "注：脚本安装时移除的 firewalld/ufw 不会自动恢复，需要请手动安装启用"
 }
 
 cleanup_all_modules() {
@@ -393,6 +455,8 @@ cleanup_all_modules() {
     cleanup_nginx_module
     cleanup_cert_module
     cleanup_warp_module
+    cleanup_crowdsec_module
+    cleanup_firewall_module
     cleanup_unbound_module
     cleanup_system_module
     cleanup_hysteria2_module
