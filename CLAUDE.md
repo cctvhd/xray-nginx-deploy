@@ -66,31 +66,46 @@ Strong success criteria let you loop independently. Weak criteria ("make it work
 
 ---
 
-## 项目当前状态（2026-06-18）
+## 项目定位（2026-09-05 更新）
 
-### 已完成
-- `modules/naive.sh`：Caddyfile 禁 h3（`servers { protocols h1 h2 }`）、证书直引用 letsencrypt、certaccess 组权限、certbot hook 改 reload
-- `modules/nginx.sh`：`generate_cf_realip_conf()` 补 `is_media_ext` + `redirect_to_fake` map；xhttp/gRPC server block webroot 改为 `/var/www/${DOMAIN}`，`if ($from_cf = 0)` 改为 `if ($redirect_to_fake)`；生成时自动 `mkdir` 并复制 `index.html`
-- `modules/xray.sh`：Reality dest 防偷流量（有域名 → nginx 8321，无域名 → dokodemo 4431）；xhttp-reality 防偷流量（dokodemo 4432）
-- `.gitignore`：补充排除 `.claude/` 和 `.understand-anything/`
-- `modules/nginx.sh`：`generate_fake_site()` 改为模板驱动（eu/na-cia/na-la）；Reality dest 8321 webroot 对齐
-- `assets/fake-site-eu.html`：欧洲档案馆主题（lietuva-heritage，无本地媒体引用）
-- `assets/fake-site-na/cia/index.html`：North America CIA 主题（Stillwater）
-- `assets/fake-site-na/la/index.html`：North America LA 主题（California Indigenous Heritage）
-- `assets/download-media.sh`：Baltic/Native American 媒体文件下载脚本（yt-dlp + FMA）
-- `/var/www/Example/North America/cia/cia_index.html` → `index.html`（已重命名）
-- `/var/www/Example/North America/la/la_index.html` → `index.html`（已重命名）
+一键部署 + 多发行版的代理服务器栈。支持 Debian/Ubuntu（apt）与 RHEL 系（dnf：Alma/RHEL/**Fedora**/amzn/ol，靠 `ID_LIKE` 与包管理器分派而非 OS_ID 字面量）。
 
-### 媒体文件策略
-- **不入 git**：mp4 视频（15–70 MB，共 ~133 MB）；Native American mp3（~28 MB）
-- **不入 git**：Baltic mp3 也改用下载脚本，保持仓库轻量
-- 下载入口：`assets/download-media.sh`（需 yt-dlp；默认目标 `/var/www/Example/`）
-- `ltu/` 和 `lu/` HTML 模板仍引用本地短名称文件，需在对应 webroot 目录链接或重命名
+覆盖：Nginx（伪装站/反代/CDN 回源）+ Xray（VLESS-Reality / VLESS-XHTTP / gRPC-CDN）+ Sing-Box（AnyTLS）+ Hysteria2 + NaiveProxy（Caddy-naive）+ Unbound（本地 DNS）+ WARP（wgcf 凭证内嵌出站）+ nftables 防火墙 + CrowdSec + 内核/BBR 优化。附：域名分配级联重建、客户端订阅生成、单组件升级（`--upgrade-<comp>`）、整体卸载。
 
-### 待续任务
-（无未完成的功能性任务）
+## 功能模块总览（modules/*.sh）
 
-### 严格禁止事项
+| 模块 | 作用 |
+|---|---|
+| `install.sh` | 主入口：多级菜单、安装/配置/卸载编排、state 读写 |
+| `system.sh` | 内核/BBR/系统优化 |
+| `nginx.sh` | Nginx 安装 + 全套配置生成（SNI map/servers/伪装 webroot/CF real-ip/8321 dest） |
+| `cert.sh` | Cloudflare DNS + letsencrypt 证书申请、deploy hook |
+| `xray.sh` | Xray 安装 + Reality/XHTTP 等入站配置生成 |
+| `singbox.sh` | Sing-Box 安装 + AnyTLS 配置生成 |
+| `hysteria2.sh` / `naive.sh` | Hysteria2 / NaiveProxy（xcaddy Caddy+forwardproxy） |
+| `unbound.sh` | Unbound 本地 DNS：**纯转发模式**（DoT 上游），配置按真实二进制能力探测 |
+| `firewall.sh` / `crowdsec.sh` | nftables 防火墙 / CrowdSec + bouncer（各自 `_os_family()` ID_LIKE 分派） |
+| `warp.sh` | 旧 cloudflare-warp 清理 + wgcf 按架构下载凭证，Xray/Sing-Box 内嵌 wireguard 出站 |
+| `upgrade.sh` / `sync.sh` / `modules.list` | 单组件版本取数（读本机仓库候选）/ 模块热更新清单 |
+| `uninstall.sh` | 逐组件清理 + 全清；卸载菜单含 CrowdSec 与 nftables 单项 |
+| `security.sh` / `client.sh` | 加固 / 客户端订阅 |
+
+state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读写），保存安装开关、网络栈、域名分配等，是「当前生效配置」的事实来源；各生成 `.conf` 头部带自动生成时间戳。
+
+## 近期变更与回退指引（2026-08 ~ 2026-09，`feature/hysteria2-naive` 已多次合入 main）
+
+- **distro 审计批**：nginx 版本判定只对 Stable 线且读发行版仓库真实候选（c1706f4）；`install_nginx` 补 Fedora 分支（599c354）；codename 优先读 `/etc/os-release` 兜底 lsb_release（cfd65fd）；`load_os_info` 放行 amzn/ol 等 ID_LIKE 衍生系统（500fa32）；sing-box 版本取数改读本机仓库候选、回退 GitHub latest（b40515e）；wgcf 按架构选二进制 + rpm 清理按包管理器分派（a8482c8）。
+- **unbound 能力探测（d22d59a）**：`_unbound_supports <opt> [样例值]` 以真实 `unbound-checkconf` 探测新指令，老包（如 EL8 1.7.x）自动省略 `serve-expired-client-timeout/reply-ttl`、`tls-system-cert`。注意整数型选项探测必须传**整数样例**，默认 `yes` 会误判。
+- **uninstall 补全（301a73c / 73fb20f）**：OS_ID 字面量→包管理器分派；新增 crowdsec/nftables 清理函数与卸载菜单项。
+- **unbound 收窄 + 去定时（1cf593d，2026-09-05，已并入 main@b8b8f09）**：v6 监听从公网通配 `[::]` 收窄为回环 `[::1]`（resolv.conf 走 127.0.0.1、v6 模式走 ::1，均在回环覆盖内）；`install_root_update_job` 改为 `remove_root_update_job`（纯转发模式 root.hints 从不参与解析，移除每月无谓下载+重启的 timer）。
+
+**回退通用步骤**：某次变更出问题 → `git revert <sha>`，再重跑 `install.sh` 对应组件菜单（unbound 用菜单 2「重新配置」或 4「仅刷新域名配置」）即重新生成配置。unbound 活机改动前的配置文件已备份在 `/etc/unbound/unbound.conf.bk.*`（活机本机，不进 git）。活机真实域名/IP/服务快照等敏感运维事实见自动记忆 `live-unbound-2026-09`。
+
+## 媒体/伪装站资产策略（assets/）
+- 伪装站主题模板在 `assets/`（eu 档案馆 / na-cia / na-la），`download-media.sh` 用 yt-dlp 拉媒体。
+- **mp4/mp3 等大媒体不入 git**，部署时在对应 webroot 目录链接或重命名短名称文件。
+
+## 严格禁止事项（绝对铁律）
 - **永远不要** `git add`、`git commit`、`git push` `server-audit/` 目录下的任何文件
 - `server-audit/` 包含服务器敏感审计数据，必须始终保持在 `.gitignore` 中
 - 执行任何 git 操作前，先确认 `server-audit/` 不在暂存区
