@@ -1447,8 +1447,12 @@ load_os_info() {
                 PKG_INSTALL="dnf install -y"
                 ;;
             *)
-                log_error "不支持的系统: $OS_ID"
-                return 1
+                # OS_ID 在 state 里但不在显式白名单时，可能是 detect_os 经
+                # ID_LIKE 认可的衍生系统（amzn/ol 等）。这里不能仅凭 OS_ID
+                # 判断 apt/dnf，交由 detect_os 依 /etc/os-release 权威判定；
+                # 真正陌生的系统会在 detect_os 内 exit 1。
+                load_module system
+                detect_os
                 ;;
         esac
         return
@@ -2809,14 +2813,56 @@ upgrade_apt_candidate() {
         | head -1
 }
 
+upgrade_dnf_candidate() {
+    local pkg="$1"
+    # --cacheonly：只读本地元数据、不触发网络刷新；返回仓库当前可装最高版（不含已装包）
+    timeout 8 dnf -q --cacheonly repoquery --latest-limit 1 "$pkg" 2>/dev/null \
+        | grep -oP '[0-9]+(\.[0-9]+)+' \
+        | head -1
+}
+
+# 按本机包管理器取"实际能装到的最高版本"
+upgrade_repo_candidate() {
+    local pkg="$1"
+    if command -v dnf >/dev/null 2>&1; then
+        upgrade_dnf_candidate "$pkg"
+    elif command -v apt-get >/dev/null 2>&1; then
+        upgrade_apt_candidate "$pkg"
+    fi
+}
+
+# 官方下载页 Stable 段版本（RHEL/dnf、Debian/apt 的 nginx.org 仓库都只发布 stable 线）
+upgrade_nginx_stable() {
+    curl -fsSL --max-time 8 "https://nginx.org/en/download.html" 2>/dev/null \
+        | tr '\n' ' ' \
+        | grep -oP '<h4>Stable version</h4></center>.*?/download/nginx-\K[0-9]+\.[0-9]+\.[0-9]+(?=\.tar\.gz)' \
+        | head -1
+}
+
 upgrade_remote_version() {
     case "$1" in
         nginx)
-            curl -fsSL --max-time 8 "https://nginx.org/en/CHANGES" 2>/dev/null \
-                | grep -m1 'Changes with nginx' \
-                | grep -oP '[0-9]+\.[0-9]+\.[0-9]+'
+            # nginx 有 mainline（开发线，奇号段）与 stable（稳定线，偶号段）两条版本线。
+            # 本脚本安装/升级一律走官方 stable 仓库（modules/nginx.sh，mainline 仓库禁用），
+            # 故"最新"只认 stable：
+            #   · 仓库安装 → 读本机仓库真实候选（apt/dnf），避开官方公布→仓库打包的滞后窗口；
+            #   · 读不到候选（未安装 / 编译安装）→ 退回官方下载页 Stable 段。
+            # 若像旧逻辑那样取 CHANGES 顶部的 mainline，会与 stable 已装版本恒不相等，
+            # 造成常年误报"可升级"而升级动作实际升不动。
+            if [[ "$(nginx_install_method)" == "pkg" ]]; then
+                local cand
+                cand=$(upgrade_repo_candidate nginx)
+                [[ -n "$cand" ]] && { echo "$cand"; return; }
+            fi
+            upgrade_nginx_stable
             ;;
         singbox)
+            # sing-box 由官方 sagernet 仓库安装（modules/singbox.sh，apt/dnf），
+            # 与 nginx 同理："最新"认本机仓库候选，避开 GitHub release→仓库打包的滞后窗口；
+            # 读不到候选（仓库未加/未装）→ 退回 GitHub latest。
+            local cand
+            cand=$(upgrade_repo_candidate sing-box)
+            [[ -n "$cand" ]] && { echo "$cand"; return; }
             upgrade_github_latest SagerNet/sing-box
             ;;
         xray)      upgrade_github_latest XTLS/Xray-core ;;
@@ -3298,14 +3344,24 @@ show_upgrade_status() {
     fi
 }
 
+# 点分版本数值比较：$1 >= $2 返回 0（sort -V 语义）
+# 例如 mainline 已装 1.31.1 与 stable 目标 1.30.4 比较 → 1.31.1 >= 1.30.4 为真
+ver_ge() {
+    [[ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | tail -n1)" == "$1" ]]
+}
+
 upgrade_status_label() {
     local current="$1" remote="$2"
     if [[ -z "$remote" ]]; then
         echo "远程未知"
     elif [[ -z "$current" ]]; then
         echo "未安装"
-    elif [[ "$current" == "$remote" ]]; then
-        echo "已最新"
+    elif ver_ge "$current" "$remote"; then
+        if [[ "$current" == "$remote" ]]; then
+            echo "已最新"
+        else
+            echo "无需升级"   # 已装版本高于通道目标（如 mainline 高于 stable），无可升级对象
+        fi
     else
         echo "可升级"
     fi
@@ -3379,7 +3435,7 @@ do_upgrade_menu() {
             for c in nginx xray singbox hysteria2 naive; do
                 cur=$(upgrade_command_version "$c")
                 rem="${UPGRADE_REMOTE_VERSIONS[$c]:-}"
-                if [[ -n "$rem" && -n "$cur" && "$cur" != "$rem" ]]; then
+                if [[ -n "$rem" && -n "$cur" ]] && ! ver_ge "$cur" "$rem"; then
                     pending+=("$c")
                 fi
             done
@@ -3405,9 +3461,9 @@ do_upgrade_menu() {
         local current remote
         current=$(upgrade_command_version "$component")
         remote="${UPGRADE_REMOTE_VERSIONS[$component]:-}"
-        if [[ -n "$remote" && -n "$current" && "$current" == "$remote" ]]; then
+        if [[ -n "$remote" && -n "$current" ]] && ver_ge "$current" "$remote"; then
             local force
-            read -rp "  ${component} 已是最新（${current}），强制重装？[y/N]: " force
+            read -rp "  ${component} 已是可用的最新（当前 ${current} ≥ 最新 ${remote}），强制重装？[y/N]: " force
             if [[ "${force,,}" != "y" ]]; then
                 read -rp "按回车继续..." _
                 continue
@@ -3433,6 +3489,8 @@ do_uninstall_menu() {
     echo "  8. 清理 NaiveProxy"
     echo "  9. 清理 Cloudflare WARP"
     echo "  10. 清理全部"
+    echo "  11. 清理 CrowdSec"
+    echo "  12. 清理 nftables 防火墙"
     echo "  q. 返回主菜单"
     echo ""
     read -rp "  请选择: " cleanup_choice
@@ -3459,6 +3517,8 @@ do_uninstall_menu() {
             rm -f "$STATE_FILE"
             init_state
             ;;
+       11) cleanup_crowdsec_module ;;
+       12) cleanup_firewall_module ;;
         q|Q)
             ;;
         *)

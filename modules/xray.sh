@@ -833,6 +833,9 @@ ${_dokodemo_xhttp_routing}
                     "idle_timeout":          60,
                     "health_check_timeout":  20,
                     "permit_without_stream": false
+                },
+                "sockopt": {
+                    "trustedXForwardedFor": ["127.0.0.1", "::1"]
                 }
             },
             "sniffing": {
