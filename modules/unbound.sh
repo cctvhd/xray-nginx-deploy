@@ -323,9 +323,12 @@ generate_main_config() {
     [[ $mem_gb -ge 8 ]] && msg_cache="512m" && rrset_cache="1024m"
 
     local do_ip6="yes"
-    local iface_ipv6="    interface: ::"
+    local iface_ipv6="    interface: ::1"
     local unbound_prefer_ip6
-    [[ "$(get_stack_mode)" == "ipv4" ]] && do_ip6="no" && iface_ipv6="    # interface: ::  # IPv4-only"
+    [[ "$(get_stack_mode)" == "ipv4" ]] && do_ip6="no" && iface_ipv6="    # interface: ::1  # IPv4-only"
+    # 注：只绑回环 ::1，不绑公网 v6（:: 通配）。访问控制本只放行回环，
+    # 绑 :: 只会把 :53 暴露到公网 v6 纯当攻击面；resolv.conf 用 127.0.0.1，
+    # v6 模式 resolv 走 ::1，二者都在回环覆盖内。
     if is_ipv6_preferred 2>/dev/null; then
         unbound_prefer_ip6="yes"
     else
@@ -517,132 +520,25 @@ init_unbound_control() {
     log_info "remote-control 已写入主配置"
 }
 
-# ── root.hints 自动更新脚本 + 定时任务 ──────────────────────
-install_root_update_job() {
-    log_step "安装 root.hints 自动更新脚本..."
+# ── 历史 root.hints 自动更新任务清理 ─────────────────────────
+# 部署为纯转发模式（forward-zone "."），root.hints 从不参与解析，
+# 无需每月更新；本函数改为清理旧版脚本曾安装的定时任务残留，
+# 避免每月无谓地下载+校验+重启一次 unbound。
+remove_root_update_job() {
+    log_step "清理历史 root.hints 自动更新任务..."
 
-    cat > /usr/local/bin/update-root-hints.sh << 'UPDATE_EOF'
-#!/usr/bin/env bash
-# 自动更新 Unbound root.hints 并重启服务
-set -euo pipefail
+    systemctl disable --now unbound-root-update.timer   2>/dev/null || true
+    systemctl disable --now unbound-root-update.service 2>/dev/null || true
+    rm -f /usr/local/bin/update-root-hints.sh
+    rm -f /etc/cron.weekly/update-root-hints
+    rm -f /etc/systemd/system/unbound-root-update.service
+    rm -f /etc/systemd/system/unbound-root-update.timer
+    rm -f /var/log/unbound-root-update.log
+    rm -rf /var/lib/unbound/root-hints-backup
+    rm -f  /var/lib/unbound/root-update.timestamp
+    systemctl daemon-reload 2>/dev/null || true
 
-ROOT_HINTS_URL="https://www.internic.net/domain/named.root"
-DEST_FILE="/etc/unbound/root.hints"
-ROOT_KEY_FILE="/var/lib/unbound/root.key"
-BACKUP_DIR="/var/lib/unbound/root-hints-backup"
-MAX_BACKUPS=1
-MAX_RETRIES=3
-LOG_FILE="/var/log/unbound-root-update.log"
-MIN_ROOT_HINTS_SIZE=3000
-TIMESTAMP_FILE="/var/lib/unbound/root-update.timestamp"
-
-_info()  { echo -e "\033[1;32m[INFO]\033[0m $*"; }
-_warn()  { echo -e "\033[1;33m[WARN]\033[0m $*"; }
-_error() { echo -e "\033[1;31m[ERR]\033[0m  $*"; }
-
-exec > >(tee -a "$LOG_FILE") 2>&1
-echo "===== $(date '+%Y-%m-%d %H:%M:%S') 开始更新 ====="
-
-[[ $EUID -ne 0 ]] && { _error "请使用 root 用户运行"; exit 1; }
-
-mkdir -p /etc/unbound /var/lib/unbound "$BACKUP_DIR"
-
-# ── 初始化 root.key（文件不存在或为空时）───────────────────
-if [[ ! -f "$ROOT_KEY_FILE" || ! -s "$ROOT_KEY_FILE" ]]; then
-    _info "生成 root.key..."
-    unbound-anchor -a "$ROOT_KEY_FILE" 2>/dev/null || true
-    chown unbound:unbound "$ROOT_KEY_FILE" 2>/dev/null || true
-fi
-
-# ── 备份旧 root.hints ────────────────────────────────────────
-TS=$(date +"%Y%m%d-%H%M%S")
-if [[ -f "$DEST_FILE" ]]; then
-    cp "$DEST_FILE" "${BACKUP_DIR}/root.hints.${TS}"
-    _info "已备份到 ${BACKUP_DIR}/root.hints.${TS}"
-    ls -1t "${BACKUP_DIR}"/root.hints.* 2>/dev/null \
-        | tail -n +$((MAX_BACKUPS + 1)) \
-        | xargs -r rm -f
-fi
-
-# ── 下载最新 root.hints ──────────────────────────────────────
-_info "下载最新 root.hints..."
-downloaded=0
-for i in $(seq 1 $MAX_RETRIES); do
-    if curl -fsSL "$ROOT_HINTS_URL" -o "${DEST_FILE}.new"; then
-        mv "${DEST_FILE}.new" "$DEST_FILE"
-        chown unbound:unbound "$DEST_FILE" 2>/dev/null || true
-        chmod 644 "$DEST_FILE"
-        echo "$(date '+%Y-%m-%d %H:%M:%S')" > "$TIMESTAMP_FILE"
-        _info "下载成功，已更新 root.hints"
-        downloaded=1
-        break
-    else
-        _warn "下载失败，第 $i 次尝试..."
-        sleep 2
-    fi
-done
-
-if [[ $downloaded -eq 0 ]]; then
-    _error "多次下载失败，保留旧版本"
-    [[ -f "${BACKUP_DIR}/root.hints.${TS}" ]] && \
-        cp "${BACKUP_DIR}/root.hints.${TS}" "$DEST_FILE"
-    exit 1
-fi
-
-# ── 校验配置 ─────────────────────────────────────────────────
-if unbound-checkconf >/dev/null 2>&1; then
-    _info "Unbound 配置校验通过"
-else
-    _error "Unbound 配置错误，恢复旧版本..."
-    [[ -f "${BACKUP_DIR}/root.hints.${TS}" ]] && \
-        cp "${BACKUP_DIR}/root.hints.${TS}" "$DEST_FILE"
-    exit 1
-fi
-
-# ── 重启服务 ─────────────────────────────────────────────────
-_info "重启 unbound 服务..."
-systemctl restart unbound
-sleep 2
-if systemctl is-active --quiet unbound; then
-    _info "✅ Unbound 重启成功，root.hints 更新完成"
-else
-    _error "Unbound 重启失败"
-    exit 1
-fi
-UPDATE_EOF
-
-    chmod +x /usr/local/bin/update-root-hints.sh
-
-    cat > /etc/systemd/system/unbound-root-update.service << 'SVC_EOF'
-[Unit]
-Description=Update Unbound root.hints
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/bin/update-root-hints.sh
-StandardOutput=journal
-StandardError=journal
-SVC_EOF
-
-    cat > /etc/systemd/system/unbound-root-update.timer << 'TIMER_EOF'
-[Unit]
-Description=Monthly Unbound root.hints update
-Requires=unbound-root-update.service
-
-[Timer]
-OnCalendar=monthly
-RandomizedDelaySec=3600
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-TIMER_EOF
-
-    systemctl daemon-reload
-    systemctl enable --now unbound-root-update.timer
-    log_info "定时任务已启用（每月自动更新 root.hints）"
+    log_info "历史 root.hints 定时任务已清理（转发模式用不到）"
 }
 
 start_unbound() {
@@ -732,7 +628,7 @@ run_unbound() {
                 init_unbound_control
                 start_unbound
 	trap - EXIT
-                install_root_update_job
+                remove_root_update_job
                 ;;
             2)
                 collect_unbound_stack_mode
@@ -748,7 +644,7 @@ run_unbound() {
                 if systemctl is-active --quiet unbound; then
                     setup_resolv_conf
                     verify_unbound
-                    install_root_update_job
+                    remove_root_update_job
                 else
                     log_error "Unbound 重启失败"
                     journalctl -u unbound -n 20 --no-pager
@@ -769,10 +665,10 @@ run_unbound() {
         generate_unbound_config
         init_unbound_control
         start_unbound
-        install_root_update_job
+        remove_root_update_job
     fi
 
     log_info "========== Unbound 安装配置完成 =========="
-    log_info "本地递归 DNS   : 127.0.0.1:53"
-    log_info "root.hints 更新: 每月自动执行（systemd timer）"
+    log_info "本地 DNS        : 127.0.0.1:53（转发上游，不递归）"
+    log_info "root.hints      : 静态（转发模式无需定时更新）"
 }
