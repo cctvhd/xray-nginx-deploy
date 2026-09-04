@@ -22,22 +22,21 @@ cleanup_old_warp() {
     systemctl stop    warp-svc >/dev/null 2>&1 || true
     systemctl disable warp-svc >/dev/null 2>&1 || true
 
-    case "${OS_ID}" in
-        ubuntu|debian)
-            apt-get remove -y --purge cloudflare-warp >/dev/null 2>&1 || true
-            apt-get autoremove -y >/dev/null 2>&1 || true
-            rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
-            rm -f /etc/apt/sources.list.d/cloudflare-client.list
-            ;;
-        centos|rhel|rocky|almalinux)
-            if command -v dnf &>/dev/null; then
-                dnf remove -y cloudflare-warp >/dev/null 2>&1 || true
-            else
-                yum remove -y cloudflare-warp >/dev/null 2>&1 || true
-            fi
-            rm -f /etc/yum.repos.d/cloudflare-warp.repo
-            ;;
-    esac
+    # 按包管理器分派，不依赖 OS_ID 字面量：fedora/amzn/ol 等 RHEL 系
+    # ID_LIKE 衍生系统也能命中 rpm 清理，避免漏分支。
+    if command -v apt-get >/dev/null 2>&1; then
+        apt-get remove -y --purge cloudflare-warp >/dev/null 2>&1 || true
+        apt-get autoremove -y >/dev/null 2>&1 || true
+        rm -f /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+        rm -f /etc/apt/sources.list.d/cloudflare-client.list
+    else
+        if command -v dnf &>/dev/null; then
+            dnf remove -y cloudflare-warp >/dev/null 2>&1 || true
+        else
+            yum remove -y cloudflare-warp >/dev/null 2>&1 || true
+        fi
+        rm -f /etc/yum.repos.d/cloudflare-warp.repo
+    fi
 
     rm -rf /var/lib/cloudflare-warp
     rm -f  /usr/bin/warp-cli /usr/bin/warp-taskbar
@@ -54,15 +53,32 @@ install_wgcf() {
 
     log_step "下载 wgcf 最新版本..."
 
-    local download_url
+    # wgcf 官方 release 按架构分发型裸二进制（linux_amd64/arm64/armv5-7/386/s390x）。
+    # 此前硬编码 linux_amd64：ARM 等架构会装到 x86 版或匹配为空而失败。
+    local arch wgcf_arch download_url
+    arch=$(uname -m)
+    case "$arch" in
+        x86_64|amd64)            wgcf_arch="linux_amd64" ;;
+        aarch64|arm64)           wgcf_arch="linux_arm64" ;;
+        armv7l|armv7)            wgcf_arch="linux_armv7" ;;
+        armv6l|armv6)            wgcf_arch="linux_armv6" ;;
+        armv5tel|armv5te|armv5l) wgcf_arch="linux_armv5" ;;
+        i686|i386|x86)           wgcf_arch="linux_386" ;;
+        s390x)                   wgcf_arch="linux_s390x" ;;
+        *)
+            log_error "不支持的架构: ${arch}（wgcf 无对应 Linux 二进制）"
+            exit 1
+            ;;
+    esac
+
     download_url=$(curl -fsSL \
         https://api.github.com/repos/ViRb3/wgcf/releases/latest \
         | grep browser_download_url \
         | cut -d '"' -f 4 \
-        | grep 'linux_amd64$')
+        | grep "${wgcf_arch}$")
 
     if [[ -z "${download_url}" ]]; then
-        log_error "无法获取 wgcf 下载地址，请检查网络或 GitHub API 限速"
+        log_error "无法获取 wgcf(${wgcf_arch}) 下载地址，请检查网络或 GitHub API 限速"
         exit 1
     fi
 
