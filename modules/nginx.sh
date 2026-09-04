@@ -14,8 +14,12 @@ install_nginx() {
                 curl -fsSL https://nginx.org/keys/nginx_signing.key | \
                     gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg
 
+                # 优先读 /etc/os-release 的 VERSION_CODENAME：
+                # lsb_release 依赖 lsb-release 包，精简系统常未安装，
+                # 而 Debian/Ubuntu 的 VERSION_CODENAME 即 nginx.org 仓库 codename
                 local codename
-                codename=$(lsb_release -cs)
+                codename=$(grep "^VERSION_CODENAME=" /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')
+                [[ -z "${codename}" ]] && codename=$(lsb_release -cs 2>/dev/null)
                 echo "deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] \
 http://nginx.org/packages/${OS_ID} ${codename} nginx" \
                     > /etc/apt/sources.list.d/nginx.list
