@@ -60,6 +60,14 @@ REPO
 
             dnf install -y nginx >/dev/null 2>&1
             ;;
+
+        fedora)
+            # nginx.org 不发布 Fedora 软件包（仅有 centos/debian/ubuntu 等源），
+            # Fedora 走发行版自带 nginx；其仓库候选版本由 install.sh 的
+            # upgrade_repo_candidate(dnf) 读取，与安装通道一致。
+            log_info "Fedora 使用发行版仓库安装 nginx（nginx.org 无 Fedora 源）"
+            dnf install -y nginx >/dev/null 2>&1
+            ;;
     esac
 
     if ! command -v nginx &>/dev/null; then
