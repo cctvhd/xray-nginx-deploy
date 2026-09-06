@@ -203,16 +203,38 @@ generate_fake_site() {
 
             local _subdir="" _dom_bn="${dir##*/}"
             _dom_bn="${_dom_bn,,}"
-            local _di _pd
-            # 域名关键词 → 专属主题：webroot 目录名(即站点域名)包含主题目录名即命中，
-            # 如 shoes ← la.shoes-bv.tk；同族域名共享同一专属主题。专属主题不进 slot 轮换池。
+            local _di _pd _pdl _want _excluded=""
+            # 专属主题 = 精确绑定单个域名，不再「域名含目录名即套同款」：
+            #   · 主题目录名 == 整域名（如 fake-site-na/lax.shoes-bv.tk/）→ 1:1 命中
+            #   · 主题目录内 .domain 数据文件内容 == 域名 → 命中（既有关键词式主题钉扎旗舰，
+            #     如 shoes/.domain=la.shoes-bv.tk；同族其余域名不再复制它）
+            #   · 裸子串关键词不再生效；未命中的专属主题不进 slot 轮换池
             for (( _di = _n_generic; _di < ${#_na_dirs[@]}; _di++ )); do
                 _pd="${_na_dirs[$_di]}"
-                if [[ "$_dom_bn" == *"$_pd"* ]] && \
-                   { [[ -z "$_subdir" ]] || [[ "${#_pd}" -gt "${#_subdir}" ]]; }; then
-                    _subdir="$_pd"
+                _pdl="${_pd,,}"
+                if [[ "$_pdl" == "$_dom_bn" ]]; then
+                    _subdir="$_pd"                      # 整域名主题：1:1 且名称最长，天然优先
+                    continue
+                fi
+                # 注意：$(<file) 只在无附加重定向时才是 bash 读文件特例；
+                # 附 2>/dev/null 会退化为「空命令 + 重定向」→ 读不到内容，故用 -f 先行判断
+                _want=""
+                if [[ -f "${_na_base}/${_pd}/.domain" ]]; then
+                    _want="$(<"${_na_base}/${_pd}/.domain")"
+                fi
+                _want="${_want%%$'\r'}"
+                if [[ -n "$_want" && "$_want" == "$_dom_bn" ]]; then
+                    if [[ -z "$_subdir" ]] || [[ "${#_pd}" -gt "${#_subdir}" ]]; then
+                        _subdir="$_pd"
+                    fi
+                elif [[ "$_dom_bn" == *"$_pdl"* ]]; then
+                    # 该域含此关键词但主题已钉扎别域/无钉扎 → 记入排除名单供引导
+                    _excluded="${_excluded:+$_excluded }$_pd"
                 fi
             done
+            if [[ -z "$_subdir" && -n "$_excluded" ]]; then
+                log_warn "专属主题 <${_excluded}> 已固定给其它域名；${_dom_bn} 若需独立外观，请新增预置主题 assets/fake-site-na/${_dom_bn}/index.html"
+            fi
             # 未命中专属主题 → 仅从通用主题按 slot 轮换，保证同域名外观稳定
             if [[ -z "$_subdir" ]]; then
                 local _pool_n=${#_na_dirs[@]}
