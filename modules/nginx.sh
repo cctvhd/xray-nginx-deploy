@@ -195,7 +195,30 @@ generate_fake_site() {
         fi
 
         if [[ ${#_na_dirs[@]} -gt 0 ]]; then
-            local _subdir="${_na_dirs[$(( _slot % ${#_na_dirs[@]} ))]}"
+            # _na_dirs 前段 = 存在的通用主题(slot 池)；其余为「专属主题」池
+            local _n_generic=0 _gn
+            for _gn in "${_known_order[@]}"; do
+                [[ -f "${_na_base}/${_gn}/index.html" ]] && _n_generic=$(( _n_generic + 1 ))
+            done
+
+            local _subdir="" _dom_bn="${dir##*/}"
+            _dom_bn="${_dom_bn,,}"
+            local _di _pd
+            # 域名关键词 → 专属主题：webroot 目录名(即站点域名)包含主题目录名即命中，
+            # 如 shoes ← la.shoes-bv.tk；同族域名共享同一专属主题。专属主题不进 slot 轮换池。
+            for (( _di = _n_generic; _di < ${#_na_dirs[@]}; _di++ )); do
+                _pd="${_na_dirs[$_di]}"
+                if [[ "$_dom_bn" == *"$_pd"* ]] && \
+                   { [[ -z "$_subdir" ]] || [[ "${#_pd}" -gt "${#_subdir}" ]]; }; then
+                    _subdir="$_pd"
+                fi
+            done
+            # 未命中专属主题 → 仅从通用主题按 slot 轮换，保证同域名外观稳定
+            if [[ -z "$_subdir" ]]; then
+                local _pool_n=${#_na_dirs[@]}
+                [[ $_n_generic -gt 0 ]] && _pool_n=$_n_generic
+                _subdir="${_na_dirs[$(( _slot % _pool_n ))]}"
+            fi
             for _f in \
                 "${_assets}/fake-site-na/${_subdir}/index.html" \
                 "${_assets_installed}/fake-site-na/${_subdir}/index.html"; do
