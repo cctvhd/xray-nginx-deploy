@@ -2205,17 +2205,31 @@ _cf_self_ipv4() {
         || hostname -I 2>/dev/null | awk '{print $1}'
 }
 
+# ── 本机公网 IPv6（best-effort；无 v6 路由则回退本机全局地址，均可空）───
+_cf_self_ipv6() {
+    curl -fsSL -6 --connect-timeout 3 --max-time 4 https://api.ipify.org 2>/dev/null \
+        || curl -fsSL -6 --connect-timeout 3 --max-time 4 https://ip.sb 2>/dev/null \
+        || { ip -o -6 addr show scope global 2>/dev/null | awk '{print $4; exit}' | cut -d/ -f1; }
+}
+
 # ── CF 线上域名盘点（只读，best-effort）─────────────────────
-# 枚举各去重 token 的 zones + A/AAAA 子记录，对照本地注册表分组打印
-# 已登记 / 未登记；未登记项标注 proxied(CDN代理) / 灰云直指本机(可作空闲
-# 直连域候选) / 指向他处。纯只读：不改 state、不读 stdin、恒返回 0；网络/
-# 权限失败一律降级 log_warn 并 continue，绝不影响 refresh 修复/级联路径。
+# 枚举各去重 token 的 zones + A/AAAA 子记录，把**未登记**域按可用性分类写入
+# 模块级缓冲 _CF_*（不打印清单——展示由 print_domain_protocol_overview 统一负责）。
+# 已登记 = DOMAIN_REGISTRY + 各槽位非空标量；已登记项只计 _found_reg 防误报。
+# 分类：proxied 且指向本机 → CDN 域候选；灰云且指向本机 → 直连/Reality 自建候选
+#      （v4/v6 都算"本机"，修复旧版仅比 IPv4 致自指 AAAA 误报他处的 bug）；
+#       其余 → 他处/托管（不可用）。纯只读：不改 state、不读 stdin、恒返回 0；
+#       网络/权限失败一律降级 log_warn 并 continue，绝不影响 refresh 修复/级联。
 # 注：本函数是 refresh_domain_assignments 的首个网络调用，逐调用超时封顶。
 # JSON 解析为 grep-only（repo 无 jq），字段序已按活体响应锁定；若 CF 变更
-# 字段序只会退化为空/部分清单，不会崩溃。AAAA 记录仅比对 IPv4（curl -4），
-# 指向本机 v6 的记录会落入"指向 <content>（他处/未用）"分支，属预期。
+# 字段序只会退化为空/部分清单，不会崩溃。
+_CF_SPARE_GREY=()      # 未登记 · 灰云直指本机 → 直连/Reality 自建域候选
+_CF_SPARE_PROXIED=()   # 未登记 · CDN代理指向本机 → CDN 域候选
+_CF_OTHER_UNREG=()     # 其它未登记（指向他处 / Worker 托管等，不可自动用）
+_CF_SCAN_OK=0          # 1 = 本次盘点实际读到 ≥1 个 zone（区分"扫过但无未登记"与"没扫"）
 scan_cf_domain_inventory() {
     (( ${CF_SCAN_OFF:-0} )) && return 0
+    _CF_SPARE_GREY=(); _CF_SPARE_PROXIED=(); _CF_OTHER_UNREG=(); _CF_SCAN_OK=0
 
     # ── 去重枚举账号（按 token 值，首个文件 basename 作显示名，永不打印 token）
     local -a _acct_tokens=() _acct_labels=()
@@ -2230,8 +2244,6 @@ scan_cf_domain_inventory() {
         fi
     done
 
-    echo ""
-    log_info "Cloudflare 线上域名盘点（只读）："
     if (( ${#_acct_tokens[@]} == 0 )); then
         log_info "  未配置 Cloudflare 账号，跳过自动盘点"
         return 0
@@ -2245,14 +2257,12 @@ scan_cf_domain_inventory() {
         [[ -n "${!_slot:-}" ]] && _known+=" ${!_slot} "
     done
     local _self_ip
-    _self_ip=$(_cf_self_ipv4)
+    _self_ip="$(_cf_self_ipv4) $(_cf_self_ipv6)"
 
     local i p rc body _tp _tmp _line _zn _zid _name _ty _ct _px _reg
     for i in "${!_acct_tokens[@]}"; do
         local _tok="${_acct_tokens[$i]}" _label="${_acct_labels[$i]}"
         local -a _zone_ids=() _zone_names=()
-        echo ""
-        log_info "  账号: ${_label}"
         _reg=0
 
         # ── zones（分页 ≤2 防御；实际各 token 通常 1-2 个 zone）
@@ -2293,8 +2303,6 @@ scan_cf_domain_inventory() {
             local _zid2="${_zone_ids[$z]}" _zn2="${_zone_names[$z]}"
             local -a _u_name=() _u_content=() _u_proxied=()
             local u _found_reg=0 _name_shown=" "
-            echo ""
-            log_info "    Zone: ${_zn2}"
             p=1; _tp=1; rc=0; body=""
             while (( p <= 3 )); do
                 body=$(_cf_api_get "$_tok" "zones/${_zid2}/dns_records?per_page=100&page=${p}") || rc=$?
@@ -2321,16 +2329,7 @@ scan_cf_domain_inventory() {
                     [[ " ${_name_shown} " == *" ${_name} "* ]] && continue
                     _name_shown+="${_name} "
                     if [[ " ${_known} " == *" ${_name} "* ]]; then
-                        local _sfx _md _pr
-                        _sfx=$(echo "$_name" | tr '.' '_')
-                        _md=$(get_state "DOMAIN_MODE_${_sfx}" "")
-                        _pr=$(get_state "DOMAIN_PROTO_${_sfx}" "")
-                        if [[ -n "$_pr" ]]; then
-                            printf "  %-30s 已登记 [%s / %s]\n" "$_name" "$_md" "$_pr"
-                        else
-                            printf "  %-30s 已登记\n" "$_name"
-                        fi
-                        _found_reg=1
+                        _found_reg=1   # 已登记：仅计防误报，清单由协议一览统一展示
                     else
                         _u_name+=("$_name"); _u_content+=("$_ct"); _u_proxied+=("$_px")
                     fi
@@ -2339,14 +2338,17 @@ scan_cf_domain_inventory() {
                 (( p++ ))
             done
             [[ "$_zid2" == "skip" ]] && continue
-            # 未登记组（已登记行之后统一列出）
+            _CF_SCAN_OK=1   # 读到 ≥1 个 zone 且未跳过
+            # 未登记组按可用性进全局缓冲（v4/v6 指向本机均算，展示在协议一览）
             for u in "${!_u_name[@]}"; do
-                if [[ "${_u_proxied[$u]}" == "true" ]]; then
-                    printf "  %-30s 未登记 · CDN代理（橙云）\n" "${_u_name[$u]}"
-                elif [[ -n "$_self_ip" && "${_u_proxied[$u]}" == "false" && "${_u_content[$u]}" == "$_self_ip" ]]; then
-                    printf "  %-30s 未登记 · 灰云直指本机，可作空闲直连域候选\n" "${_u_name[$u]}"
+                if [[ -n "$_self_ip" && " ${_self_ip} " == *" ${_u_content[$u]} "* ]]; then
+                    if [[ "${_u_proxied[$u]}" == "true" ]]; then
+                        _CF_SPARE_PROXIED+=("${_u_name[$u]}")
+                    else
+                        _CF_SPARE_GREY+=("${_u_name[$u]}")
+                    fi
                 else
-                    printf "  %-30s 未登记 · 指向 %s（他处/未用）\n" "${_u_name[$u]}" "${_u_content[$u]}"
+                    _CF_OTHER_UNREG+=("${_u_name[$u]}")
                 fi
             done
             # 该 zone 存在但 A/AAAA 一条都没解析到 → 响应结构可能变化
@@ -2356,6 +2358,189 @@ scan_cf_domain_inventory() {
         done
     done
     return 0
+}
+
+# ── 协议 ↔ 域名 一览（纯本地，不碰网络）────────────────────
+# 用户一屏看清三问：①哪个域分给哪个协议 ②剩下多少个空闲未分配 ③哪些协议没域。
+# 7 槽位读 state 标量；空槽里 Reality 两槽若仍在借公共 SNI（REALITY_SNI/
+# XHTTP_REALITY_SNI 非空）算"缺口"——协议在跑，补域=切自建，可自动无痛。
+# 空闲/其它未登记清单读 scan_cf_domain_inventory 填好的 _CF_* 模块级缓冲。
+print_domain_protocol_overview() {
+    echo ""
+    log_info "协议 ↔ 域名 一览："
+    printf "  %-16s %-30s %s\n" "协议槽位" "域名 / 当前 SNI" "备注"
+    printf "  %-16s %-30s %s\n" "────────────────" "──────────────────────────────" "────────────"
+
+    local -a _rows=(
+        "VLESS-XHTTP|XHTTP_DOMAIN|"
+        "gRPC-CDN|GRPC_DOMAIN|"
+        "VLESS-Reality|REALITY_DOMAIN|REALITY_SNI"
+        "XHTTP-Reality|XHTTP_REALITY_DOMAIN|XHTTP_REALITY_SNI"
+        "AnyTLS|ANYTLS_DOMAIN|"
+        "Hysteria2|HYSTERIA2_DOMAIN|"
+        "NaiveProxy|NAIVE_DOMAIN|"
+    )
+    # 域 → 被多少槽位占用（同域多槽共用时标注）
+    local -A _usage=()
+    local _r _v _d
+    for _r in "${_rows[@]}"; do
+        _v="${_r#*|}"; _v="${_v%%|*}"
+        _d=$(get_state "$_v" "")
+        [[ -n "$_d" ]] && _usage[$_d]=$(( ${_usage[$_d]:-0} + 1 ))
+    done
+
+    local -a _gap=() _unconf=()
+    local _label _rest _var _snk _sni _note
+    for _r in "${_rows[@]}"; do
+        _label="${_r%%|*}"; _rest="${_r#*|}"
+        _var="${_rest%%|*}"; _snk="${_rest#*|}"
+        _d=$(get_state "$_var" "")
+        if [[ -n "$_d" ]]; then
+            _note="✓"
+            (( ${_usage[$_d]:-0} > 1 )) && _note="✓ 共用"
+            printf "  %-16s %-30s %s\n" "$_label" "$_d" "$_note"
+        else
+            _sni=""
+            [[ -n "$_snk" ]] && _sni=$(get_state "$_snk" "")
+            if [[ -n "$_sni" ]]; then
+                printf "  %-16s %-30s %s\n" "$_label" "(借公共 SNI: ${_sni})" "⚠ 缺口 · 缺自建域"
+                _gap+=("$_label")
+            else
+                printf "  %-16s %-30s %s\n" "$_label" "(未配置)" "—"
+                _unconf+=("$_label")
+            fi
+        fi
+    done
+
+    # 注册表里已登记却未挂任何协议标签的域
+    local _reg _sfx _protos _domain
+    _reg=$(get_state "DOMAIN_REGISTRY" "")
+    local -a _orphan=()
+    for _domain in $_reg; do
+        _sfx=$(echo "$_domain" | tr '.' '_')
+        _protos=$(get_state "DOMAIN_PROTO_${_sfx}" "")
+        [[ -z "$_protos" ]] && _orphan+=("$_domain")
+    done
+    if (( ${#_orphan[@]} > 0 )); then
+        echo ""
+        log_warn "已注册但未挂任何协议：${_orphan[*]}（不占协议槽，需手动分配）"
+    fi
+
+    # 汇总三问之二/三
+    echo ""
+    log_info "未分配协议（缺口）：${#_gap[@]} 个"
+    if (( ${#_gap[@]} > 0 )); then
+        printf "  %s\n" "${_gap[@]/#/·  }"
+    fi
+    log_info "未分配空闲域名：$(( ${#_CF_SPARE_GREY[@]} + ${#_CF_SPARE_PROXIED[@]} )) 个"
+    if (( ${#_CF_SPARE_GREY[@]} > 0 )); then
+        printf "    灰云直指本机（可作直连 / Reality 自建）：%s\n" "${_CF_SPARE_GREY[*]}"
+    fi
+    if (( ${#_CF_SPARE_PROXIED[@]} > 0 )); then
+        printf "    CDN 代理指向本机（可作 CDN 域）：%s\n" "${_CF_SPARE_PROXIED[*]}"
+    fi
+    if (( ${#_CF_OTHER_UNREG[@]} > 0 )); then
+        echo ""
+        log_warn "CF 上其它未登记记录（指向他处 / Worker 托管等，不可自动用）：${_CF_OTHER_UNREG[*]}"
+    fi
+    if (( ${#_CF_SPARE_GREY[@]} == 0 && ${#_CF_SPARE_PROXIED[@]} == 0 && ${#_CF_OTHER_UNREG[@]} == 0 )); then
+        if (( _CF_SCAN_OK )); then
+            echo ""
+            log_info "CF 盘点：未发现未登记 / 空闲域名（账号内记录已全部入册）"
+        fi
+    fi
+    # 未配置的协议槽（无域也无借 SNI）——非"缺域"，需走各自配置菜单
+    if (( ${#_unconf[@]} > 0 )); then
+        echo ""
+        log_warn "以下协议尚未配置（无域名也无借公共 SNI）：${_unconf[*]}——请走其配置菜单"
+    fi
+}
+
+# ── 空闲直连域自动补 Reality 自建缺口（预览 + y/N 确认）────────
+# 仅当某 Reality 槽仍借公共 SNI（协议在跑）且 CF 有空闲灰云直连域时才弹 y/N。
+# 确认后经 reality_tag_self_domain()（xray 模块，按需 load）注册 + 切自建；
+# state 变化由 refresh 尾部的槽位 diff 抓到 → 触发既有级联（Xray/nginx/订阅）。
+# 惰性的旧公共 REALITY_SERVER_NAMES/DEST/SNI 保留：自建模式生成器不读，回公共即复用。
+offer_reality_auto_assign() {
+    local _vless_gap=0 _xhttp_gap=0
+    [[ -z "$(get_state "REALITY_DOMAIN" "")" && -n "$(get_state "REALITY_SNI" "")" ]] && _vless_gap=1
+    [[ -z "$(get_state "XHTTP_REALITY_DOMAIN" "")" && -n "$(get_state "XHTTP_REALITY_SNI" "")" ]] && _xhttp_gap=1
+    (( _vless_gap == 0 && _xhttp_gap == 0 )) && return 0
+
+    local _gapname=""
+    (( _vless_gap )) && _gapname="VLESS-Reality"
+    (( _xhttp_gap )) && _gapname="${_gapname:+${_gapname}, }XHTTP-Reality"
+
+    # 空闲池 = 盘点出的灰云直指本机 且 尚未入册
+    local _used=" $(get_state "DOMAIN_REGISTRY" "") "
+    local -a _pool=()
+    local _d
+    for _d in "${_CF_SPARE_GREY[@]}"; do
+        [[ " $_used " == *" $_d "* ]] && continue
+        _pool+=("$_d")
+    done
+    if (( ${#_pool[@]} == 0 )); then
+        echo ""
+        log_info "缺口协议：${_gapname}；当前 CF 无空闲直连域可自动补齐（可在 CF 增配一条灰云 A/AAAA 记录后重跑本项）"
+        return 0
+    fi
+
+    # 组装配对：VLESS-Reality 优先取第 1 个空闲域，XHTTP-Reality 用下一个
+    local -a _assign=() _tag=()
+    local _pi=0
+    if (( _vless_gap )); then
+        _assign+=("${_pool[$_pi]}"); _tag+=("xray-reality"); (( _pi++ ))
+    fi
+    if (( _xhttp_gap && _pi < ${#_pool[@]} )); then
+        _assign+=("${_pool[$_pi]}"); _tag+=("xhttp-reality"); (( _pi++ ))
+    fi
+    if (( ${#_assign[@]} == 0 )); then
+        echo ""
+        log_info "缺口协议：${_gapname}；但可用空闲域不足，跳过自动分配"
+        return 0
+    fi
+
+    echo ""
+    log_info "检测到可自动补齐的 Reality 自建域缺口："
+    local _i _slotname
+    for _i in "${!_assign[@]}"; do
+        if [[ "${_tag[$_i]}" == "xray-reality" ]]; then _slotname="VLESS-Reality"; else _slotname="XHTTP-Reality"; fi
+        printf "  · 将 %-30s → %s（自建：SNI=%s，Reality dest→本地伪装站）\n" \
+            "${_assign[$_i]}" "$_slotname" "${_assign[$_i]}"
+    done
+    echo "    影响：重建 Xray config + Nginx（SNI map / 伪装站）+ 客户端订阅；"
+    echo "          原借公共 SNI 的该协议客户端需重新订阅才生效。"
+    local _yn
+    read -rp "  是否执行自动分配？[y/N]: " _yn
+    [[ "${_yn,,}" == "y" ]] || { echo ""; log_info "已跳过，未作任何修改"; return 0; }
+
+    # reality_tag_self_domain 定义在 xray 模块，本菜单仅载 cert → 按需补载
+    if ! declare -F reality_tag_self_domain >/dev/null 2>&1; then
+        declare -F load_module >/dev/null 2>&1 && load_module xray >/dev/null 2>&1 || true
+    fi
+    local _applied=0
+    for _i in "${!_assign[@]}"; do
+        if declare -F reality_tag_self_domain >/dev/null 2>&1; then
+            if reality_tag_self_domain "${_assign[$_i]}" "${_tag[$_i]}"; then
+                log_info "已分配：${_assign[$_i]} → ${_tag[$_i]}（自建模式）"
+                _applied=1
+            else
+                log_warn "分配失败：${_assign[$_i]} → ${_tag[$_i]}（见上方拒绝原因），跳过"
+            fi
+        else
+            log_warn "reality_tag_self_domain 不可用（xray 模块加载失败）——请手动在主菜单 x 配置 Reality"
+        fi
+    done
+
+    # 仍缺自建域且仍在借 SNI 的槽位 → 提示
+    local _still=""
+    [[ -z "$(get_state "REALITY_DOMAIN" "")" && -n "$(get_state "REALITY_SNI" "")" ]] && _still="VLESS-Reality"
+    [[ -z "$(get_state "XHTTP_REALITY_DOMAIN" "")" && -n "$(get_state "XHTTP_REALITY_SNI" "")" ]] \
+        && _still="${_still:+${_still}, }XHTTP-Reality"
+    if (( _applied )) && [[ -n "$_still" ]]; then
+        echo ""
+        log_info "仍缺自建域的协议槽位：${_still}（暂无更多空闲直连域，继续借公共 SNI）"
+    fi
 }
 
 refresh_domain_assignments() {
@@ -2503,27 +2688,12 @@ refresh_domain_assignments() {
 
     save_domain_config
 
-    echo ""
-    log_info "刷新后的域名分配："
-    local registry
-    registry=$(get_state "DOMAIN_REGISTRY")
-    if [[ -n "$registry" ]]; then
-        for domain in $registry; do
-            local suffix mode protos
-            suffix=$(echo "$domain" | tr '.' '_')
-            mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
-            protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
-            printf "  %-30s [%s / %s]\n" "$domain" "$mode" "$protos"
-        done
-    else
-        echo "  （暂无）"
-    fi
-
-    log_info "HYSTERIA2_DOMAIN=${HYSTERIA2_DOMAIN:-}"
-    log_info "NAIVE_DOMAIN=${NAIVE_DOMAIN:-}"
-
-    # ── CF 线上域名盘点（只读）：把账号里真实存在但未登记的域也列出来 ──
+    # ── CF 线上域名盘点（只读）：发现并分类未登记/空闲域，填入 _CF_* 缓冲 ──
     scan_cf_domain_inventory
+    # ── 协议↔域名 一览 + 缺口/空闲汇总（一屏看清三问）──
+    print_domain_protocol_overview
+    # ── 空闲直连域自动补 Reality 自建缺口（预览 + y/N，确认后才改 state）──
+    offer_reality_auto_assign
 
     # ── 级联：槽位域有变化 → 打印对照 → 触发通用全量重建（install.sh）──
     local -a _changed_slots=()
