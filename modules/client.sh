@@ -14,6 +14,7 @@ load_existing_params() {
     XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY")
+    XHTTP_REALITY_PUBLIC_KEY=$(get_state "XHTTP_REALITY_PUBLIC_KEY")
     REALITY_SNI=$(get_state "REALITY_SNI")
     REALITY_DEST=$(get_state "REALITY_DEST")
     XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
@@ -240,7 +241,7 @@ path=${path_encoded}\
 &type=xhttp\
 &encryption=none\
 &fp=chrome\
-&pbk=${XRAY_PUBLIC_KEY}\
+&pbk=${XHTTP_REALITY_PUBLIC_KEY:-${XRAY_PUBLIC_KEY}}\
 &sid=${REALITY_SHORT_ID}\
 &security=reality\
 &sni=${_xhttp_r_sni}\

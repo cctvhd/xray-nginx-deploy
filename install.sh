@@ -2133,6 +2133,8 @@ do_conf_xray() {
     save_state "XRAY_UUID"             "${XRAY_UUID:-}"
     save_state "XRAY_PUBLIC_KEY"       "${XRAY_PUBLIC_KEY:-}"
     save_state "XRAY_PRIVATE_KEY"      "${XRAY_PRIVATE_KEY:-}"
+    save_state "XHTTP_REALITY_PUBLIC_KEY"  "${XHTTP_REALITY_PUBLIC_KEY:-}"
+    save_state "XHTTP_REALITY_PRIVATE_KEY" "${XHTTP_REALITY_PRIVATE_KEY:-}"
     save_state "XHTTP_PATH"            "${XHTTP_PATH:-}"
     save_state "GRPC_SERVICE_NAME"     "${GRPC_SERVICE_NAME:-}"
     save_state "REALITY_DEST"          "${REALITY_DEST:-}"
@@ -2419,6 +2421,8 @@ _restore_xray_after_nginx_sync_failure() {
     save_state "XRAY_UUID" "${RESET_OLD_XRAY_UUID:-}"
     save_state "XRAY_PRIVATE_KEY" "${RESET_OLD_XRAY_PRIVATE_KEY:-}"
     save_state "XRAY_PUBLIC_KEY" "${RESET_OLD_XRAY_PUBLIC_KEY:-}"
+    [[ -n "${RESET_OLD_XHTTP_REALITY_PRIVATE_KEY:-}" ]] && save_state "XHTTP_REALITY_PRIVATE_KEY" "${RESET_OLD_XHTTP_REALITY_PRIVATE_KEY}"
+    [[ -n "${RESET_OLD_XHTTP_REALITY_PUBLIC_KEY:-}" ]] && save_state "XHTTP_REALITY_PUBLIC_KEY" "${RESET_OLD_XHTTP_REALITY_PUBLIC_KEY}"
     save_state "REALITY_SHORT_IDS" "${RESET_OLD_REALITY_SHORT_IDS:-}"
     save_state "REALITY_SHORT_ID" "${RESET_OLD_REALITY_SHORT_ID:-}"
     [[ -n "${RESET_OLD_XHTTP_PATH:-}" ]] && save_state "XHTTP_PATH" "${RESET_OLD_XHTTP_PATH}"
@@ -2436,11 +2440,14 @@ _rotate_xray_credentials() {
     fi
 
     log_step "轮换 Xray UUID / Reality 密钥 / shortIds..."
-    local new_uuid keypair new_private new_public new_short_ids new_xhttp_path tmp backup
+    local new_uuid keypair keypair_xhr new_private new_public new_xhr_private new_xhr_public new_short_ids new_xhttp_path tmp backup
     new_uuid=$(_new_uuid)
     keypair=$(xray x25519)
     new_private=$(echo "$keypair" | grep -i "private" | awk '{print $NF}')
     new_public=$(echo "$keypair" | grep -i "public\|password" | awk '{print $NF}')
+    keypair_xhr=$(xray x25519)
+    new_xhr_private=$(echo "$keypair_xhr" | grep -i "private" | awk '{print $NF}')
+    new_xhr_public=$(echo "$keypair_xhr" | grep -i "public\|password" | awk '{print $NF}')
     new_short_ids=$(_new_xray_short_ids)
     new_xhttp_path=$(_new_xhttp_path)
     tmp="${config}.tmp.$$.json"
@@ -2448,6 +2455,7 @@ _rotate_xray_credentials() {
 
     if ! NEW_XRAY_UUID="${new_uuid}" \
         NEW_XRAY_PRIVATE_KEY="${new_private}" \
+        NEW_XHTTP_REALITY_PRIVATE_KEY="${new_xhr_private}" \
         NEW_XRAY_SHORT_IDS="${new_short_ids}" \
         NEW_XHTTP_PATH="${new_xhttp_path}" \
         python3 - "$config" "$tmp" << 'PY'
@@ -2463,6 +2471,7 @@ with path.open() as f:
 
 new_uuid = os.environ["NEW_XRAY_UUID"]
 new_private_key = os.environ["NEW_XRAY_PRIVATE_KEY"]
+new_xhr_private_key = os.environ["NEW_XHTTP_REALITY_PRIVATE_KEY"]
 new_short_ids = os.environ["NEW_XRAY_SHORT_IDS"].split()
 new_xhttp_path = os.environ["NEW_XHTTP_PATH"]
 
@@ -2475,7 +2484,10 @@ for inbound in config.get("inbounds", []):
 
     reality = inbound.get("streamSettings", {}).get("realitySettings")
     if reality:
-        reality["privateKey"] = new_private_key
+        if inbound.get("tag") == "vless-xhttp-reality":
+            reality["privateKey"] = new_xhr_private_key
+        else:
+            reality["privateKey"] = new_private_key
         reality["shortIds"] = new_short_ids
         changed += 1
 
@@ -2483,6 +2495,13 @@ for inbound in config.get("inbounds", []):
     if xhttp and "path" in xhttp:
         xhttp["path"] = new_xhttp_path
         changed += 1
+
+    # reality-direct 的 XHTTP fallback（dest=8325）路径也要同步轮换，
+    # 否则轮换后 fallbacks[0].path 残留旧 XHTTP_PATH，与 xhttpSettings 不一致。
+    for fb in inbound.get("settings", {}).get("fallbacks", []):
+        if fb.get("dest") == "127.0.0.1:8325" and "path" in fb:
+            fb["path"] = new_xhttp_path
+            changed += 1
 
 if changed == 0:
     sys.exit("no Xray client or Reality credential fields matched")
@@ -2508,6 +2527,8 @@ PY
     RESET_OLD_XRAY_UUID=$(get_state "XRAY_UUID" "")
     RESET_OLD_XRAY_PRIVATE_KEY=$(get_state "XRAY_PRIVATE_KEY" "")
     RESET_OLD_XRAY_PUBLIC_KEY=$(get_state "XRAY_PUBLIC_KEY" "")
+    RESET_OLD_XHTTP_REALITY_PRIVATE_KEY=$(get_state "XHTTP_REALITY_PRIVATE_KEY" "")
+    RESET_OLD_XHTTP_REALITY_PUBLIC_KEY=$(get_state "XHTTP_REALITY_PUBLIC_KEY" "")
     RESET_OLD_REALITY_SHORT_IDS=$(get_state "REALITY_SHORT_IDS" "")
     RESET_OLD_REALITY_SHORT_ID=$(get_state "REALITY_SHORT_ID" "")
     RESET_OLD_XHTTP_PATH=$(get_state "XHTTP_PATH" "")
@@ -2520,15 +2541,19 @@ PY
     XRAY_UUID="${new_uuid}"
     XRAY_PRIVATE_KEY="${new_private}"
     XRAY_PUBLIC_KEY="${new_public}"
+    XHTTP_REALITY_PRIVATE_KEY="${new_xhr_private}"
+    XHTTP_REALITY_PUBLIC_KEY="${new_xhr_public}"
     XHTTP_PATH="${new_xhttp_path}"
     REALITY_SHORT_IDS="${new_short_ids}"
-    REALITY_SHORT_ID="$(awk '{print $2}' <<< "${new_short_ids}")"
+    REALITY_SHORT_ID="$(awk '{print $1}' <<< "${new_short_ids}")"
     save_state "XRAY_UUID" "${new_uuid}"
     save_state "XRAY_PRIVATE_KEY" "${new_private}"
     save_state "XRAY_PUBLIC_KEY" "${new_public}"
+    save_state "XHTTP_REALITY_PRIVATE_KEY" "${new_xhr_private}"
+    save_state "XHTTP_REALITY_PUBLIC_KEY" "${new_xhr_public}"
     save_state "XHTTP_PATH" "${new_xhttp_path}"
     save_state "REALITY_SHORT_IDS" "${new_short_ids}"
-    save_state "REALITY_SHORT_ID" "$(awk '{print $2}' <<< "${new_short_ids}")"
+    save_state "REALITY_SHORT_ID" "$(awk '{print $1}' <<< "${new_short_ids}")"
     log_info "Xray 凭据已轮换"
 
 }
@@ -2698,15 +2723,15 @@ do_reset_client_credentials() {
     [[ "${c,,}" != "y" ]] && return
 
     _rotate_xray_credentials
-    _rotate_singbox_credentials
-    _rotate_hysteria2_credentials
-    _rotate_naive_credentials
     _sync_nginx_after_credential_reset || {
         _restore_xray_after_nginx_sync_failure
         exit 1
     }
     rm -f "${RESET_XRAY_BACKUP:-}"
     RESET_XRAY_BACKUP=""
+    _rotate_singbox_credentials
+    _rotate_hysteria2_credentials
+    _rotate_naive_credentials
     _new_subscription_path
 
     do_client
@@ -3623,6 +3648,8 @@ run_full_install_flow() {
     save_state "XRAY_UUID"            "${XRAY_UUID:-}"
     save_state "XRAY_PUBLIC_KEY"      "${XRAY_PUBLIC_KEY:-}"
     save_state "XRAY_PRIVATE_KEY"     "${XRAY_PRIVATE_KEY:-}"
+    save_state "XHTTP_REALITY_PUBLIC_KEY"  "${XHTTP_REALITY_PUBLIC_KEY:-}"
+    save_state "XHTTP_REALITY_PRIVATE_KEY" "${XHTTP_REALITY_PRIVATE_KEY:-}"
     save_state "XHTTP_PATH"           "${XHTTP_PATH:-}"
     save_state "GRPC_SERVICE_NAME"    "${GRPC_SERVICE_NAME:-}"
     save_state "REALITY_DEST"         "${REALITY_DEST:-}"
@@ -3752,6 +3779,8 @@ do_reconf_xray() {
 	save_state "XRAY_UUID"            ""
 	save_state "XRAY_PUBLIC_KEY"      ""
 	save_state "XRAY_PRIVATE_KEY"     ""
+	save_state "XHTTP_REALITY_PUBLIC_KEY"  ""
+	save_state "XHTTP_REALITY_PRIVATE_KEY" ""
 	save_state "REALITY_DEST"         ""
 	save_state "REALITY_SNI"          ""
 	save_state "XHTTP_REALITY_SNI"    ""
