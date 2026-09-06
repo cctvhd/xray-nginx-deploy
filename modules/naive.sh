@@ -352,31 +352,17 @@ configure_naive() {
     save_state "NAIVE_PROBE_LINK" "${probe_link}"
     log_info "probe_resistance: ${probe_link}.${NAIVE_DOMAIN}"
 
-    # ── 6. 伪装反代 ──────────────────────────────────────────
-    local NAIVE_PROXY_TARGET
-    NAIVE_PROXY_TARGET=$(get_state "NAIVE_PROXY_TARGET")
-    if [[ -z "${NAIVE_PROXY_TARGET}" ]]; then
-        local choice
-        while true; do
-            echo "伪装网站选择："
-            echo "1) https://www.cloudflare.com（默认）"
-            echo "2) https://www.apple.com"
-            echo "3) https://www.microsoft.com"
-            echo "4) https://www.bing.com"
-            echo "5) https://www.wikipedia.org"
-            read -rp "请选择伪装目标 [1-5, 默认 1]: " choice
-            case "$choice" in
-                ""|1) NAIVE_PROXY_TARGET="https://www.cloudflare.com"; break ;;
-                2) NAIVE_PROXY_TARGET="https://www.apple.com"; break ;;
-                3) NAIVE_PROXY_TARGET="https://www.microsoft.com"; break ;;
-                4) NAIVE_PROXY_TARGET="https://www.bing.com"; break ;;
-                5) NAIVE_PROXY_TARGET="https://www.wikipedia.org"; break ;;
-                *) echo "无效选择，请重新输入" ;;
-            esac
-        done
-        save_state "NAIVE_PROXY_TARGET" "${NAIVE_PROXY_TARGET}"
+    # ── 6. 本地伪装站（取代原「反代外部站」伪装）──────────────────
+    # 浏览器/探针兜底改为本地静态站：caddy file_server 直读 webroot，
+    # 不再反代外部真实站（无出站依赖、可离线）。
+    # 与 reality / xhttp-reality 自建域名同理，都走 generate_fake_site，
+    # 使各协议的本地伪装站在脚本配置时自动生成并引用。
+    if ! declare -F generate_fake_site &>/dev/null; then
+        load_module nginx
     fi
-    log_info "伪装反代: ${NAIVE_PROXY_TARGET}"
+    mkdir -p "/var/www/${NAIVE_DOMAIN}"
+    generate_fake_site "/var/www/${NAIVE_DOMAIN}" 0
+    log_info "本地伪装站: /var/www/${NAIVE_DOMAIN}"
 
     # ── 7. certaccess 组：让 caddy-naive 直读 letsencrypt 证书 ──
     # 创建共享组（幂等），live/ 和 archive/ 设为组可穿越（750），
@@ -421,9 +407,8 @@ configure_naive() {
             hide_via
             probe_resistance ${probe_link}.${NAIVE_DOMAIN}
         }
-        reverse_proxy ${NAIVE_PROXY_TARGET} {
-            header_up Host {upstream_hostport}
-        }
+        root * /var/www/${NAIVE_DOMAIN}
+        file_server
     }
 }
 EOF
