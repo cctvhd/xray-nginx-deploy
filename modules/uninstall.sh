@@ -87,6 +87,7 @@ reset_cert_state() {
     save_state "XHTTP_DOMAIN" ""
     save_state "GRPC_DOMAIN" ""
     save_state "REALITY_DOMAIN" ""
+    save_state "XHTTP_REALITY_DOMAIN" ""
     save_state "ANYTLS_DOMAIN" ""
     save_state "ALL_DOMAINS" ""
     save_state "CDN_DOMAINS" ""
@@ -94,6 +95,16 @@ reset_cert_state() {
     save_state "DOMAIN_REGISTRY" ""
     save_state "NAIVE_DOMAIN" ""
     save_state "HYSTERIA2_DOMAIN" ""
+    # 权威主槽位一并清空——历史残留会随 rebuild/load_domain_state 自愈复活陈旧域
+    save_state "DOMAIN_PRIMARY_XRAY_XHTTP"    ""
+    save_state "DOMAIN_PRIMARY_XRAY_GRPC"     ""
+    save_state "DOMAIN_PRIMARY_XRAY_REALITY"  ""
+    save_state "DOMAIN_PRIMARY_XHTTP_REALITY" ""
+    save_state "DOMAIN_PRIMARY_SINGBOX"       ""
+    save_state "DOMAIN_PRIMARY_HYSTERIA2"     ""
+    save_state "DOMAIN_PRIMARY_NAIVEPROXY"    ""
+    save_state "DOMAIN_PRIMARY_XRAY_CDN"      ""
+    save_state "DOMAIN_PRIMARY_XRAY_DIRECT"   ""
     # 清理动态域名注册条目
     if [[ -n "${STATE_FILE:-}" && -f "${STATE_FILE}" ]]; then
         sed -i '/^DOMAIN_MODE_/d' "${STATE_FILE}"
@@ -112,6 +123,7 @@ reset_xray_state() {
     save_state "REALITY_SNI" ""
     save_state "REALITY_SHORT_ID" ""
     save_state "REALITY_SPIDER_X" ""
+    save_state "XHTTP_REALITY_SNI" ""
     save_state "INST_XRAY" "0"
     save_state "CONF_XRAY" "0"
 }
