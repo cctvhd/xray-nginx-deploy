@@ -9,6 +9,8 @@
 : "${CF_CONFIG_DIR:=/etc/cloudflare}"
 : "${CF_DOMAIN_MAP_FILE:=${CF_CONFIG_DIR}/domain_map.conf}"
 : "${CF_CERT_STATUS_FILE:=${CF_CONFIG_DIR}/cert_request_status.conf}"
+# 选项6「刷新域名分配」内的 CF 线上盘点开关：测试 harness / 离线设 1 跳过（默认开）
+: "${CF_SCAN_OFF:=0}"
 
 # ── 检测 Certbot 是否已安装 ──────────────────────────────────
 check_certbot_installed() {
@@ -394,6 +396,43 @@ verify_cf_token() {
         return 3
     fi
 
+    return 0
+}
+
+# ── 只读 CF API GET（盘点用，best-effort）───────────────────
+# 用法: body=$(_cf_api_get <token> <path_query>)   （注意用 || rc=$? 承接返回值）
+# rc=0: HTTP 200 且 success:true，body 打到 stdout（result 可为空数组）；
+# rc=1: 4xx / success:false（Token 无效 / 无权限）；
+# rc=2: curl 失败 / 超时 / 5xx / 空响应。
+# 仅 rc=0 输出 body，错误体不进日志。curl 范式镜像 verify_cf_token，
+# 额外加 --connect-timeout 4 —— 本函数是 refresh 的首个网络调用，须快速失败。
+_cf_api_get() {
+    local token="$1" path_query="$2"
+    local resp body http_code curl_rc
+    resp=$(curl -sS --connect-timeout 4 --max-time 5 \
+        -H "Authorization: Bearer ${token}" \
+        -w $'\n%{http_code}' \
+        "https://api.cloudflare.com/client/v4/${path_query}" 2>/dev/null) || curl_rc=$?
+    curl_rc="${curl_rc:-0}"
+
+    if [[ "$curl_rc" -ne 0 || -z "$resp" ]]; then
+        return 2
+    fi
+
+    http_code=$(printf '%s\n' "$resp" | tail -n1)
+    body=$(printf '%s\n' "$resp" | sed '$d')
+
+    case "$http_code" in
+        200) ;;
+        5*)  return 2 ;;
+        *)   return 1 ;;
+    esac
+
+    if ! echo "$body" | grep -q '"success":[[:space:]]*true'; then
+        return 1
+    fi
+
+    printf '%s\n' "$body"
     return 0
 }
 
@@ -2159,6 +2198,166 @@ add_domain_and_cert() {
     log_info "域名添加完成: ${#new_domains[@]} 个"
 }
 
+# ── 本机公网 IPv4（best-effort；全空则跳过"指向本机"标注）───
+_cf_self_ipv4() {
+    curl -fsSL -4 --connect-timeout 3 --max-time 4 https://api.ipify.org 2>/dev/null \
+        || curl -fsSL -4 --connect-timeout 3 --max-time 4 https://ip.sb 2>/dev/null \
+        || hostname -I 2>/dev/null | awk '{print $1}'
+}
+
+# ── CF 线上域名盘点（只读，best-effort）─────────────────────
+# 枚举各去重 token 的 zones + A/AAAA 子记录，对照本地注册表分组打印
+# 已登记 / 未登记；未登记项标注 proxied(CDN代理) / 灰云直指本机(可作空闲
+# 直连域候选) / 指向他处。纯只读：不改 state、不读 stdin、恒返回 0；网络/
+# 权限失败一律降级 log_warn 并 continue，绝不影响 refresh 修复/级联路径。
+# 注：本函数是 refresh_domain_assignments 的首个网络调用，逐调用超时封顶。
+# JSON 解析为 grep-only（repo 无 jq），字段序已按活体响应锁定；若 CF 变更
+# 字段序只会退化为空/部分清单，不会崩溃。AAAA 记录仅比对 IPv4（curl -4），
+# 指向本机 v6 的记录会落入"指向 <content>（他处/未用）"分支，属预期。
+scan_cf_domain_inventory() {
+    (( ${CF_SCAN_OFF:-0} )) && return 0
+
+    # ── 去重枚举账号（按 token 值，首个文件 basename 作显示名，永不打印 token）
+    local -a _acct_tokens=() _acct_labels=()
+    local _seen=" " f token
+    for f in $(_scan_cf_account_files); do
+        token=$(_cf_ini_token "$f")
+        [[ -z "$token" ]] && continue
+        if [[ " ${_seen} " != *" ${token} "* ]]; then
+            _seen+=" ${token} "
+            _acct_tokens+=("$token")
+            _acct_labels+=("$(basename "$f" .ini)")
+        fi
+    done
+
+    echo ""
+    log_info "Cloudflare 线上域名盘点（只读）："
+    if (( ${#_acct_tokens[@]} == 0 )); then
+        log_info "  未配置 Cloudflare 账号，跳过自动盘点"
+        return 0
+    fi
+
+    # 已登记集合 = DOMAIN_REGISTRY + 各槽位非空标量（空格包裹便于子串判含）
+    local _known=" $(get_state "DOMAIN_REGISTRY" "") "
+    local _slot
+    for _slot in XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN XHTTP_REALITY_DOMAIN \
+                 ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN; do
+        [[ -n "${!_slot:-}" ]] && _known+=" ${!_slot} "
+    done
+    local _self_ip
+    _self_ip=$(_cf_self_ipv4)
+
+    local i p rc body _tp _tmp _line _zn _zid _name _ty _ct _px _reg
+    for i in "${!_acct_tokens[@]}"; do
+        local _tok="${_acct_tokens[$i]}" _label="${_acct_labels[$i]}"
+        local -a _zone_ids=() _zone_names=()
+        echo ""
+        log_info "  账号: ${_label}"
+        _reg=0
+
+        # ── zones（分页 ≤2 防御；实际各 token 通常 1-2 个 zone）
+        p=1; _tp=1; rc=0; body=""
+        while (( p <= 2 )); do
+            body=$(_cf_api_get "$_tok" "zones?per_page=50&page=${p}") || rc=$?
+            if (( rc == 2 )); then
+                log_warn "    账号 [${_label}]: Cloudflare 网络请求失败（超时/5xx），跳过该账号"
+                _reg=-1; break
+            elif (( rc == 1 )); then
+                log_warn "    账号 [${_label}]: Token 无效或无权读取 Zone 列表，跳过"
+                _reg=-1; break
+            fi
+            if (( p == 1 )); then
+                _tp=$(echo "$body" | grep -oE '"total_pages":[0-9]+' | head -1 | cut -d: -f2)
+                [[ "$_tp" =~ ^[0-9]+$ ]] || _tp=1
+            fi
+            while IFS= read -r _line; do
+                [[ -z "$_line" ]] && continue
+                echo "$_line" | grep -q '"status":"active"' || continue
+                (( ${#_zone_ids[@]} < 10 )) || break
+                _zid=$(echo "$_line" | sed -E 's/.*"id":"([^"]+)".*/\1/')
+                _zn=$(echo "$_line" | sed -E 's/.*"name":"([^"]+)".*/\1/')
+                _zone_ids+=("$_zid"); _zone_names+=("$_zn")
+            done < <(echo "$body" | grep -oE '"id":"[^"]+","name":"[^"]+","status":"[^"]+"')
+            (( p >= _tp )) && break
+            (( p++ ))
+        done
+        (( _reg == -1 )) && continue
+        if (( ${#_zone_ids[@]} == 0 )); then
+            log_info "  可读 0 个 Zone，跳过该账号"
+            continue
+        fi
+
+        # ── 逐 zone 拉 A/AAAA 记录并分组打印（先已登记、后未登记）──
+        local z
+        for z in "${!_zone_ids[@]}"; do
+            local _zid2="${_zone_ids[$z]}" _zn2="${_zone_names[$z]}"
+            local -a _u_name=() _u_content=() _u_proxied=()
+            local u _found_reg=0 _name_shown=" "
+            echo ""
+            log_info "    Zone: ${_zn2}"
+            p=1; _tp=1; rc=0; body=""
+            while (( p <= 3 )); do
+                body=$(_cf_api_get "$_tok" "zones/${_zid2}/dns_records?per_page=100&page=${p}") || rc=$?
+                if (( rc == 2 )); then
+                    log_warn "      Zone ${_zn2}: 记录请求网络失败，跳过该 Zone"
+                    _zid2=skip; break
+                elif (( rc == 1 )); then
+                    log_warn "      Zone ${_zn2}: 无权读取记录（403/4xx），跳过"
+                    _zid2=skip; break
+                fi
+                if (( p == 1 )); then
+                    _tp=$(echo "$body" | grep -oE '"total_pages":[0-9]+' | head -1 | cut -d: -f2)
+                    [[ "$_tp" =~ ^[0-9]+$ ]] || _tp=1
+                fi
+                while IFS= read -r _line; do
+                    [[ -z "$_line" ]] && continue
+                    _name=$(echo "$_line" | sed -E 's/.*"name":"([^"]+)".*/\1/')
+                    # apex（name==zone）与通配（*.zone）子记录跳过——zone 已作标题
+                    [[ "$_name" == "${_zn2}" || "$_name" == \** ]] && continue
+                    _ty=$(echo "$_line" | sed -E 's/.*"type":"([^"]+)".*/\1/')
+                    _ct=$(echo "$_line" | sed -E 's/.*"content":"([^"]*)".*/\1/')
+                    _px=$(echo "$_line" | sed -E 's/.*"proxied":(true|false).*/\1/')
+                    # 同主机常有 A + AAAA 两条：只保留首见（实测 CF 先 A 后 AAAA，A 作权威）
+                    [[ " ${_name_shown} " == *" ${_name} "* ]] && continue
+                    _name_shown+="${_name} "
+                    if [[ " ${_known} " == *" ${_name} "* ]]; then
+                        local _sfx _md _pr
+                        _sfx=$(echo "$_name" | tr '.' '_')
+                        _md=$(get_state "DOMAIN_MODE_${_sfx}" "")
+                        _pr=$(get_state "DOMAIN_PROTO_${_sfx}" "")
+                        if [[ -n "$_pr" ]]; then
+                            printf "  %-30s 已登记 [%s / %s]\n" "$_name" "$_md" "$_pr"
+                        else
+                            printf "  %-30s 已登记\n" "$_name"
+                        fi
+                        _found_reg=1
+                    else
+                        _u_name+=("$_name"); _u_content+=("$_ct"); _u_proxied+=("$_px")
+                    fi
+                done < <(echo "$body" | grep -oE '"name":"[^"]+","type":"(A|AAAA)","content":"[^"]*","proxiable":(true|false),"proxied":(true|false)')
+                (( p >= _tp )) && break
+                (( p++ ))
+            done
+            [[ "$_zid2" == "skip" ]] && continue
+            # 未登记组（已登记行之后统一列出）
+            for u in "${!_u_name[@]}"; do
+                if [[ "${_u_proxied[$u]}" == "true" ]]; then
+                    printf "  %-30s 未登记 · CDN代理（橙云）\n" "${_u_name[$u]}"
+                elif [[ -n "$_self_ip" && "${_u_proxied[$u]}" == "false" && "${_u_content[$u]}" == "$_self_ip" ]]; then
+                    printf "  %-30s 未登记 · 灰云直指本机，可作空闲直连域候选\n" "${_u_name[$u]}"
+                else
+                    printf "  %-30s 未登记 · 指向 %s（他处/未用）\n" "${_u_name[$u]}" "${_u_content[$u]}"
+                fi
+            done
+            # 该 zone 存在但 A/AAAA 一条都没解析到 → 响应结构可能变化
+            if (( ${#_u_name[@]} == 0 && _found_reg == 0 )); then
+                log_warn "      Zone ${_zn2}: 未解析到任何 A/AAAA 子记录（响应结构可能变化）"
+            fi
+        done
+    done
+    return 0
+}
+
 refresh_domain_assignments() {
     log_step "刷新域名协议分配"
 
@@ -2322,6 +2521,9 @@ refresh_domain_assignments() {
 
     log_info "HYSTERIA2_DOMAIN=${HYSTERIA2_DOMAIN:-}"
     log_info "NAIVE_DOMAIN=${NAIVE_DOMAIN:-}"
+
+    # ── CF 线上域名盘点（只读）：把账号里真实存在但未登记的域也列出来 ──
+    scan_cf_domain_inventory
 
     # ── 级联：槽位域有变化 → 打印对照 → 触发通用全量重建（install.sh）──
     local -a _changed_slots=()
