@@ -106,6 +106,8 @@ reset_xray_state() {
     save_state "XRAY_UUID" ""
     save_state "XRAY_PUBLIC_KEY" ""
     save_state "XRAY_PRIVATE_KEY" ""
+    save_state "XHTTP_REALITY_PUBLIC_KEY" ""
+    save_state "XHTTP_REALITY_PRIVATE_KEY" ""
     save_state "REALITY_DEST" ""
     save_state "REALITY_SNI" ""
     save_state "REALITY_SHORT_ID" ""

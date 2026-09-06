@@ -73,6 +73,30 @@ generate_xray_params() {
         log_info "生成新密钥对"
     fi
 
+    # vless-xhttp-reality（8325）独立密钥对：与 vless-reality（reality-direct，8320）隔离，
+    # 避免两个 Reality 入站复用同一次 x25519 结果，导致两个伪装身份可被关联。
+    local saved_xhr_privkey saved_xhr_pubkey
+    saved_xhr_privkey=$(get_state "XHTTP_REALITY_PRIVATE_KEY" "")
+    saved_xhr_pubkey=$(get_state "XHTTP_REALITY_PUBLIC_KEY" "")
+    if [[ -n "${saved_xhr_privkey}" ]]; then
+        XHTTP_REALITY_PRIVATE_KEY="${saved_xhr_privkey}"
+        if [[ -n "${saved_xhr_pubkey}" ]]; then
+            XHTTP_REALITY_PUBLIC_KEY="${saved_xhr_pubkey}"
+        else
+            local xhr_keypair
+            xhr_keypair=$(xray x25519 -i "$XHTTP_REALITY_PRIVATE_KEY" 2>/dev/null)
+            XHTTP_REALITY_PUBLIC_KEY=$(echo "$xhr_keypair" | grep -i "public\|password" | awk '{print $NF}')
+            log_warn "从私钥重新推导 vless-xhttp-reality 公钥"
+        fi
+        log_info "复用已有 vless-xhttp-reality 密钥对"
+    else
+        local xhr_keypair
+        xhr_keypair=$(xray x25519)
+        XHTTP_REALITY_PRIVATE_KEY=$(echo "$xhr_keypair" | grep -i "private" | awk '{print $NF}')
+        XHTTP_REALITY_PUBLIC_KEY=$(echo "$xhr_keypair" | grep -i "public\|password" | awk '{print $NF}')
+        log_info "生成新 vless-xhttp-reality 密钥对"
+    fi
+
     # ── VLESS Encryption（ML-KEM-768 后量子认证，用于 CDN 入站端到端加密）──
     local saved_enc_seed
     saved_enc_seed=$(get_state "VLESS_ENC_SEED" "")
@@ -604,7 +628,16 @@ generate_xray_config() {
         local _rdest_host="${REALITY_DEST%%:*}"
         local _rdest_port="${REALITY_DEST##*:}"
         _reality_direct_dest="127.0.0.1:4431"
-        _reality_direct_sn="${sn_json}"
+        # reality-direct 只接受真正路由到 8320 的 SNI：排除 XHTTP_REALITY_SNI/DOMAIN，
+        # 它们由 nginx stream 分流到 8325（vless-xhttp-reality），与 generate_sni_map 对齐。
+        # 否则 8320 会把本不该归它的 SNI（如 business.ca.gov）也当 Reality 客户端处理。
+        local _direct_sn=""
+        for _sn in "${REALITY_SERVER_NAMES[@]}"; do
+            [[ -n "$_sn" ]] || continue
+            [[ "$_sn" == "${XHTTP_REALITY_SNI:-}" || "$_sn" == "${XHTTP_REALITY_DOMAIN:-}" ]] && continue
+            _direct_sn+="\"${_sn}\","
+        done
+        _reality_direct_sn="${_direct_sn%,}"
         _dokodemo_reality_routing='            {
                 "type":        "field",
                 "inboundTag":  ["dokodemo-reality"],
@@ -928,7 +961,7 @@ ${_dokodemo_xhttp_routing}
                     "dest":        "${_xhttp_reality_dest}",
                     "xver":        0,
                     "serverNames": [${_xhttp_reality_sn}],
-                    "privateKey":  "${XRAY_PRIVATE_KEY}",
+                    "privateKey":  "${XHTTP_REALITY_PRIVATE_KEY}",
                     "shortIds":    [${sid_json}]
                 },
                 "sockopt": {
