@@ -2543,6 +2543,102 @@ offer_reality_auto_assign() {
     fi
 }
 
+# ── 解除 Reality 自建绑定（域归属同处管理：主菜单 5→6）──
+# 列出已自建绑定 → 选序号解除（回借公共 SNI，走 reality_untag_self_domain）。
+# 解除后若另一 Reality 槽仍无自建域、且被释域未挂其它协议标签 → 可顺带改绑给它
+# （覆盖「同一域在 xhttp/vless 间换绑」；auto-assign 只补缺口且 VLESS 优先，
+# 无法实现换绑）。默认不改、无绑定不弹、恒 return 0。
+offer_reality_unbind() {
+    local -a _rows=()
+    local _sl _sl_dom _dom_key _rest _name _tag
+    for _sl in "REALITY_DOMAIN|VLESS-Reality|xray-reality" \
+               "XHTTP_REALITY_DOMAIN|XHTTP-Reality|xhttp-reality"; do
+        _dom_key="${_sl%%|*}"; _rest="${_sl#*|}"
+        _name="${_rest%%|*}"; _tag="${_rest##*|}"
+        _sl_dom=$(get_state "$_dom_key" "")
+        [[ -n "$_sl_dom" ]] && _rows+=("${_name}|${_tag}|${_sl_dom}")
+    done
+    (( ${#_rows[@]} == 0 )) && return 0
+
+    echo ""
+    log_info "Reality 自建域绑定（选序号可解除 → 回借公共 SNI；域归属均在本项管理）："
+    local _i=1 _r
+    for _r in "${_rows[@]}"; do
+        printf "  %d) %-16s → %s\n" "$_i" "${_r%%|*}" "${_r##*|}"
+        (( _i++ ))
+    done
+    echo "  0) 不改动"
+    read -rp "请选择 [0-${#_rows[@]}，默认0]: " _ub
+    [[ "${_ub:-0}" == "0" ]] && return 0
+    local _idx=$(( ${_ub:-0} - 1 ))
+    (( _idx < 0 || _idx >= ${#_rows[@]} )) && return 0
+    local _sel
+    _sel="${_rows[$_idx]}"
+    _name="${_sel%%|*}"; _rest="${_sel#*|}"
+    _tag="${_rest%%|*}"; _dom="${_rest##*|}"
+    echo ""
+
+    # reality_untag/tag 定义在 xray 模块，本菜单仅载 cert → 按需补载
+    if ! declare -F reality_untag_self_domain >/dev/null 2>&1; then
+        declare -F load_module >/dev/null 2>&1 && load_module xray >/dev/null 2>&1 || true
+    fi
+    if ! declare -F reality_untag_self_domain >/dev/null 2>&1; then
+        log_warn "reality_untag_self_domain 不可用（xray 模块加载失败），无法解除——请到主菜单 x 处理"
+        return 0
+    fi
+
+    if ! reality_untag_self_domain "$_dom" "$_tag"; then
+        log_warn "解除 ${_name} 的自建域 ${_dom} 失败（见上方原因），未改动"
+        return 0
+    fi
+    log_info "已解除 ${_name} 的自建域 ${_dom}（回到借公共 SNI 状态）"
+
+    # 解除后：另一 Reality 槽仍无自建域、且被释域未挂其它协议标签 → 可改绑过去
+    local _sfx _protos
+    _sfx=$(echo "$_dom" | tr '.' '_')
+    _protos=$(get_state "DOMAIN_PROTO_${_sfx}" "")
+    local _other_key _other_tag _swap=""
+    if [[ "$_tag" == "xray-reality" ]]; then
+        _other_key="XHTTP_REALITY_DOMAIN"; _other_tag="xhttp-reality"
+    else
+        _other_key="REALITY_DOMAIN"; _other_tag="xray-reality"
+    fi
+    if [[ -z "$(get_state "$_other_key" "")" && -z "$_protos" ]]; then
+        echo ""
+        read -rp "  把 ${_dom} 改绑给另一 Reality 槽（${_other_key%_DOMAIN}）？[y/N]: " _swap
+        if [[ "${_swap,,}" == "y" ]]; then
+            if reality_tag_self_domain "$_dom" "$_other_tag"; then
+                log_info "已把 ${_dom} 改绑给 ${_other_key%_DOMAIN}（${_other_tag}）"
+                _swap="y"
+            else
+                log_warn "改绑失败（见上方原因）；${_dom} 仍处未绑定态"
+            fi
+        fi
+    fi
+
+    # 未换绑 → 提示回公共的后续；公共参数若是早期残留则提醒重配
+    if [[ "${_swap,,}" != "y" ]]; then
+        local _stale=""
+        if [[ "$_tag" == "xray-reality" ]]; then
+            # 旧版菜单 x 会把 vless 公共参数收敛成自建残值，解除后即失效 → 需重配
+            if [[ "$(get_state "REALITY_SERVER_NAMES" "")" == "$_dom" \
+                || "$(get_state "REALITY_DEST" "")" == "127.0.0.1:8321" ]]; then
+                _stale=1
+            fi
+        else
+            if [[ "$(get_state "XHTTP_REALITY_SNI" "")" == "$_dom" ]]; then
+                _stale=1
+            fi
+        fi
+        if [[ -n "$_stale" ]]; then
+            log_warn "该槽公共伪装参数仍是早期残留——请到主菜单 11/x 重新选择公共伪装目标（本项只改域归属）"
+        else
+            log_info "该槽已回未绑公共 SNI 状态；如需手动改绑到指定协议槽，可到主菜单 5 域名编辑器打 xray-reality / xhttp-reality 标签"
+        fi
+    fi
+    return 0
+}
+
 refresh_domain_assignments() {
     log_step "刷新域名协议分配"
 
@@ -2694,6 +2790,8 @@ refresh_domain_assignments() {
     print_domain_protocol_overview
     # ── 空闲直连域自动补 Reality 自建缺口（预览 + y/N，确认后才改 state）──
     offer_reality_auto_assign
+    # ── 已自建绑定的解除 / 换绑（解除即回借公共 SNI；默认不改）──
+    offer_reality_unbind
 
     # ── 级联：槽位域有变化 → 打印对照 → 触发通用全量重建（install.sh）──
     local -a _changed_slots=()
