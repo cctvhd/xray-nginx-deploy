@@ -252,47 +252,69 @@ reality_untag_self_domain() {
     log_info "vless-reality 已切换为公共 SNI 模式（REALITY_DOMAIN 已清空）"
 }
 
-# ── 收集 Reality 伪装参数 ────────────────────────────────────
-# Current correct values on this server: dest=www.mpg.de:443, spiderX=/
-# When re-running, select: Europe(2) -> mpg.de(5), then input spiderX=/
-collect_reality_params() {
-    echo ""
-    log_step "配置 Reality 伪装参数"
-    echo ""
 
-    # ── Reality-direct 模式提示：模式由域名分配决定，非下方交互决定 ──
-    # reality-direct 节点（vless-reality）实际用哪种 SNI，取决于域名管理里
-    # 是否有 xray-reality 标签域（REALITY_DOMAIN）：
-    #   在册 → 自建域名模式（SNI=自有域，dest=本地伪装站 8321）
-    #   无   → 公共 SNI 模式（SNI/dest=下方所选公共伪装目标）
-    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        # 显式二选一：vless-reality 用自有域名还是公共 SNI。
-        # 旧逻辑由 xray-reality 标签静默决定并把下方所选第三方覆盖成自有域名，
-        # 与"选什么=配什么"冲突；这里把决定权交回 menu x。
-        echo ""
-        echo "vless-reality 当前绑定自有域名 ${REALITY_DOMAIN}（自建域名模式：SNI=${REALITY_DOMAIN}，dest→本地伪装站 8321）"
-        echo "请选择 vless-reality 的伪装方式："
-        echo "  1. 公共 SNI —— 借用第三方域名：自动摘除 ${REALITY_DOMAIN} 的 xray-reality 标签，"
-        echo "                 你随后在下方列表里选哪个，vless-reality 就用哪个 SNI"
-        echo "  2. 自建域名 —— ${REALITY_DOMAIN}（真实证书；下方列表仅供 vless-xhttp-reality 选公共 SNI）"
-        read -rp "请选择 [1/2，默认2]: " _vless_mode
-        echo ""
-        if [[ "${_vless_mode:-2}" == "1" ]]; then
-            log_info "切换 vless-reality 为公共 SNI 模式：摘除 ${REALITY_DOMAIN} 的 xray-reality 标签并重建派生..."
-            reality_untag_self_domain "${REALITY_DOMAIN}"
-            log_info "REALITY_DOMAIN 已清空——以下所选公共目标即 vless-reality 的 dest/SNI"
+# ── 收集 Reality 伪装参数（先问模式，再按需弹列表）─────────────────
+# 设计(2026-09-06 重排)：
+#   1. vless-reality 与 vless-xhttp-reality 各自先问「自有域名 / 公共 SNI」，
+#      顺序完全对称，不再依赖外部标签或列表时序隐式触发。
+#   2. 地区 + 伪装目标列表仅当「至少一个协议选了公共 SNI」才弹出；
+#      两协议都走自有域名时直接跳过（原实现会白问一遍再被收敛覆盖）。
+#   3. 列表只弹一次、按需分配：两协议都用公共 SNI 时首域名归 vless-reality、
+#      其余供 xhttp 挑（避免撞 SNI）；仅 xhttp 用公共 SNI 时整表可选（vless 未占用）。
+#   4. spiderX 探测只在 vless-reality 走公共 SNI 时执行（该字段仅写入
+#      reality-direct，xhttp-reality 的 realitySettings 无 spiderX）。
+# 遗留 TODO：_reality_pick_own_domain() 目前只把选中域名赋给 REALITY_DOMAIN /
+#   XHTTP_REALITY_DOMAIN，不回写 DOMAIN_REGISTRY / DOMAIN_MODE_* / DOMAIN_PROTO_*，
+#   与 reality_untag_self_domain() 不对称——首次把一个域名设为 reality 自有时，
+#   域名管理菜单不会显示占用。建议后续补对称的 reality_tag_self_domain()。
+
+# ── 辅助：交互式挑选/输入一个「自有域名」（vless-reality / xhttp-reality 复用）──
+# 用法: chosen=$(_reality_pick_own_domain [排除的域名...])
+# 注意：提示文字写 stderr（echo >&2 / read -rp 默认写 stderr），
+# 仅最终选中域名走 stdout，便于被 $(...) 干净捕获。
+_reality_pick_own_domain() {
+    local -a _exclude=("$@")
+    local -a _avail=()
+    local _d _ex _skip
+
+    for _d in "${DIRECT_DOMAINS[@]:-}"; do
+        [[ -z "$_d" ]] && continue
+        _skip=0
+        for _ex in "${_exclude[@]}" \
+                   "${XHTTP_DOMAIN:-}" "${GRPC_DOMAIN:-}" "${NAIVE_DOMAIN:-}" \
+                   "${ANYTLS_DOMAIN:-}" "${HYSTERIA2_DOMAIN:-}"; do
+            [[ -n "$_ex" && "$_d" == "$_ex" ]] && { _skip=1; break; }
+        done
+        (( _skip )) || _avail+=("$_d")
+    done
+
+    if (( ${#_avail[@]} > 0 )); then
+        echo "可用自有域名：" >&2
+        local _i=1
+        for _d in "${_avail[@]}"; do echo "  ${_i}. ${_d}" >&2; (( _i++ )); done
+        echo "  ${_i}. 手动输入" >&2
+        local _choice
+        read -rp "请选择 [1-${_i}，默认1]: " _choice
+        if [[ "${_choice}" == "${_i}" ]]; then
+            local _manual
+            read -rp "输入域名: " _manual
+            echo "${_manual}"
         else
-            log_info "vless-reality 保持自建域名模式（SNI=${REALITY_DOMAIN}，dest→本地伪装站 8321）"
-            log_info "下方公共伪装目标列表仅供 vless-xhttp-reality 挑选公共 SNI，不会改变 vless-reality 的 SNI"
+            local _idx=$(( ${_choice:-1} - 1 ))
+            (( _idx < 0 || _idx >= ${#_avail[@]} )) && _idx=0
+            echo "${_avail[$_idx]}"
         fi
     else
-        log_info "节点 vless-reality（Reality-direct）当前为公共 SNI 模式"
-        log_info "下方第 1 步所选伪装目标行，行首域名即 vless-reality 的 SNI（与该行 dest 同站）"
-        log_info "第 2 步再从该行的其余域名中，单独为 vless-xhttp-reality 选一个 SNI（nginx 按 SNI 分流两个节点）"
+        local _manual
+        read -rp "输入自有域名: " _manual
+        echo "${_manual}"
     fi
-    echo ""
+}
 
-    # 从 HW_REGION 前缀自动推断地区，避免重复手动选择
+# ── 辅助：地区 + 伪装目标列表选择（原 collect_reality_params 内联段）──
+# 设置全局 REALITY_DEST 与 REALITY_SERVER_NAMES（已去重）。
+# 仅当至少一个协议要用「公共 SNI」时才被调用。
+_reality_pick_target_list() {
     local region_choice
     local _hw_prefix="${HW_REGION%%/*}"
     case "$_hw_prefix" in
@@ -315,7 +337,6 @@ collect_reality_params() {
 
     case "${region_choice:-2}" in
 
-        # ── 美国 / 北美 ──────────────────────────────────────
         1)
             local -a _us_labels=(
                 "solanolibrary.com:443（洛杉矶公共图书馆）"
@@ -327,13 +348,8 @@ collect_reality_params() {
                 "www.lapl.org:443（洛杉矶公共图书馆官网）"
             )
             local -a _us_dests=(
-                "solanolibrary.com:443"
-                "www.siliconvalley.com:443"
-                "business.ca.gov:443"
-                "openclaw.ai:443"
-                "www.oxy.edu:443"
-                "film.ca.gov:443"
-                "www.lapl.org:443"
+                "solanolibrary.com:443" "www.siliconvalley.com:443" "business.ca.gov:443"
+                "openclaw.ai:443" "www.oxy.edu:443" "film.ca.gov:443" "www.lapl.org:443"
             )
             local -a _us_servernames=(
                 "solanolibrary.com openclaw.ai www.lapl.org www.siliconvalley.com www.oxy.edu business.ca.gov film.ca.gov"
@@ -347,9 +363,7 @@ collect_reality_params() {
             echo ""
             echo "美国 / 北美伪装目标："
             local _i
-            for (( _i=0; _i<${#_us_labels[@]}; _i++ )); do
-                echo "  $(( _i+1 )). ${_us_labels[$_i]}"
-            done
+            for (( _i=0; _i<${#_us_labels[@]}; _i++ )); do echo "  $(( _i+1 )). ${_us_labels[$_i]}"; done
             read -rp "请选择 [1-${#_us_labels[@]}，默认1]: " dest_choice
             local _di=$(( ${dest_choice:-1} - 1 ))
             (( _di < 0 || _di >= ${#_us_dests[@]} )) && _di=0
@@ -357,7 +371,6 @@ collect_reality_params() {
             read -ra REALITY_SERVER_NAMES <<< "${_us_servernames[$_di]}"
             ;;
 
-        # ── 欧洲 ─────────────────────────────────────────────
         2)
             local -a _eu_labels=(
                 "ethz.ch:443（瑞士联邦理工学院）"
@@ -368,12 +381,8 @@ collect_reality_params() {
                 "sentinels.copernicus.eu:443（哥白尼计划）"
             )
             local -a _eu_dests=(
-                "ethz.ch:443"
-                "www.ecb.europa.eu:443"
-                "opendata.cern.ch:443"
-                "yandex.com.tr:443"
-                "www.mpg.de:443"
-                "sentinels.copernicus.eu:443"
+                "ethz.ch:443" "www.ecb.europa.eu:443" "opendata.cern.ch:443"
+                "yandex.com.tr:443" "www.mpg.de:443" "sentinels.copernicus.eu:443"
             )
             local -a _eu_servernames=(
                 "ethz.ch m.ethz.ch debian.ethz.ch cuni.cz mff.cuni.cz www.mpg.de developer.trumpf.com"
@@ -386,9 +395,7 @@ collect_reality_params() {
             echo ""
             echo "欧洲伪装目标："
             local _i
-            for (( _i=0; _i<${#_eu_labels[@]}; _i++ )); do
-                echo "  $(( _i+1 )). ${_eu_labels[$_i]}"
-            done
+            for (( _i=0; _i<${#_eu_labels[@]}; _i++ )); do echo "  $(( _i+1 )). ${_eu_labels[$_i]}"; done
             read -rp "请选择 [1-${#_eu_labels[@]}，默认1]: " dest_choice
             local _di=$(( ${dest_choice:-1} - 1 ))
             (( _di < 0 || _di >= ${#_eu_dests[@]} )) && _di=0
@@ -396,16 +403,12 @@ collect_reality_params() {
             read -ra REALITY_SERVER_NAMES <<< "${_eu_servernames[$_di]}"
             ;;
 
-        # ── 亚洲 ─────────────────────────────────────────────
         3)
             local -a _as_labels=(
                 "www.lovelive-anime.jp:443（日本动画）"
                 "www.nintendo.co.jp:443（任天堂日本）"
             )
-            local -a _as_dests=(
-                "www.lovelive-anime.jp:443"
-                "www.nintendo.co.jp:443"
-            )
+            local -a _as_dests=("www.lovelive-anime.jp:443" "www.nintendo.co.jp:443")
             local -a _as_servernames=(
                 "www.lovelive-anime.jp www.nintendo.co.jp"
                 "www.nintendo.co.jp www.lovelive-anime.jp"
@@ -413,9 +416,7 @@ collect_reality_params() {
             echo ""
             echo "亚洲伪装目标："
             local _i
-            for (( _i=0; _i<${#_as_labels[@]}; _i++ )); do
-                echo "  $(( _i+1 )). ${_as_labels[$_i]}"
-            done
+            for (( _i=0; _i<${#_as_labels[@]}; _i++ )); do echo "  $(( _i+1 )). ${_as_labels[$_i]}"; done
             read -rp "请选择 [1-${#_as_labels[@]}，默认1]: " dest_choice
             local _di=$(( ${dest_choice:-1} - 1 ))
             (( _di < 0 || _di >= ${#_as_dests[@]} )) && _di=0
@@ -423,16 +424,13 @@ collect_reality_params() {
             read -ra REALITY_SERVER_NAMES <<< "${_as_servernames[$_di]}"
             ;;
 
-        # ── 自定义 ───────────────────────────────────────────
         4)
             read -rp "输入自定义 dest（格式 domain:443）: " REALITY_DEST
             read -rp "输入 serverName（多个用空格分隔）: " -a REALITY_SERVER_NAMES
             ;;
     esac
 
-    local deduped_server_names=()
-    local seen_server_names=""
-    local sn
+    local deduped_server_names=() seen_server_names="" sn
     for sn in "${REALITY_SERVER_NAMES[@]}"; do
         [[ -n "$sn" ]] || continue
         if [[ " ${seen_server_names} " != *" ${sn} "* ]]; then
@@ -441,106 +439,132 @@ collect_reality_params() {
         fi
     done
     REALITY_SERVER_NAMES=("${deduped_server_names[@]}")
+}
 
-    local reality_dest_domain="${REALITY_DEST%%:*}"
+# ── 收集 Reality 伪装参数 ────────────────────────────────────
+collect_reality_params() {
     echo ""
-    log_step "探测伪装域名 ${reality_dest_domain} 的可用路径..."
-    local detected_path
-    if detected_path=$(detect_spider_path "${reality_dest_domain}"); then
-        REALITY_SPIDER_X="${detected_path}"
-        log_info "spiderX 自动设为 ${detected_path}（${reality_dest_domain} 返回 200）"
-    else
-        log_warn "未探测到任何返回 200 的路径"
-        read -rp "请手动输入 Reality spiderX [默认 /]: " spider_x
-        REALITY_SPIDER_X="${spider_x:-/}"
-        log_warn "请确认该路径在目标网站返回 200，否则流量特征异常"
-    fi
+    log_step "配置 Reality 伪装参数"
+    echo ""
 
-    # ── 选择 vless-xhttp-reality 专用 SNI ─────────────────────
-    # serverNames[0] 留给 vless-reality（TCP+Vision / reality-direct，REALITY_SNI），
-    # 从剩余条目里选一个给 vless-xhttp-reality（8325）
-    XHTTP_REALITY_SNI=""
-    if (( ${#REALITY_SERVER_NAMES[@]} > 1 )); then
-        echo ""
-        echo "请选择 vless-xhttp-reality 节点（XHTTP-Reality 协议）使用的伪装 SNI："
-        echo "  （两 Reality 节点须用不同 SNI：首域名=vless-reality(8320)，本项=vless-xhttp-reality(8325)，nginx 据此分流）"
-        local _idx=1
-        for sn in "${REALITY_SERVER_NAMES[@]:1}"; do
-            echo "  ${_idx}. ${sn}"
-            (( _idx++ ))
-        done
-        echo "  （默认 1：${REALITY_SERVER_NAMES[1]}）"
-        read -rp "请选择 [1-$(( ${#REALITY_SERVER_NAMES[@]} - 1 ))，默认1]: " _sni_choice
-        local _sni_idx=$(( ${_sni_choice:-1} - 1 ))
-        # 越界则回退到 1
-        if (( _sni_idx < 0 || _sni_idx >= ${#REALITY_SERVER_NAMES[@]} - 1 )); then
-            _sni_idx=0
-        fi
-        XHTTP_REALITY_SNI="${REALITY_SERVER_NAMES[$(( _sni_idx + 1 ))]}"
-        # 防呆：不允许与 vless-reality 的 SNI（[0]）相同
-        if [[ "${XHTTP_REALITY_SNI}" == "${REALITY_SERVER_NAMES[0]}" ]]; then
-            log_warn "所选 SNI 与 vless-reality 相同，已自动清空——vless-xhttp-reality 节点不可用"
-            XHTTP_REALITY_SNI=""
-        else
-            log_info "vless-xhttp-reality SNI 设为: ${XHTTP_REALITY_SNI}"
-        fi
-    else
-        log_warn "serverNames 只有一个条目，vless-xhttp-reality 节点不可用（与 vless-reality 共用同一 SNI 无法分流）"
-    fi
+    local _vless_own="" _xhttp_own=""
 
-    # ── 选择 XHTTP-Reality 域名模式 ──────────────────────────────
-    # 有自有域名：dest → 本地 nginx 8326（真实证书 + 伪装站），更可控
-    # 无/公共 SNI：dest → dokodemo 4432 → 借用第三方域名（默认行为）
-    XHTTP_REALITY_DOMAIN=""
-    if [[ -n "${XHTTP_REALITY_SNI:-}" ]]; then
-        echo ""
-        echo "XHTTP-Reality 伪装域名模式："
-        echo "  1. 公共 SNI（${XHTTP_REALITY_SNI}）——借用第三方域名，无需自有证书（推荐）"
-        echo "  2. 自有域名——需拥有该域名证书，服务器自建伪装站"
-        read -rp "请选择 [1/2，默认1]: " _xhr_mode
-        if [[ "${_xhr_mode}" == "2" ]]; then
-            local -a _avail_direct=()
-            for _d in "${DIRECT_DOMAINS[@]:-}"; do
-                [[ "$_d" == "${REALITY_DOMAIN:-}"   ]] && continue
-                [[ "$_d" == "${XHTTP_DOMAIN:-}"    ]] && continue
-                [[ "$_d" == "${GRPC_DOMAIN:-}"     ]] && continue
-                [[ "$_d" == "${NAIVE_DOMAIN:-}"    ]] && continue
-                [[ "$_d" == "${ANYTLS_DOMAIN:-}"   ]] && continue
-                [[ "$_d" == "${HYSTERIA2_DOMAIN:-}" ]] && continue
-                _avail_direct+=("$_d")
-            done
-            if [[ ${#_avail_direct[@]} -gt 0 ]]; then
-                echo "可用自有域名："
-                local _di=1
-                for _d in "${_avail_direct[@]}"; do echo "  ${_di}. ${_d}"; (( _di++ )); done
-                echo "  ${_di}. 手动输入"
-                read -rp "请选择 [1-${_di}，默认1]: " _dom_choice
-                if [[ "${_dom_choice}" == "${_di}" ]]; then
-                    read -rp "输入域名: " XHTTP_REALITY_DOMAIN
-                else
-                    local _dom_idx=$(( ${_dom_choice:-1} - 1 ))
-                    (( _dom_idx < 0 || _dom_idx >= ${#_avail_direct[@]} )) && _dom_idx=0
-                    XHTTP_REALITY_DOMAIN="${_avail_direct[$_dom_idx]}"
-                fi
-            else
-                read -rp "输入 xhttp-reality 自有域名: " XHTTP_REALITY_DOMAIN
-            fi
-            [[ -n "${XHTTP_REALITY_DOMAIN}" ]] && log_info "XHTTP-Reality 自有域名: ${XHTTP_REALITY_DOMAIN}"
-        fi
-    fi
-
-    # ── 自建域名模式收敛：reality-direct 参数以 REALITY_DOMAIN 为准 ──
-    # 生成器在自建域名模式把 SNI 固定为 REALITY_DOMAIN、dest 固定为本地伪装站，
-    # 此处同步收敛内存变量与后续 state 持久化，避免 nginx stream map 残留公共死路由。
+    # ========================================================
+    # Step 1：vless-reality 模式（自有域名 / 公共SNI）—— 总是先问
+    # ========================================================
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        echo "vless-reality 当前绑定自有域名 ${REALITY_DOMAIN}"
+        echo "请选择 vless-reality 的伪装方式："
+        echo "  1. 公共 SNI —— 借用第三方域名（将摘除 ${REALITY_DOMAIN} 的 xray-reality 标签）"
+        echo "  2. 自建域名 —— ${REALITY_DOMAIN}（真实证书）"
+        read -rp "请选择 [1/2，默认2]: " _m1
+        echo ""
+        if [[ "${_m1:-2}" == "1" ]]; then
+            log_info "切换 vless-reality 为公共 SNI 模式：摘除 ${REALITY_DOMAIN} 的 xray-reality 标签并重建派生..."
+            reality_untag_self_domain "${REALITY_DOMAIN}"
+        else
+            _vless_own="${REALITY_DOMAIN}"
+            log_info "vless-reality 保持自建域名模式（SNI=${REALITY_DOMAIN}，dest→本地伪装站 8321）"
+        fi
+    else
+        echo "请选择 vless-reality 的伪装方式："
+        echo "  1. 公共 SNI —— 借用第三方域名（推荐）"
+        echo "  2. 自有域名 —— 需拥有该域名证书，服务器自建伪装站"
+        read -rp "请选择 [1/2，默认1]: " _m1
+        echo ""
+        if [[ "${_m1:-1}" == "2" ]]; then
+            _vless_own=$(_reality_pick_own_domain)
+            REALITY_DOMAIN="${_vless_own}"
+            log_info "vless-reality 自有域名设为: ${_vless_own}"
+            # 注：这里暂不回写 DOMAIN_REGISTRY，见函数前注释 TODO
+        fi
+    fi
+    echo ""
+
+    # ========================================================
+    # Step 2：vless-xhttp-reality 模式（自有域名 / 公共SNI）—— 也先问
+    # ========================================================
+    echo "请选择 vless-xhttp-reality 的伪装方式："
+    echo "  1. 公共 SNI —— 借用第三方域名（推荐）"
+    echo "  2. 自有域名 —— 需拥有该域名证书，服务器自建伪装站"
+    read -rp "请选择 [1/2，默认1]: " _m2
+    echo ""
+    if [[ "${_m2:-1}" == "2" ]]; then
+        _xhttp_own=$(_reality_pick_own_domain "${_vless_own}")
+        XHTTP_REALITY_DOMAIN="${_xhttp_own}"
+        log_info "vless-xhttp-reality 自有域名设为: ${_xhttp_own}"
+    fi
+    echo ""
+
+    # ========================================================
+    # Step 3：只有至少一个协议选了「公共SNI」，才需要伪装目标列表
+    # ========================================================
+    REALITY_SERVER_NAMES=()
+    XHTTP_REALITY_SNI=""
+    REALITY_DEST=""
+
+    if [[ -z "${_vless_own}" || -z "${_xhttp_own}" ]]; then
+        _reality_pick_target_list
+
+        if [[ -z "${_xhttp_own}" ]]; then
+            local -a _candidates=()
+            if [[ -z "${_vless_own}" ]]; then
+                # vless-reality 也在用这份列表 → serverNames[0] 归它，
+                # xhttp 只能从剩下的挑，避免两节点撞 SNI 导致 nginx 分流失败
+                _candidates=("${REALITY_SERVER_NAMES[@]:1}")
+            else
+                # vless-reality 走自有域名，没占用这份列表 → 全部可选
+                _candidates=("${REALITY_SERVER_NAMES[@]}")
+            fi
+
+            if (( ${#_candidates[@]} > 0 )); then
+                echo "请选择 vless-xhttp-reality 使用的伪装 SNI："
+                local _i=1
+                for sn in "${_candidates[@]}"; do echo "  ${_i}. ${sn}"; (( _i++ )); done
+                echo "  （默认 1：${_candidates[0]}）"
+                read -rp "请选择 [1-${#_candidates[@]}，默认1]: " _sni_choice
+                local _sni_idx=$(( ${_sni_choice:-1} - 1 ))
+                (( _sni_idx < 0 || _sni_idx >= ${#_candidates[@]} )) && _sni_idx=0
+                XHTTP_REALITY_SNI="${_candidates[$_sni_idx]}"
+                log_info "vless-xhttp-reality SNI 设为: ${XHTTP_REALITY_SNI}"
+            else
+                log_warn "没有可用的备用 SNI，vless-xhttp-reality 节点不可用"
+            fi
+        fi
+
+        # spiderX 只服务于 vless-reality 走公共SNI 的场景（xhttp-reality 的
+        # realitySettings 本来就没有 spiderX 字段，不需要为它探测）
+        if [[ -z "${_vless_own}" ]]; then
+            local reality_dest_domain="${REALITY_DEST%%:*}"
+            echo ""
+            log_step "探测伪装域名 ${reality_dest_domain} 的可用路径..."
+            local detected_path
+            if detected_path=$(detect_spider_path "${reality_dest_domain}"); then
+                REALITY_SPIDER_X="${detected_path}"
+                log_info "spiderX 自动设为 ${detected_path}（${reality_dest_domain} 返回 200）"
+            else
+                log_warn "未探测到任何返回 200 的路径"
+                read -rp "请手动输入 Reality spiderX [默认 /]: " spider_x
+                REALITY_SPIDER_X="${spider_x:-/}"
+                log_warn "请确认该路径在目标网站返回 200，否则流量特征异常"
+            fi
+        fi
+    fi
+
+    # ========================================================
+    # Step 4：自建域名模式收敛 —— vless-reality 用自有域名时，
+    # dest/serverNames 固定为本地伪装站（本身逻辑不变，只是现在
+    # 不会再被「白问一遍地区/列表」污染了）
+    # ========================================================
+    if [[ -n "${_vless_own}" ]]; then
         REALITY_DEST="127.0.0.1:8321"
-        REALITY_SERVER_NAMES=("${REALITY_DOMAIN}")
+        REALITY_SERVER_NAMES=("${_vless_own}")
     fi
 
     log_info "Reality dest:        ${REALITY_DEST}"
     log_info "Reality serverNames: ${REALITY_SERVER_NAMES[*]}"
     log_info "vless-reality       的 SNI: ${REALITY_SERVER_NAMES[0]:-（无）}"
-    log_info "vless-xhttp-reality 的 SNI: ${XHTTP_REALITY_SNI:-（未启用，与 vless-reality 无法分流）}"
+    log_info "vless-xhttp-reality 的 SNI: ${XHTTP_REALITY_SNI:-${XHTTP_REALITY_DOMAIN:-（未启用，与 vless-reality 无法分流）}}"
 }
 
 # ── 构建 wireguard 出站 JSON ──────────────────────────────────
