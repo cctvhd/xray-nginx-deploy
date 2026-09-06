@@ -574,6 +574,22 @@ collect_reality_params() {
     XHTTP_REALITY_SNI=""
     echo ""
 
+    # vless 自建时：把 state 里的公共回滚参数（dest/serverNames/spiderX）读回
+    # shell。wizard 流程 init_state/restore_domain_arrays 只还原 serverNames
+    # 数组、从不还原 dest/spiderX，nounset(set -u) 下裸引用 REALITY_DEST 会崩；
+    # 且调用方 save 块用 ${VAR:-} 会把未赋值的 dest/spiderX 写成 ''，清掉
+    # option-6 解除后待复用的公共回滚态。读回后展示可用、save 原样回写。
+    # vless 公共时这些由下方 _reality_pick_target_list/_probe_vless_spider_x
+    # 现场覆写，此读回无副作用。
+    if [[ -n "${_vless_own}" ]]; then
+        REALITY_DEST=$(get_state "REALITY_DEST" "")
+        REALITY_SPIDER_X=$(get_state "REALITY_SPIDER_X" "")
+        REALITY_SERVER_NAMES=()
+        local _rsn_state
+        _rsn_state=$(get_state "REALITY_SERVER_NAMES" "")
+        [[ -n "${_rsn_state}" ]] && read -ra REALITY_SERVER_NAMES <<< "${_rsn_state}"
+    fi
+
     if [[ -z "${_vless_own}" && -z "${_xhttp_own}" ]]; then
         # 两槽都公共：目标列表归 vless；xhttp 从 serverNames[1:] 挑不撞 SNI
         # （两节点共 SNI 会导致 nginx SNI map 只分流到一个后端）
