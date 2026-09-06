@@ -300,10 +300,11 @@ reality_tag_self_domain() {
                 return 1 ;;
         esac
     fi
-    # CDN 业务域（xhttp/grpc）不允许被 reality 认领自建（模式与 SNI 语义都不符）
+    # CDN / 反代业务域（xhttp/grpc/naiveproxy/anytls）不允许被 reality 认领自建
+    # （模式与 SNI 语义都不符）；reality 需独占一个无这些标签的直连域。
     case ",${existing}," in
-        *,xray-xhttp,*|*,xray-grpc,*)
-            log_warn "拒绝：${domain} 是 CDN 业务域（xray-xhttp/xray-grpc），不能作为 reality 自建域"
+        *,xray-xhttp,*|*,xray-grpc,*|*,naiveproxy,*|*,singbox,*)
+            log_warn "拒绝：${domain} 是 CDN/反代业务域（xray-xhttp/xray-grpc/naiveproxy/singbox），不能作为 reality 自建域"
             return 1 ;;
     esac
 
@@ -342,23 +343,29 @@ reality_tag_self_domain() {
 }
 
 
-# ── 收集 Reality 伪装参数（域归属只读，仅配借公共 SNI 槽的伪装目标）──
-# 设计(2026-09-06 职责分离)：
-#   1. 域归属——「哪个自有域绑定 xray-reality(8320) / xhttp-reality(8325)」——
-#      由主菜单 5→6「刷新/修复域名协议分配」唯一决定并持久化：
-#      reality_tag_self_domain / reality_untag_self_domain（上文）写
-#      DOMAIN_REGISTRY + DOMAIN_PROTO_* + DOMAIN_PRIMARY_*，派生 REALITY_DOMAIN /
-#      XHTTP_REALITY_DOMAIN 经 rebuild 落库。本函数对域归属**只读**：自建槽按
-#      自建处理，绝不提供摘除/认领交互（否则与 option-6 冲突，见 menu-x 回归）。
-#   2. 本函数只配置仍「借公共 SNI」槽位的伪装参数：
+# ── 收集 Reality 伪装参数（菜单 11/x = SNI 真分配：自建 vs 借公共）──
+# 设计(2026-09-06 SNI 真分配)：
+#   1. 域归属分两层：
+#      - 主菜单 5→6 = 预分配：仅把一个「可自建 SNI」的直连域 earmark 给某
+#        Reality 槽（写 REALITY_PREALLOC / XHTTP_REALITY_PREALLOC，advisory，
+#        不切 SNI、不自动改绑）；
+#      - 本函数（菜单 11/x）= SNI 真分配：每个 Reality 协议**独立**选 SNI 来源
+#        （用自有域自建 / 借公共大站 SNI），读取 5→6 预分配并排最前。
+#        reality_tag_self_domain / reality_untag_self_domain（上文）是唯一持久化
+#        通道（DOMAIN_REGISTRY + DOMAIN_PROTO_* + DOMAIN_PRIMARY_* → rebuild 派生
+#        REALITY_DOMAIN / XHTTP_REALITY_DOMAIN）。本函数调用它们——自建槽可随时
+#        取消 / 改换，不再是只读、也不再反向依赖 option-6 解除。
+#   2. 名额门控：自建候选 = 预分配优先 + 其它真正可自建 SNI 的直连域（已入册、
+#      无 CDN/anytls/naiveproxy/任一 reality 标签、证书已签，见 _reality_self_capable）。
+#      无候选 → 本槽「自建」选项隐藏；一域被某槽自建后自动从另一槽候选剔除
+#      （两槽都想自建但可用自有域不足时，第二个自建自然选不上）。
+#   3. Stage B 只给最终仍「借公共 SNI」的槽配伪装参数：
 #      - vless-reality 公共 → dest + serverNames 池 + spiderX 探测；
 #      - vless-xhttp-reality 公共 → 单个借用站点（即其 SNI，dest 恒=该站点:443）。
-#   3. 列表只弹一次、按需分配：两槽都公共 → 目标列表归 vless，serverNames[1:]
-#      供 xhttp 挑（避免两节点撞 SNI）；仅 xhttp 公共 → 只问一次借用站点=SNI；
-#      仅 vless 公共 → 只配 vless；两槽都自建 → 无需公共参数。
+#      两槽都公共 → 目标列表归 vless，serverNames[1:] 供 xhttp 挑（避免撞 SNI）。
 #   4. vless 自建时不再收敛 REALITY_DEST/serverNames（生成器自建分支固定
 #      dest→本地伪装站 8321、serverNames=["REALITY_DOMAIN"]，不读这两个变量）：
-#      保留它们 = 该槽公共模式回滚态，option-6 解除绑定后可直接复用。
+#      保留它们 = 该槽公共模式回滚态，本菜单切回借公共 SNI 时直接复用。
 
 # ── 辅助：vless-reality 走公共 SNI 时探测可用 spiderX 路径 ──
 # 探测目标站返回 200 的路径；失败则手动输入。仅 vless 公共需要（xhttp-reality
@@ -531,6 +538,156 @@ _reality_pick_target_list() {
     fi
 }
 
+# ── Reality 域「能否作自建 SNI」判定（不要求入册）────────────
+# 返回 0 iff DOMAIN_PROTO_<sfx> 不含 {xray-xhttp, xray-grpc, singbox, naiveproxy,
+# xray-reality, xhttp-reality} 且证书已签。证书路径解析与 nginx generate_servers_conf
+# 完全一致（CERT_PATH_${root//./_} 状态优先，否则 /etc/letsencrypt/live/${root}）。
+_reality_domain_usable_fast() {
+    local domain="$1"
+    local suffix protos
+    suffix=$(printf '%s' "$domain" | tr '.' '_')
+    protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+    local -a _fb=(xray-xhttp xray-grpc singbox naiveproxy xray-reality xhttp-reality)
+    local _t
+    for _t in "${_fb[@]}"; do
+        case ",${protos}," in *,"${_t}",*) return 1 ;; esac
+    done
+    local root cert_path
+    root=$(printf '%s' "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+    cert_path=$(get_state "CERT_PATH_${root//./_}" "")
+    [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${root}"
+    [[ -f "${cert_path}/fullchain.pem" ]]
+}
+
+# 某域现在能否作为某 Reality 槽的自建 SNI（Q2=只许可自建的域）= 已入册 + 上面可用。
+_reality_self_capable() {
+    local domain="$1"
+    domain_is_registered "$domain" || return 1
+    _reality_domain_usable_fast "$domain"
+}
+
+# 某 Reality 槽的可选自有域（stdout 每行一域）。顺序 = [5→6 预分配] + [其余空闲直连域]。
+# 剔除：本槽当前活性自建域、另一槽活性自建域、另一槽预分配。预分配域即使刚被 untag
+# 摘出注册表（无其它角色、证书仍在）也照列——reality_tag_self_domain 会重新入册，
+# 自建取消后可一键再启用。
+_reality_own_candidates() {
+    local tag="$1"
+    local own other own_pre other_pre
+    if [[ "$tag" == "xray-reality" ]]; then
+        own="${REALITY_DOMAIN:-}";        other="${XHTTP_REALITY_DOMAIN:-}"
+        own_pre=$(get_state "REALITY_PREALLOC" "");       other_pre=$(get_state "XHTTP_REALITY_PREALLOC" "")
+    else
+        own="${XHTTP_REALITY_DOMAIN:-}";  other="${REALITY_DOMAIN:-}"
+        own_pre=$(get_state "XHTTP_REALITY_PREALLOC" ""); other_pre=$(get_state "REALITY_PREALLOC" "")
+    fi
+    local -a pool=()
+    local registry d
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+    for d in $registry; do
+        [[ "$d" == "$own" || "$d" == "$other" || "$d" == "$other_pre" ]] && continue
+        _reality_self_capable "$d" && pool+=("$d")
+    done
+    if [[ -n "$own_pre" && "$own_pre" != "$own" && "$own_pre" != "$other" \
+            && "$own_pre" != "$other_pre" ]] && _reality_domain_usable_fast "$own_pre"; then
+        echo "$own_pre"
+    fi
+    local seen="${own_pre:-}" d2
+    for d2 in "${pool[@]}"; do
+        [[ "$d2" != "$seen" ]] && echo "$d2"
+    done
+}
+
+# ── 单 Reality 槽 SNI 来源决策（Stage A 用）─────────────────
+# 用法: _reality_ask_slot_sni <tag>   tag ∈ {xray-reality, xhttp-reality}
+# 读全局 REALITY_DOMAIN / XHTTP_REALITY_DOMAIN + state 预分配；需要时调
+# reality_tag/untag_self_domain（内部 rebuild+load 已刷新上述全局——调用方切勿
+# 沿用进入时的旧值）。槽为「借公共 且无自建候选」时置 _REALITY_SLOT_GUIDE=1。
+_reality_ask_slot_sni() {
+    local tag="$1"
+    local label own_key other_key prealloc_key
+    if [[ "$tag" == "xray-reality" ]]; then
+        label="VLESS-Reality"; own_key="REALITY_DOMAIN"; other_key="XHTTP_REALITY_DOMAIN"; prealloc_key="REALITY_PREALLOC"
+    else
+        label="XHTTP-Reality"; own_key="XHTTP_REALITY_DOMAIN"; other_key="REALITY_DOMAIN"; prealloc_key="XHTTP_REALITY_PREALLOC"
+    fi
+    local own="${!own_key:-}"
+    local prealloc
+    prealloc=$(get_state "$prealloc_key" "")
+
+    local -a cands=()
+    local _d
+    while IFS= read -r _d; do [[ -n "$_d" ]] && cands+=("$_d"); done < <(_reality_own_candidates "$tag")
+
+    echo ""
+    local c _i _choice _target
+    if [[ -n "$own" ]]; then
+        # ── 当前用自有域自建：保持 / 取消（回公共）/ 改换 ──
+        log_info "${label} 当前用自有域自建: ${own}"
+        echo "  请选择该协议的 SNI 来源："
+        echo "  1) 保持自建 ${own}（默认）"
+        echo "  2) 切回借公共 SNI（取消自建）"
+        if (( ${#cands[@]} > 0 )); then
+            echo "  3) 改用其它自有域自建："
+            local _j=1
+            for c in "${cands[@]}"; do printf "     %d) %s\n" "$_j" "$c"; ((_j++)); done
+        fi
+        read -rp "  请选择 [默认1]: " _choice
+        case "${_choice:-1}" in
+            2)
+                reality_untag_self_domain "$own" "$tag"
+                log_info "${label} 已取消自建 → 回借公共 SNI（公共伪装参数在下方配置）"
+                ;;
+            3)
+                if (( ${#cands[@]} > 0 )); then
+                    read -rp "  选择要改用哪个自有域 [1-${#cands[@]}]: " _i
+                    _target="${cands[$(( ${_i:-1} - 1 ))]:-}"
+                    if [[ -n "$_target" && "$_target" != "$own" ]]; then
+                        reality_untag_self_domain "$own" "$tag"
+                        if reality_tag_self_domain "$_target" "$tag"; then
+                            save_state "$prealloc_key" "$_target"
+                            log_info "${label} 已改用自有域自建: ${_target}"
+                        else
+                            log_warn "改绑 ${_target} 失败（见上方原因）——恢复原自建域 ${own}"
+                            reality_tag_self_domain "$own" "$tag"
+                        fi
+                    fi
+                fi
+                ;;
+        esac
+    else
+        # ── 当前借公共 SNI（或未配置）──
+        log_info "${label} 借公共 SNI（未用自有域自建）"
+        if (( ${#cands[@]} == 0 )); then
+            # 无任何可自建候选：只剩「借公共」一条路，不弹选择、不占 read
+            _REALITY_SLOT_GUIDE=1
+            return 0
+        fi
+        echo "  请选择该协议的 SNI 来源："
+        echo "  1) 借公共大站 SNI（默认）"
+        echo "  2) 用自有域自建："
+        local _k=1
+        for c in "${cands[@]}"; do
+            local _mark=""
+            [[ "$c" == "$prealloc" ]] && _mark="（主菜单5→6 已预分配，优先）"
+            printf "     %d) %s %s\n" "$_k" "$c" "$_mark"
+            ((_k++))
+        done
+        read -rp "  请选择 [1-2，默认1]: " _choice
+        if [[ "${_choice:-1}" == "2" ]]; then
+            read -rp "  选择要自建的自有域 [1-${#cands[@]}]: " _i
+            _target="${cands[$(( ${_i:-1} - 1 ))]:-}"
+            if [[ -n "$_target" ]]; then
+                if reality_tag_self_domain "$_target" "$tag"; then
+                    save_state "$prealloc_key" "$_target"
+                    log_info "${label} 已启用自有域自建: ${_target}"
+                else
+                    log_warn "${label} 绑定自建域 ${_target} 失败（见上方原因），保持借公共 SNI"
+                fi
+            fi
+        fi
+    fi
+}
+
 # ── 收集 Reality 伪装参数 ────────────────────────────────────
 collect_reality_params() {
     echo ""
@@ -541,27 +698,28 @@ collect_reality_params() {
 
     # ── 防御：同域双标（registry 把同一域同时标给两节点 → SNI 冲突）──
     # 属域层错误态：此处自动把 xhttp 降为公共（避免 generate_sni_map 静默丢
-    # 8325）；正确归属仍须到主菜单 5→6 重分。
+    # 8325）；正确归属仍须到主菜单 11/x 把两槽分配到不同自有域。
     if [[ -n "${_xhttp_own}" && "${_xhttp_own}" == "${_vless_own}" ]]; then
         log_warn "检测到 ${_xhttp_own} 同时是两 Reality 节点的自建域（SNI 冲突）"
-        log_warn "将 vless-xhttp-reality 自动降为公共 SNI；请到主菜单 5→6 把两槽分配到不同自有域"
+        log_warn "将 vless-xhttp-reality 自动降为公共 SNI；请到本菜单（11/x）把两槽分配到不同自有域"
         reality_untag_self_domain "${_xhttp_own}" "xhttp-reality"
         _xhttp_own="${XHTTP_REALITY_DOMAIN:-}"
     fi
 
-    # ── 只读展示域归属（不提供摘除/认领交互；需调整请到主菜单 5→6）──
-    if [[ -n "${_vless_own}" ]]; then
-        log_info "vless-reality       已绑定自建域 ${_vless_own}（主菜单5→6分配；SNI=${_vless_own}，dest→本地伪装站8321）"
-    else
-        log_info "vless-reality       借公共 SNI（无自建域）"
-    fi
-    if [[ -n "${_xhttp_own}" ]]; then
-        log_info "vless-xhttp-reality 已绑定自建域 ${_xhttp_own}（主菜单5→6分配；SNI=${_xhttp_own}，dest→本地伪装站8326）"
-    else
-        log_info "vless-xhttp-reality 借公共 SNI（无自建域）"
-    fi
-    if [[ -z "${_vless_own}" || -z "${_xhttp_own}" ]]; then
-        log_warn "如需绑定自有域名，请到主菜单 5→6 刷新/修复域名协议分配（本菜单不改域归属）"
+    # ═══ Stage A：逐槽 SNI 来源决策（本菜单 = SNI 真分配）═══
+    # 每个 Reality 协议独立选「用自有域自建 / 借公共大站 SNI」。候选 =
+    # [5→6 预分配优先] + [其它可自建空闲直连域]，见 _reality_ask_slot_sni。
+    # tag/untag 内部 rebuild+load_domain_state 已刷新 shell 全局
+    # REALITY_DOMAIN / XHTTP_REALITY_DOMAIN——故 Stage A 后必须重快照，
+    # 不可沿用进入本函数时的旧值（这是 tag/untag 后重快照纪律）。
+    _REALITY_SLOT_GUIDE=0
+    _reality_ask_slot_sni xray-reality
+    _reality_ask_slot_sni xhttp-reality
+    _vless_own="${REALITY_DOMAIN:-}"
+    _xhttp_own="${XHTTP_REALITY_DOMAIN:-}"
+    if (( _REALITY_SLOT_GUIDE )); then
+        echo ""
+        log_info "如需让借公共 SNI 的 Reality 槽用自有域自建：主菜单 5 为域新增灰云直连并签发证书 → 5→6 预分配 → 重跑本菜单选自建"
     fi
 
     # ========================================================
@@ -569,7 +727,7 @@ collect_reality_params() {
     # XHTTP_REALITY_SNI 必须重置：xhttp 自建时要置空（防残留把自建槽误当公共）。
     # REALITY_DEST / REALITY_SERVER_NAMES 不预清：vless 自建时生成器固定
     # dest→本地伪装站8321、serverNames=["REALITY_DOMAIN"]，不读它们，保留即是
-    # 该槽公共模式回滚态（option-6 解除后直接复用）。
+    # 该槽公共模式回滚态（本菜单切回借公共 SNI 时直接复用）。
     # ========================================================
     XHTTP_REALITY_SNI=""
     echo ""
@@ -578,7 +736,7 @@ collect_reality_params() {
     # shell。wizard 流程 init_state/restore_domain_arrays 只还原 serverNames
     # 数组、从不还原 dest/spiderX，nounset(set -u) 下裸引用 REALITY_DEST 会崩；
     # 且调用方 save 块用 ${VAR:-} 会把未赋值的 dest/spiderX 写成 ''，清掉
-    # option-6 解除后待复用的公共回滚态。读回后展示可用、save 原样回写。
+    # 本菜单切回借公共 SNI 后待复用的公共回滚态。读回后展示可用、save 原样回写。
     # vless 公共时这些由下方 _reality_pick_target_list/_probe_vless_spider_x
     # 现场覆写，此读回无副作用。
     if [[ -n "${_vless_own}" ]]; then
@@ -626,7 +784,7 @@ collect_reality_params() {
     if [[ -n "${_vless_own}" ]]; then
         log_info "vless-reality       自建模式：SNI=${_vless_own}，dest→本地伪装站8321（生成器固定）"
         if [[ -n "${REALITY_DEST}" || ${#REALITY_SERVER_NAMES[@]} -gt 0 ]]; then
-            log_info "Reality 公共回滚参数保留: dest=${REALITY_DEST} serverNames=${REALITY_SERVER_NAMES[*]}（解除自建后复用）"
+            log_info "Reality 公共回滚参数保留: dest=${REALITY_DEST} serverNames=${REALITY_SERVER_NAMES[*]}（切回借公共 SNI 后复用）"
         fi
     else
         log_info "Reality dest:        ${REALITY_DEST}"

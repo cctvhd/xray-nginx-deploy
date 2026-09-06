@@ -2389,7 +2389,7 @@ print_domain_protocol_overview() {
         [[ -n "$_d" ]] && _usage[$_d]=$(( ${_usage[$_d]:-0} + 1 ))
     done
 
-    local -a _gap=() _unconf=()
+    local -a _unconf=()
     local _label _rest _var _snk _sni _note
     for _r in "${_rows[@]}"; do
         _label="${_r%%|*}"; _rest="${_r#*|}"
@@ -2403,8 +2403,9 @@ print_domain_protocol_overview() {
             _sni=""
             [[ -n "$_snk" ]] && _sni=$(get_state "$_snk" "")
             if [[ -n "$_sni" ]]; then
-                printf "  %-16s %-30s %s\n" "$_label" "(借公共 SNI: ${_sni})" "⚠ 缺口 · 缺自建域"
-                _gap+=("$_label")
+                # Reality 槽借公共大站 SNI = 合法配置态，非缺口；自建与否由菜单 11/x 决策
+                # （5→6 只管预分配）。仅真正「无域无 SNI」的槽才是未配置。
+                printf "  %-16s %-30s %s\n" "$_label" "(借公共 SNI: ${_sni})" "公共伪装"
             else
                 printf "  %-16s %-30s %s\n" "$_label" "(未配置)" "—"
                 _unconf+=("$_label")
@@ -2426,12 +2427,7 @@ print_domain_protocol_overview() {
         log_warn "已注册但未挂任何协议：${_orphan[*]}（不占协议槽，需手动分配）"
     fi
 
-    # 汇总三问之二/三
-    echo ""
-    log_info "未分配协议（缺口）：${#_gap[@]} 个"
-    if (( ${#_gap[@]} > 0 )); then
-        printf "  %s\n" "${_gap[@]/#/·  }"
-    fi
+    # 汇总（Reality 借公共 SNI 不再视为缺口；未配置槽位由下方 _unconf 单独提示）
     log_info "未分配空闲域名：$(( ${#_CF_SPARE_GREY[@]} + ${#_CF_SPARE_PROXIED[@]} )) 个"
     if (( ${#_CF_SPARE_GREY[@]} > 0 )); then
         printf "    灰云直指本机（可作直连 / Reality 自建）：%s\n" "${_CF_SPARE_GREY[*]}"
@@ -2456,186 +2452,97 @@ print_domain_protocol_overview() {
     fi
 }
 
-# ── 空闲直连域自动补 Reality 自建缺口（预览 + y/N 确认）────────
-# 仅当某 Reality 槽仍借公共 SNI（协议在跑）且 CF 有空闲灰云直连域时才弹 y/N。
-# 确认后经 reality_tag_self_domain()（xray 模块，按需 load）注册 + 切自建；
-# state 变化由 refresh 尾部的槽位 diff 抓到 → 触发既有级联（Xray/nginx/订阅）。
-# 惰性的旧公共 REALITY_SERVER_NAMES/DEST/SNI 保留：自建模式生成器不读，回公共即复用。
-offer_reality_auto_assign() {
-    local _vless_gap=0 _xhttp_gap=0
-    [[ -z "$(get_state "REALITY_DOMAIN" "")" && -n "$(get_state "REALITY_SNI" "")" ]] && _vless_gap=1
-    [[ -z "$(get_state "XHTTP_REALITY_DOMAIN" "")" && -n "$(get_state "XHTTP_REALITY_SNI" "")" ]] && _xhttp_gap=1
-    (( _vless_gap == 0 && _xhttp_gap == 0 )) && return 0
-
-    local _gapname=""
-    (( _vless_gap )) && _gapname="VLESS-Reality"
-    (( _xhttp_gap )) && _gapname="${_gapname:+${_gapname}, }XHTTP-Reality"
-
-    # 空闲池 = 盘点出的灰云直指本机 且 尚未入册
-    local _used=" $(get_state "DOMAIN_REGISTRY" "") "
-    local -a _pool=()
-    local _d
-    for _d in "${_CF_SPARE_GREY[@]}"; do
-        [[ " $_used " == *" $_d "* ]] && continue
-        _pool+=("$_d")
-    done
-    if (( ${#_pool[@]} == 0 )); then
-        echo ""
-        log_info "缺口协议：${_gapname}；当前 CF 无空闲直连域可自动补齐（可在 CF 增配一条灰云 A/AAAA 记录后重跑本项）"
-        return 0
-    fi
-
-    # 组装配对：VLESS-Reality 优先取第 1 个空闲域，XHTTP-Reality 用下一个
-    local -a _assign=() _tag=()
-    local _pi=0
-    if (( _vless_gap )); then
-        _assign+=("${_pool[$_pi]}"); _tag+=("xray-reality"); (( _pi++ ))
-    fi
-    if (( _xhttp_gap && _pi < ${#_pool[@]} )); then
-        _assign+=("${_pool[$_pi]}"); _tag+=("xhttp-reality"); (( _pi++ ))
-    fi
-    if (( ${#_assign[@]} == 0 )); then
-        echo ""
-        log_info "缺口协议：${_gapname}；但可用空闲域不足，跳过自动分配"
-        return 0
-    fi
-
-    echo ""
-    log_info "检测到可自动补齐的 Reality 自建域缺口："
-    local _i _slotname
-    for _i in "${!_assign[@]}"; do
-        if [[ "${_tag[$_i]}" == "xray-reality" ]]; then _slotname="VLESS-Reality"; else _slotname="XHTTP-Reality"; fi
-        printf "  · 将 %-30s → %s（自建：SNI=%s，Reality dest→本地伪装站）\n" \
-            "${_assign[$_i]}" "$_slotname" "${_assign[$_i]}"
-    done
-    echo "    影响：重建 Xray config + Nginx（SNI map / 伪装站）+ 客户端订阅；"
-    echo "          原借公共 SNI 的该协议客户端需重新订阅才生效。"
-    local _yn
-    read -rp "  是否执行自动分配？[y/N]: " _yn
-    [[ "${_yn,,}" == "y" ]] || { echo ""; log_info "已跳过，未作任何修改"; return 0; }
-
-    # reality_tag_self_domain 定义在 xray 模块，本菜单仅载 cert → 按需补载
-    if ! declare -F reality_tag_self_domain >/dev/null 2>&1; then
+# ── Reality 自建域预分配（菜单 5→6 = 预分配，只 earmark 不设 SNI）────────
+# 职责（2026-09-06 职责反转）：仅把「可作自建 SNI 的直连域」预指派给某个仍借公共
+# SNI 的 Reality 槽（写 *_PREALLOC 键，advisory）。不挂 reality 标签、不改 *_DOMAIN、
+# 不触发 diff/级联——真正切换 SNI 来源在菜单 11/x（SNI 真分配）。
+# 候选 = [当前预分配优先] + [其它真正可自建空闲直连域]，名额判定与 11/x 共用
+# _reality_own_candidates（xray 模块）。无候选 → 打步骤指引；两槽都自建 → return 0。
+offer_reality_preassign() {
+    # 候选过滤依赖 xray 模块的 reality 域能力函数；本菜单可能仅载 cert → 按需补载
+    if ! declare -F _reality_own_candidates >/dev/null 2>&1; then
         declare -F load_module >/dev/null 2>&1 && load_module xray >/dev/null 2>&1 || true
     fi
-    local _applied=0
-    for _i in "${!_assign[@]}"; do
-        if declare -F reality_tag_self_domain >/dev/null 2>&1; then
-            if reality_tag_self_domain "${_assign[$_i]}" "${_tag[$_i]}"; then
-                log_info "已分配：${_assign[$_i]} → ${_tag[$_i]}（自建模式）"
-                _applied=1
-            else
-                log_warn "分配失败：${_assign[$_i]} → ${_tag[$_i]}（见上方拒绝原因），跳过"
-            fi
-        else
-            log_warn "reality_tag_self_domain 不可用（xray 模块加载失败）——请手动在主菜单 x 配置 Reality"
-        fi
-    done
-
-    # 仍缺自建域且仍在借 SNI 的槽位 → 提示
-    local _still=""
-    [[ -z "$(get_state "REALITY_DOMAIN" "")" && -n "$(get_state "REALITY_SNI" "")" ]] && _still="VLESS-Reality"
-    [[ -z "$(get_state "XHTTP_REALITY_DOMAIN" "")" && -n "$(get_state "XHTTP_REALITY_SNI" "")" ]] \
-        && _still="${_still:+${_still}, }XHTTP-Reality"
-    if (( _applied )) && [[ -n "$_still" ]]; then
-        echo ""
-        log_info "仍缺自建域的协议槽位：${_still}（暂无更多空闲直连域，继续借公共 SNI）"
-    fi
-}
-
-# ── 解除 Reality 自建绑定（域归属同处管理：主菜单 5→6）──
-# 列出已自建绑定 → 选序号解除（回借公共 SNI，走 reality_untag_self_domain）。
-# 解除后若另一 Reality 槽仍无自建域、且被释域未挂其它协议标签 → 可顺带改绑给它
-# （覆盖「同一域在 xhttp/vless 间换绑」；auto-assign 只补缺口且 VLESS 优先，
-# 无法实现换绑）。默认不改、无绑定不弹、恒 return 0。
-offer_reality_unbind() {
-    local -a _rows=()
-    local _sl _sl_dom _dom_key _rest _name _tag
-    for _sl in "REALITY_DOMAIN|VLESS-Reality|xray-reality" \
-               "XHTTP_REALITY_DOMAIN|XHTTP-Reality|xhttp-reality"; do
-        _dom_key="${_sl%%|*}"; _rest="${_sl#*|}"
-        _name="${_rest%%|*}"; _tag="${_rest##*|}"
-        _sl_dom=$(get_state "$_dom_key" "")
-        [[ -n "$_sl_dom" ]] && _rows+=("${_name}|${_tag}|${_sl_dom}")
-    done
-    (( ${#_rows[@]} == 0 )) && return 0
-
-    echo ""
-    log_info "Reality 自建域绑定（选序号可解除 → 回借公共 SNI；域归属均在本项管理）："
-    local _i=1 _r
-    for _r in "${_rows[@]}"; do
-        printf "  %d) %-16s → %s\n" "$_i" "${_r%%|*}" "${_r##*|}"
-        (( _i++ ))
-    done
-    echo "  0) 不改动"
-    read -rp "请选择 [0-${#_rows[@]}，默认0]: " _ub
-    [[ "${_ub:-0}" == "0" ]] && return 0
-    local _idx=$(( ${_ub:-0} - 1 ))
-    (( _idx < 0 || _idx >= ${#_rows[@]} )) && return 0
-    local _sel
-    _sel="${_rows[$_idx]}"
-    _name="${_sel%%|*}"; _rest="${_sel#*|}"
-    _tag="${_rest%%|*}"; _dom="${_rest##*|}"
-    echo ""
-
-    # reality_untag/tag 定义在 xray 模块，本菜单仅载 cert → 按需补载
-    if ! declare -F reality_untag_self_domain >/dev/null 2>&1; then
-        declare -F load_module >/dev/null 2>&1 && load_module xray >/dev/null 2>&1 || true
-    fi
-    if ! declare -F reality_untag_self_domain >/dev/null 2>&1; then
-        log_warn "reality_untag_self_domain 不可用（xray 模块加载失败），无法解除——请到主菜单 x 处理"
+    if ! declare -F _reality_own_candidates >/dev/null 2>&1; then
+        log_warn "Reality 域能力函数不可用（xray 模块加载失败），跳过预分配"
         return 0
     fi
 
-    if ! reality_untag_self_domain "$_dom" "$_tag"; then
-        log_warn "解除 ${_name} 的自建域 ${_dom} 失败（见上方原因），未改动"
-        return 0
-    fi
-    log_info "已解除 ${_name} 的自建域 ${_dom}（回到借公共 SNI 状态）"
+    echo ""
+    log_info "Reality 自建域预分配（5→6 只 earmark 候选域，不切 SNI；主菜单 11/x 选用自有域自建才真正切换）"
+    log_info "预分配候选 = 已入册 + 灰云直连 + 已发证书 + 无 CDN/naive/anytls/另一 Reality 占用"
 
-    # 解除后：另一 Reality 槽仍无自建域、且被释域未挂其它协议标签 → 可改绑过去
-    local _sfx _protos
-    _sfx=$(echo "$_dom" | tr '.' '_')
-    _protos=$(get_state "DOMAIN_PROTO_${_sfx}" "")
-    local _other_key _other_tag _swap=""
-    if [[ "$_tag" == "xray-reality" ]]; then
-        _other_key="XHTTP_REALITY_DOMAIN"; _other_tag="xhttp-reality"
-    else
-        _other_key="REALITY_DOMAIN"; _other_tag="xray-reality"
-    fi
-    if [[ -z "$(get_state "$_other_key" "")" && -z "$_protos" ]]; then
+    local _slot_line _slot_key _rest _slot_name _slot_tag _dom_key _pre_key
+    local _pre _cl _cand _count _i _sel _tgt
+    for _slot_line in "REALITY|VLESS-Reality|xray-reality" "XHTTP_REALITY|XHTTP-Reality|xhttp-reality"; do
+        _slot_key="${_slot_line%%|*}"; _rest="${_slot_line#*|}"
+        _slot_name="${_rest%%|*}"; _slot_tag="${_rest##*|}"
+        _dom_key="${_slot_key}_DOMAIN"; _pre_key="${_slot_key}_PREALLOC"
+
+        # 已用自有域自建的槽：预分配无意义（活性自建域即现状），跳过
+        [[ -n "$(get_state "$_dom_key" "")" ]] && continue
+
+        _pre=$(get_state "$_pre_key" "")
+
+        # 候选（stdout 每行一域）：当前预分配 usable 则排最前，其后是空闲直连候选
+        local -a _cand=()
+        while IFS= read -r _cl; do [[ -n "$_cl" ]] && _cand+=("$_cl"); done < <(_reality_own_candidates "$_slot_tag")
+
         echo ""
-        read -rp "  把 ${_dom} 改绑给另一 Reality 槽（${_other_key%_DOMAIN}）？[y/N]: " _swap
-        if [[ "${_swap,,}" == "y" ]]; then
-            if reality_tag_self_domain "$_dom" "$_other_tag"; then
-                log_info "已把 ${_dom} 改绑给 ${_other_key%_DOMAIN}（${_other_tag}）"
-                _swap="y"
-            else
-                log_warn "改绑失败（见上方原因）；${_dom} 仍处未绑定态"
-            fi
+        if [[ -n "$_pre" ]]; then
+            log_info "${_slot_name} 当前预分配: ${_pre}（菜单 11/x 启用前不改 SNI）"
+        else
+            log_info "${_slot_name} 未预分配"
         fi
-    fi
 
-    # 未换绑 → 提示回公共的后续；公共参数若是早期残留则提醒重配
-    if [[ "${_swap,,}" != "y" ]]; then
-        local _stale=""
-        if [[ "$_tag" == "xray-reality" ]]; then
-            # 旧版菜单 x 会把 vless 公共参数收敛成自建残值，解除后即失效 → 需重配
-            if [[ "$(get_state "REALITY_SERVER_NAMES" "")" == "$_dom" \
-                || "$(get_state "REALITY_DEST" "")" == "127.0.0.1:8321" ]]; then
-                _stale=1
-            fi
-        else
-            if [[ "$(get_state "XHTTP_REALITY_SNI" "")" == "$_dom" ]]; then
-                _stale=1
-            fi
+        if (( ${#_cand[@]} == 0 && ${#_pre} == 0 )); then
+            echo "  无可用自建域候选。如需让该槽用自有域自建："
+            echo "    ① Cloudflare 为该域新增灰云（仅 DNS）A/AAAA 指向本机"
+            echo "    ② 在菜单 5 为该域签发证书"
+            echo "    ③ 重跑本项（5→6）预分配"
+            echo "    ④ 到主菜单 11/x 选『用自有域自建』即切换（SNI map / 伪装站自动重建）"
+            continue
         fi
-        if [[ -n "$_stale" ]]; then
-            log_warn "该槽公共伪装参数仍是早期残留——请到主菜单 11/x 重新选择公共伪装目标（本项只改域归属）"
-        else
-            log_info "该槽已回未绑公共 SNI 状态；如需手动改绑到指定协议槽，可到主菜单 5 域名编辑器打 xray-reality / xhttp-reality 标签"
+
+        echo "  请选择该协议的预分配（不影响当前 SNI）："
+        echo "    0) 不改动（默认）"
+        _count=${#_cand[@]}
+        _i=1
+        local _cc
+        for _cc in "${_cand[@]}"; do
+            if [[ "$_cc" == "$_pre" ]]; then
+                printf "    %d) %s（当前预分配，选此项保持）\n" "$_i" "$_cc"
+            else
+                printf "    %d) %s\n" "$_i" "$_cc"
+            fi
+            (( _i++ ))
+        done
+        # 仅当已有预分配时，追加「清除」项（含预分配域已不可用、未进候选的情形）
+        if [[ -n "$_pre" ]]; then
+            printf "    %d) 清除当前预分配（%s）\n" "$(( _count + 1 ))" "$_pre"
         fi
-    fi
+        _max=$(( _count + ( ${#_pre} > 0 ? 1 : 0 ) ))
+        read -rp "  请选择 [0-$_max，默认0]: " _sel
+        _sel="${_sel:-0}"
+
+        if [[ "$_sel" == "0" ]]; then
+            continue
+        fi
+        if [[ "$_sel" == "$(( _count + 1 ))" && -n "$_pre" ]]; then
+            save_state "$_pre_key" ""
+            log_info "已清除 ${_slot_name} 的预分配（${_pre}）"
+            continue
+        fi
+        if (( _sel >= 1 && _sel <= _count )); then
+            _tgt="${_cand[$(( _sel - 1 ))]:-}"
+            if [[ -n "$_tgt" ]]; then
+                save_state "$_pre_key" "$_tgt"
+                log_info "已为 ${_slot_name} 预分配 ${_tgt}；到主菜单 11/x 选『用自有域自建』即启用（SNI/dest→本地伪装站）"
+            fi
+            continue
+        fi
+        log_warn "无效选择 ${_sel}，跳过"
+    done
     return 0
 }
 
@@ -2786,12 +2693,11 @@ refresh_domain_assignments() {
 
     # ── CF 线上域名盘点（只读）：发现并分类未登记/空闲域，填入 _CF_* 缓冲 ──
     scan_cf_domain_inventory
-    # ── 协议↔域名 一览 + 缺口/空闲汇总（一屏看清三问）──
+    # ── 协议↔域名 一览（Reality 借公共 SNI = 中性态；空闲域分类展示）──
     print_domain_protocol_overview
-    # ── 空闲直连域自动补 Reality 自建缺口（预览 + y/N，确认后才改 state）──
-    offer_reality_auto_assign
-    # ── 已自建绑定的解除 / 换绑（解除即回借公共 SNI；默认不改）──
-    offer_reality_unbind
+    # ── Reality 自建域预分配（advisory：只 earmark，不切 SNI、不改域归属、
+    #    只写 *_PREALLOC 键 → 尾部槽位 diff 抓不到 → 不触发级联；启用走菜单 11/x）──
+    offer_reality_preassign
 
     # ── 级联：槽位域有变化 → 打印对照 → 触发通用全量重建（install.sh）──
     local -a _changed_slots=()
