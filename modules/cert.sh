@@ -4,9 +4,11 @@
 # Cloudflare DNS 证书申请模块
 # ============================================================
 
-CF_CONFIG_DIR="/etc/cloudflare"
-CF_DOMAIN_MAP_FILE="${CF_CONFIG_DIR}/domain_map.conf"
-CF_CERT_STATUS_FILE="${CF_CONFIG_DIR}/cert_request_status.conf"
+# 用 :- 默认赋值而非无条件覆写：harness 可在 source 前 export CF_CONFIG_DIR
+# 指向临时目录（真隔离）；正常运行未导出时落到默认路径。
+: "${CF_CONFIG_DIR:=/etc/cloudflare}"
+: "${CF_DOMAIN_MAP_FILE:=${CF_CONFIG_DIR}/domain_map.conf}"
+: "${CF_CERT_STATUS_FILE:=${CF_CONFIG_DIR}/cert_request_status.conf}"
 
 # ── 检测 Certbot 是否已安装 ──────────────────────────────────
 check_certbot_installed() {
@@ -722,6 +724,7 @@ save_domain_config() {
         echo "XHTTP_DOMAIN='${XHTTP_DOMAIN:-}'"
         echo "GRPC_DOMAIN='${GRPC_DOMAIN:-}'"
         echo "REALITY_DOMAIN='${REALITY_DOMAIN:-}'"
+        echo "XHTTP_REALITY_DOMAIN='${XHTTP_REALITY_DOMAIN:-}'"
         echo "ANYTLS_DOMAIN='${ANYTLS_DOMAIN:-}'"
         echo "NAIVE_DOMAIN='${NAIVE_DOMAIN:-}'"
         echo "HYSTERIA2_DOMAIN='${HYSTERIA2_DOMAIN:-}'"
@@ -904,6 +907,7 @@ _check_protocol_slot_conflict() {
         ["xray-xhttp"]="VLESS XHTTP (CDN)"
         ["xray-grpc"]="VLESS gRPC (CDN)"
         ["xray-reality"]="VLESS Reality (Direct)"
+        ["xhttp-reality"]="VLESS XHTTP Reality (Direct)"
         ["singbox"]="AnyTLS (Direct)"
         ["hysteria2"]="Hysteria2 (Direct)"
         ["naiveproxy"]="NaiveProxy (Direct)"
@@ -960,10 +964,11 @@ _print_protocol_menu() {
     echo "    1. xray-xhttp    - VLESS XHTTP（CDN）"
     echo "    2. xray-grpc     - VLESS gRPC（CDN）"
     echo "    3. xray-reality  - VLESS Reality（直连）"
-    echo "    4. singbox       - AnyTLS（直连）"
-    echo "    5. hysteria2     - Hysteria2（直连）"
-    echo "    6. naiveproxy    - NaiveProxy（直连）"
-    echo "    7. nginx         - 独立站点（开发中）"
+    echo "    4. xhttp-reality - VLESS XHTTP Reality（直连）"
+    echo "    5. singbox       - AnyTLS（直连）"
+    echo "    6. hysteria2     - Hysteria2（直连）"
+    echo "    7. naiveproxy    - NaiveProxy（直连）"
+    echo "    8. nginx         - 独立站点（开发中）"
 }
 
 # 协议序号 → 标签（stdout 输出标签，无效返回 1）
@@ -972,10 +977,11 @@ _proto_choice_to_tag() {
         1) echo "xray-xhttp" ;;
         2) echo "xray-grpc" ;;
         3) echo "xray-reality" ;;
-        4) echo "singbox" ;;
-        5) echo "hysteria2" ;;
-        6) echo "naiveproxy" ;;
-        7) echo "nginx" ;;
+        4) echo "xhttp-reality" ;;
+        5) echo "singbox" ;;
+        6) echo "hysteria2" ;;
+        7) echo "naiveproxy" ;;
+        8) echo "nginx" ;;
         *) return 1 ;;
     esac
 }
@@ -1368,6 +1374,7 @@ collect_domains() {
     XHTTP_DOMAIN=""
     GRPC_DOMAIN=""
     REALITY_DOMAIN=""
+    XHTTP_REALITY_DOMAIN=""
     ANYTLS_DOMAIN=""
     NAIVE_DOMAIN=""
     HYSTERIA2_DOMAIN=""
@@ -1375,24 +1382,26 @@ collect_domains() {
     rm -f "${CF_CONFIG_DIR}"/domain_*.ini 2>/dev/null || true
     save_state "DOMAIN_REGISTRY" ""
     # 清空协议槽位主域名，避免旧值污染冲突检测
-    save_state "DOMAIN_PRIMARY_XRAY_XHTTP"   ""
-    save_state "DOMAIN_PRIMARY_XRAY_GRPC"    ""
-    save_state "DOMAIN_PRIMARY_XRAY_REALITY" ""
-    save_state "DOMAIN_PRIMARY_SINGBOX"      ""
-    save_state "DOMAIN_PRIMARY_HYSTERIA2"    ""
-    save_state "DOMAIN_PRIMARY_NAIVEPROXY"   ""
+    save_state "DOMAIN_PRIMARY_XRAY_XHTTP"    ""
+    save_state "DOMAIN_PRIMARY_XRAY_GRPC"     ""
+    save_state "DOMAIN_PRIMARY_XRAY_REALITY"  ""
+    save_state "DOMAIN_PRIMARY_XHTTP_REALITY" ""
+    save_state "DOMAIN_PRIMARY_SINGBOX"       ""
+    save_state "DOMAIN_PRIMARY_HYSTERIA2"     ""
+    save_state "DOMAIN_PRIMARY_NAIVEPROXY"    ""
     # 清理 v1 遗留键（迁移函数也会清，这里再保险一次）
     save_state "DOMAIN_PRIMARY_XRAY_CDN"     ""
     save_state "DOMAIN_PRIMARY_XRAY_DIRECT"  ""
 
     echo "  协议说明（X1 改良版：sub-protocol 拆分）："
-    echo "    xray-xhttp   - VLESS XHTTP（CDN）"
-    echo "    xray-grpc    - VLESS gRPC （CDN）"
-    echo "    xray-reality - VLESS Reality（直连）"
-    echo "    singbox      - Sing-Box AnyTLS（直连）"
-    echo "    hysteria2    - Hysteria2（直连）"
-    echo "    naiveproxy   - NaiveProxy（直连）"
-    echo "    nginx        - 独立 Nginx 站点（开发中）"
+    echo "    xray-xhttp     - VLESS XHTTP（CDN）"
+    echo "    xray-grpc      - VLESS gRPC （CDN）"
+    echo "    xray-reality   - VLESS Reality（直连）"
+    echo "    xhttp-reality  - VLESS XHTTP Reality（直连，需额外直连域名）"
+    echo "    singbox        - Sing-Box AnyTLS（直连）"
+    echo "    hysteria2      - Hysteria2（直连）"
+    echo "    naiveproxy     - NaiveProxy（直连）"
+    echo "    nginx          - 独立 Nginx 站点（开发中）"
     echo ""
     echo "  连接方式由协议自动推导（含 xhttp/grpc → CDN，其余 → 直连）"
     echo ""
@@ -2153,8 +2162,8 @@ add_domain_and_cert() {
 refresh_domain_assignments() {
     log_step "刷新域名协议分配"
 
-    # 对 six slot 域做 before 快照（读 state 文件；末尾 diff 决定是否级联重建）
-    local -a _slot_names=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN ANYTLS_DOMAIN HYSTERIA2_DOMAIN NAIVE_DOMAIN)
+    # 对各 slot 域做 before 快照（读 state 文件；末尾 diff 决定是否级联重建）
+    local -a _slot_names=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN XHTTP_REALITY_DOMAIN ANYTLS_DOMAIN HYSTERIA2_DOMAIN NAIVE_DOMAIN)
     local -A _before_dom=()
     local _sn
     for _sn in "${_slot_names[@]}"; do
@@ -2180,6 +2189,12 @@ refresh_domain_assignments() {
     [[ -n "${XHTTP_DOMAIN:-}" ]] && register_domain "$XHTTP_DOMAIN" "cdn" "xray-xhttp"
     [[ -n "${GRPC_DOMAIN:-}" ]] && register_domain "$GRPC_DOMAIN" "cdn" "xray-grpc"
     [[ -n "${REALITY_DOMAIN:-}" ]] && register_domain "$REALITY_DOMAIN" "direct" "xray-reality"
+    # xhttp-reality 自建域：独立槽位（SNI 与 xray-reality 互斥），仅在非空且与
+    # xray-reality 主域不同时回填——两者同域属错误态（SNI 撞），由 wizard/预检纠正，
+    # 这里不镜像以免把错误态固化进 DOMAIN_PROTO
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" && "${XHTTP_REALITY_DOMAIN}" != "${REALITY_DOMAIN:-}" ]]; then
+        register_domain "$XHTTP_REALITY_DOMAIN" "direct" "xhttp-reality"
+    fi
     [[ -n "${ANYTLS_DOMAIN:-}" ]] && register_domain "$ANYTLS_DOMAIN" "direct" "singbox"
     [[ -n "${NAIVE_DOMAIN:-}" ]] && register_domain "$NAIVE_DOMAIN" "direct" "naiveproxy"
     [[ -n "${HYSTERIA2_DOMAIN:-}" ]] && register_domain "$HYSTERIA2_DOMAIN" "direct" "hysteria2"
@@ -2324,7 +2339,8 @@ refresh_domain_assignments() {
     echo ""
     log_warn "检测到域名分配变化，触发相关配置级联重建："
     local -A _slot_tag=( [XHTTP_DOMAIN]=xhttp     [GRPC_DOMAIN]=grpc \
-                         [REALITY_DOMAIN]=reality [ANYTLS_DOMAIN]=anytls \
+                         [REALITY_DOMAIN]=reality [XHTTP_REALITY_DOMAIN]=xhttp-reality \
+                         [ANYTLS_DOMAIN]=anytls \
                          [HYSTERIA2_DOMAIN]=hysteria2 [NAIVE_DOMAIN]=naive )
     local _ch
     for _ch in "${_changed_slots[@]}"; do

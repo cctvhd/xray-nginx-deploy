@@ -24,8 +24,10 @@ is_ipv6_preferred() {
 
 BASE_URL="https://raw.githubusercontent.com/cctvhd/xray-nginx-deploy/feature/hysteria2-naive"
 MODULES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/modules"
-STATE_DIR="/etc/xray-deploy"
-STATE_FILE="${STATE_DIR}/config.env"
+# 用 :- 默认赋值而非无条件覆写：测试/嵌入 harness 可在 source 前 export
+# STATE_DIR/STATE_FILE 指向临时路径（真隔离）；正常运行未导出时落到默认路径。
+: "${STATE_DIR:=/etc/xray-deploy}"
+: "${STATE_FILE:=${STATE_DIR}/config.env}"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
 DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync security firewall crowdsec cleanup uninstall upgrade)
@@ -344,6 +346,11 @@ _preflight_check_sni_uniqueness() {
         "xray-grpc:GRPC_DOMAIN"
         "anytls:ANYTLS_DOMAIN"
         "naive:NAIVE_DOMAIN"
+        # Reality 两节点自建域同样进 stream 预读路由（各自 SNI 独占，
+        # 与 CDN/anytls/naive 或彼此都不允许同 SNI）；公共借 SNI 是第三方域，
+        # 由 Check 2 与业务域比对。REALITY_DOMAIN==XHTTP_REALITY_DOMAIN 会在此命中。
+        "xray-reality:REALITY_DOMAIN"
+        "xhttp-reality:XHTTP_REALITY_DOMAIN"
     )
     # 同 SNI 允许的槽位对（双向）—— 当前架构会合并到同一 server 块
     local -a compatible_pairs=(
@@ -394,8 +401,8 @@ _preflight_check_sni_uniqueness() {
 }
 
 # Check 2: Reality SNI 污染
-# REALITY_DOMAIN + REALITY_SERVER_NAMES[*] 全部会被 nginx stream map 路由到 9443
-# 不能与四个业务域名重合
+# REALITY_DOMAIN + XHTTP_REALITY_DOMAIN(+各自的公共 SNI / serverNames)
+# 全部会被 nginx stream map 路由到 9443，不能与四个业务域名重合
 _preflight_check_reality_pollution() {
     local -a own_domains=(
         "${XHTTP_DOMAIN:-}"
@@ -405,6 +412,9 @@ _preflight_check_reality_pollution() {
     )
     local -a reality_snis=()
     [[ -n "${REALITY_DOMAIN:-}" ]] && reality_snis+=("${REALITY_DOMAIN}")
+    # xhttp-reality 节点：自建域（=XHTTP_REALITY_DOMAIN，经注册表派生）或借公共 SNI（XHTTP_REALITY_SNI）
+    [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]] && reality_snis+=("${XHTTP_REALITY_DOMAIN}")
+    [[ -n "${XHTTP_REALITY_SNI:-}" ]] && reality_snis+=("${XHTTP_REALITY_SNI}")
 
     if declare -p REALITY_SERVER_NAMES &>/dev/null; then
         local sn
@@ -571,7 +581,7 @@ _preflight_check_state_consistency() {
     done
 
     # 5c: 每个非空 *_DOMAIN 都在 DOMAIN_REGISTRY 里
-    local -a expected=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN)
+    local -a expected=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN XHTTP_REALITY_DOMAIN ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN)
     local var dom
     for var in "${expected[@]}"; do
         dom="${!var:-}"
@@ -590,6 +600,7 @@ _preflight_check_state_consistency() {
         "DOMAIN_PRIMARY_XRAY_XHTTP"
         "DOMAIN_PRIMARY_XRAY_GRPC"
         "DOMAIN_PRIMARY_XRAY_REALITY"
+        "DOMAIN_PRIMARY_XHTTP_REALITY"
         "DOMAIN_PRIMARY_SINGBOX"
         "DOMAIN_PRIMARY_HYSTERIA2"
         "DOMAIN_PRIMARY_NAIVEPROXY"
@@ -613,7 +624,7 @@ _preflight_check_domain_map_drift() {
     local map_file="/etc/cloudflare/domain_map.conf"
     [[ -f "$map_file" ]] || return 0
 
-    local -a vars=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN)
+    local -a vars=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN XHTTP_REALITY_DOMAIN ANYTLS_DOMAIN NAIVE_DOMAIN HYSTERIA2_DOMAIN)
     local var state_val map_val drifted=""
     for var in "${vars[@]}"; do
         state_val="${!var:-}"
@@ -742,7 +753,7 @@ rebuild_protocol_domains() {
 
     local registry
     local all_d="" cdn_d="" direct_d=""
-    local -a xhttp_cands=() grpc_cands=() reality_cands=()
+    local -a xhttp_cands=() grpc_cands=() reality_cands=() xhttp_reality_cands=()
     local -a singbox_cands=() hyst_cands=() naive_cands=()
 
     registry=$(get_state "DOMAIN_REGISTRY" "")
@@ -765,15 +776,17 @@ rebuild_protocol_domains() {
         case ",${protocols}," in *,xray-xhttp,*)   xhttp_cands+=("$domain") ;; esac
         case ",${protocols}," in *,xray-grpc,*)    grpc_cands+=("$domain") ;; esac
         case ",${protocols}," in *,xray-reality,*) reality_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,xhttp-reality,*) xhttp_reality_cands+=("$domain") ;; esac
         case ",${protocols}," in *,singbox,*)      singbox_cands+=("$domain") ;; esac
         case ",${protocols}," in *,hysteria2,*)    hyst_cands+=("$domain") ;; esac
         case ",${protocols}," in *,naiveproxy,*)   naive_cands+=("$domain") ;; esac
     done
 
-    local xhttp_domain grpc_domain reality_domain anytls_domain hyst_domain naive_domain
+    local xhttp_domain grpc_domain reality_domain xhttp_reality_domain anytls_domain hyst_domain naive_domain
     xhttp_domain=$(_resolve_protocol_primary   "XRAY_XHTTP"   "${xhttp_cands[@]}")
     grpc_domain=$(_resolve_protocol_primary    "XRAY_GRPC"    "${grpc_cands[@]}")
     reality_domain=$(_resolve_protocol_primary "XRAY_REALITY" "${reality_cands[@]}")
+    xhttp_reality_domain=$(_resolve_protocol_primary "XHTTP_REALITY" "${xhttp_reality_cands[@]}")
     anytls_domain=$(_resolve_protocol_primary  "SINGBOX"      "${singbox_cands[@]}")
     hyst_domain=$(_resolve_protocol_primary    "HYSTERIA2"    "${hyst_cands[@]}")
     naive_domain=$(_resolve_protocol_primary   "NAIVEPROXY"   "${naive_cands[@]}")
@@ -784,6 +797,7 @@ rebuild_protocol_domains() {
     save_state "XHTTP_DOMAIN"     "$xhttp_domain"
     save_state "GRPC_DOMAIN"      "$grpc_domain"
     save_state "REALITY_DOMAIN"   "$reality_domain"
+    save_state "XHTTP_REALITY_DOMAIN" "$xhttp_reality_domain"
     save_state "ANYTLS_DOMAIN"    "$anytls_domain"
     save_state "HYSTERIA2_DOMAIN" "$hyst_domain"
     save_state "NAIVE_DOMAIN"     "$naive_domain"
@@ -792,6 +806,7 @@ rebuild_protocol_domains() {
     XHTTP_DOMAIN="$xhttp_domain"
     GRPC_DOMAIN="$grpc_domain"
     REALITY_DOMAIN="$reality_domain"
+    XHTTP_REALITY_DOMAIN="$xhttp_reality_domain"
     ANYTLS_DOMAIN="$anytls_domain"
     HYSTERIA2_DOMAIN="$hyst_domain"
     NAIVE_DOMAIN="$naive_domain"
@@ -802,9 +817,9 @@ rebuild_protocol_domains() {
 # ── 域名分配变更 → 级联重建相关产物（通用，不含任何具体域名）────
 # 由 modules/cert.sh refresh_domain_assignments 在检测到任一槽位域变化后调用。
 # 用法: regen_after_domain_change <changed-slot>...
-#   <changed-slot> ∈ xhttp | grpc | reality | anytls | hysteria2 | naive
+#   <changed-slot> ∈ xhttp | grpc | reality | xhttp-reality | anytls | hysteria2 | naive
 # 派发规则：
-#   xhttp/reality → Xray config（无交互从 state 重建）
+#   xhttp/reality/xhttp-reality → Xray config（无交互从 state 重建）
 #   anytls        → do_conf_singbox
 #   naive         → do_conf_naive
 #   hysteria2     → 重拷 letsencrypt 证书 + 重启（yaml 不变）
@@ -818,7 +833,7 @@ regen_after_domain_change() {
     local -a manual=()
     for slot in "$@"; do
         case "$slot" in
-            xhttp|reality) do_xray=1 ;;
+            xhttp|reality|xhttp-reality) do_xray=1 ;;
             anytls)        do_singbox=1 ;;
             naive)         do_naive=1 ;;
             hysteria2)     do_hyst=1 ;;
@@ -996,6 +1011,15 @@ load_domain_state() {
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
     XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
+    # 自愈：DOMAIN_PRIMARY_XHTTP_REALITY 是权威来源，state 丢失时自动修复
+    if [[ -z "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+        local _primary_xhttp_reality
+        _primary_xhttp_reality=$(get_state "DOMAIN_PRIMARY_XHTTP_REALITY" "")
+        if [[ -n "${_primary_xhttp_reality}" ]]; then
+            XHTTP_REALITY_DOMAIN="${_primary_xhttp_reality}"
+            save_state "XHTTP_REALITY_DOMAIN" "${_primary_xhttp_reality}"
+        fi
+    fi
 }
 
 # ── 读取延迟档位参数 → 设置协议生成变量 ────────────────────
@@ -1618,6 +1642,7 @@ show_domain_allocation() {
         "AnyTLS:DOMAIN_PRIMARY_SINGBOX:ANYTLS_DOMAIN"
         "Hysteria2:DOMAIN_PRIMARY_HYSTERIA2:HYSTERIA2_DOMAIN"
         "NaiveProxy:DOMAIN_PRIMARY_NAIVEPROXY:NAIVE_DOMAIN"
+        "xhttp-Reality:DOMAIN_PRIMARY_XHTTP_REALITY:XHTTP_REALITY_DOMAIN"
     )
     declare -A role=() mode=()
     local entry name rest key fb dom
@@ -1635,14 +1660,10 @@ show_domain_allocation() {
         fi
     done
 
-    # xhttp-reality 若占用自有域名则单独挂一行（公共 SNI 场景不消耗我们的域名）
+    # xhttp-reality 公共 SNI 场景不消耗自有域名（self-domain 态由 entries 表承载）
     local xr_sni xr_dom
     xr_sni=$(get_state "XHTTP_REALITY_SNI")
     xr_dom=$(get_state "XHTTP_REALITY_DOMAIN")
-    if [[ -n "${xr_sni:-}" && -n "${xr_dom:-}" ]]; then
-        role["$xr_dom"]+="${role["$xr_dom"]:+" + "}xhttp-reality(SNI ${xr_sni})"
-        [[ -n "${mode[$xr_dom]:-}" ]] || mode["$xr_dom"]="直连"
-    fi
 
     # 注册表兜底：未承载协议的域名 → 备用
     local sub
@@ -1677,9 +1698,9 @@ show_domain_allocation() {
         printf "  %-24s [%s] %s\n" "$d" "${mode[$d]}" "${role[$d]}"
     done
 
-    # 公共 SNI 的 xhttp-reality 不占自有域名，单列说明避免误以为漏配置
+    # 公共 SNI 的 xhttp-Reality 不占自有域名，单列说明避免误以为漏配置
     if [[ -n "${xr_sni:-}" && -z "${xr_dom:-}" ]]; then
-        echo "  ※ xhttp-reality: SNI=${xr_sni}（公共 SNI 导流到 8325，不占用自有域名）"
+        echo "  ※ xhttp-Reality: SNI=${xr_sni}（公共 SNI 导流到 8325，不占用自有域名）"
     fi
 
     echo ""
