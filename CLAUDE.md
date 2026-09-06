@@ -99,6 +99,7 @@ state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读�
 - **unbound 能力探测（d22d59a）**：`_unbound_supports <opt> [样例值]` 以真实 `unbound-checkconf` 探测新指令，老包（如 EL8 1.7.x）自动省略 `serve-expired-client-timeout/reply-ttl`、`tls-system-cert`。注意整数型选项探测必须传**整数样例**，默认 `yes` 会误判。
 - **uninstall 补全（301a73c / 73fb20f）**：OS_ID 字面量→包管理器分派；新增 crowdsec/nftables 清理函数与卸载菜单项。
 - **unbound 收窄 + 去定时（1cf593d，2026-09-05，已并入 main@b8b8f09）**：v6 监听从公网通配 `[::]` 收窄为回环 `[::1]`（resolv.conf 走 127.0.0.1、v6 模式走 ::1，均在回环覆盖内）；`install_root_update_job` 改为 `remove_root_update_job`（纯转发模式 root.hints 从不参与解析，移除每月无谓下载+重启的 timer）。
+- **Reality 域职责反转（00085c6，2026-09-06）**：菜单 5→6 从「唯一设自建域入口」改为**只预分配**（`offer_reality_preassign` 写 advisory 的 `REALITY_PREALLOC`/`XHTTP_REALITY_PREALLOC`，不挂标签、不改 `*_DOMAIN`、不级联）；菜单 11/x = **SNI 真分配**（`collect_reality_params` 两段式：Stage A 逐槽独立选「保持自建/切回借公共/改用自有域」或「借公共→选自建」，候选=预分配优先 + `_reality_self_capable` 名额门控，无候选则隐藏自建；Stage B 公共参数原样复用）。overview 里 Reality 借公共 SNI 改中性「公共伪装」，不再 ⚠缺口。活机验证：菜单 11/x 里 xhttp 现自建 laz 域应弹「保持/切回/改选」、vless 公共无候选应静默。
 
 **回退通用步骤**：某次变更出问题 → `git revert <sha>`，再重跑 `install.sh` 对应组件菜单（unbound 用菜单 2「重新配置」或 4「仅刷新域名配置」）即重新生成配置。unbound 活机改动前的配置文件已备份在 `/etc/unbound/unbound.conf.bk.*`（活机本机，不进 git）。活机真实域名/IP/服务快照等敏感运维事实见自动记忆 `live-unbound-2026-09`。
 
