@@ -2998,6 +2998,9 @@ run_cert() {
     # 2. 运行 edit_nodes.py 配置 API 令牌、域名、协议和模式
     log_step "运行 edit_nodes.py 配置"
     cd /root
+    # 保存当前域名快照（用于智能证书申请）
+    OLD_DOMAINS=("${ALL_DOMAINS[@]}")
+
     python3 edit_nodes.py
     # 编辑后，用户按 S 保存并退出，或按 Q 放弃退出
     # 我们继续处理已保存的配置（如果用户放弃，则视为无更改）
