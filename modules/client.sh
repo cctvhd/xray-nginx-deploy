@@ -331,6 +331,9 @@ print(urllib.parse.quote('${HYSTERIA2_PASSWORD}', safe=''))
                         /-----END ECH CONFIGS-----/{f=0}
                         f' /etc/hysteria/ech.pem 2>/dev/null | tr -d '\n' || true)
         if [[ -n "${_ech_cfg}" ]]; then
+            # 供 show_client_links 原样打印：Passwall 等客户端不认 URI 里的
+            # ech=，需要用户手工填裸 base64（sing-box 则要 PEM 形式）
+            HYSTERIA2_ECH_CFG="${_ech_cfg}"
             # 编码方式由实测确定（hysteria share -c 的输出）：ech= 用标准
             # 百分号编码，即 base64 的 + → %2B、/ → %2F、= → %3D，不是 base64url
             local _ech_encoded
@@ -538,11 +541,17 @@ show_client_links() {
         echo -e "  协议:   UDP"
         if [[ -n "${HYSTERIA2_ECH:-}" ]]; then
             echo -e "  ECH:    已启用 (外层 SNI: ${HYSTERIA2_ECH_PUBLIC:-未记录})"
+            echo -e "  ECH 参数(裸 base64，供 Passwall/hysteria 客户端手填):"
+            echo -e "    ${HYSTERIA2_ECH_CFG:-（未取到，检查 /etc/hysteria/ech.pem）}"
         fi
         echo ""
         {
             echo "# Hysteria2"
             echo "$HYSTERIA2_URL"
+            if [[ -n "${HYSTERIA2_ECH:-}" && -n "${HYSTERIA2_ECH_CFG:-}" ]]; then
+                echo "# ECH 参数(裸 base64，供 Passwall/hysteria 客户端手填):"
+                echo "# ${HYSTERIA2_ECH_CFG}"
+            fi
             echo ""
         } >> "$output_file"
     fi
