@@ -1225,6 +1225,48 @@ CONF
     log_info "fallback 配置生成完成"
 }
 
+# ── 清理已不在域名表中的伪装站目录 ───────────────────────────
+# 域名表（ALL_DOMAINS，由注册表派生）是唯一事实来源：表里没有的域，它的
+# /var/www/<域> 就是换域留下的孤儿。规则与 CF 账号孤儿一致——不按「换了几个」
+# 分支，只看「在不在表里」。
+# 三重护栏，宁可漏删不可误删：
+#   1. 表为空 → 整体跳过（state 异常时绝不把 /var/www 清空）
+#   2. 只删含点的目录名 → trap / html / Example 这类非域名目录天然免疫
+#      （Example 是 download-media.sh 的媒体库 + 欧洲主题模板来源，不能动）
+#   3. 本次 servers.conf 仍引用的路径一律保留 → 表与配置短暂不一致也不打断服务
+_purge_orphan_webroots() {
+    local all_domains
+    all_domains=$(get_state "ALL_DOMAINS" "")
+
+    if [[ -z "$all_domains" ]]; then
+        log_warn "ALL_DOMAINS 为空，跳过 /var/www 孤儿目录清理（避免误删）"
+        return 0
+    fi
+
+    local -A _keep=()
+    local _d
+    for _d in $all_domains; do
+        [[ -n "$_d" ]] && _keep["$_d"]=1
+    done
+
+    # 本次生成的配置仍在引用的目录
+    local _ref
+    while read -r _ref; do
+        [[ -n "$_ref" ]] && _keep["${_ref##*/}"]=1
+    done < <(grep -o 'root *[^;]*;' /etc/nginx/conf.d/servers.conf 2>/dev/null \
+             | sed 's/^root *//; s/;$//' || true)
+
+    local _dir _name
+    for _dir in /var/www/*/; do
+        [[ -d "$_dir" ]] || continue
+        _name=$(basename "$_dir")
+        [[ "$_name" == *.* ]] || continue           # 非域名目录不动
+        [[ -n "${_keep[$_name]:-}" ]] && continue    # 表内或仍被引用
+        rm -rf "$_dir"
+        log_info "已删除配置表不再引用的伪装站目录: /var/www/${_name}"
+    done
+}
+
 # ── 生成 servers.conf ────────────────────────────────────────
 generate_servers_conf() {
     log_step "生成 servers.conf..."
@@ -1725,6 +1767,9 @@ server {
     }
 }
 CONF
+
+    # 伪装站目录收尾：servers.conf 已定稿，此刻的引用关系才是权威
+    _purge_orphan_webroots
 
     log_info "servers.conf 生成完成"
 }

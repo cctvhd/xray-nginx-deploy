@@ -242,38 +242,31 @@ _get_server_ipv6() {
 }
 
 # ── 构建自有域名内部解析 ──────────────────────────────────────
+# 域名清单取自 rebuild_protocol_domains 由注册表 + 各域 mode 派生出的
+# DIRECT_DOMAINS / CDN_DOMAINS，不再逐个数 *_DOMAIN 槽位键——槽位键只有协议主域，
+# 漏掉同协议多域时的次域，而且每加一个协议都得回来补一笔。
 _build_own_domain_zones() {
-    local cdn_str
+    local direct_str cdn_str
+    direct_str=$(get_state "DIRECT_DOMAINS" "")
     cdn_str=$(get_state "CDN_DOMAINS" "")
-
-    # 构建 CDN 域名集合（跳过本地解析）
-    local -A _cdn_set=()
-    if [[ -n "$cdn_str" ]]; then
-        local _d
-        for _d in $cdn_str; do
-            [[ -n "$_d" ]] && _cdn_set["$_d"]=1
-        done
-    fi
 
     local server_ipv4 server_ipv6
     server_ipv4=$(_get_server_ipv4)
     server_ipv6=$(_get_server_ipv6)
 
-    # 收集所有直连域名（去重）
+    # 收集直连域名（去重，保留注册表顺序）
     local -a _direct_domains=()
     local -A _seen=()
-    local _k _v
-    for _k in REALITY_DOMAIN ANYTLS_DOMAIN HYSTERIA2_DOMAIN NAIVE_DOMAIN; do
-        _v=$(get_state "$_k" "")
-        [[ -z "$_v" ]] && continue
-        [[ -n "${_cdn_set[$_v]:-}" ]] && continue   # CDN 域名跳过
-        [[ -n "${_seen[$_v]:-}" ]] && continue       # 去重
-        _seen["$_v"]=1
-        _direct_domains+=("$_v")
+    local _d
+    for _d in $direct_str; do
+        [[ -n "$_d" ]] || continue
+        [[ -n "${_seen[$_d]:-}" ]] && continue
+        _seen["$_d"]=1
+        _direct_domains+=("$_d")
     done
 
     echo "    # === 自有域名内部解析 ==="
-    if [[ ${#_direct_domains[@]} -eq 0 && ${#_cdn_set[@]} -eq 0 ]]; then
+    if [[ ${#_direct_domains[@]} -eq 0 && -z "$cdn_str" ]]; then
         echo "    # 暂无自有域名配置"
         return
     fi
@@ -286,10 +279,10 @@ _build_own_domain_zones() {
     done
 
     # CDN 域名：只标注注释，不做本地解析
-    if [[ ${#_cdn_set[@]} -gt 0 ]]; then
+    if [[ -n "$cdn_str" ]]; then
         echo ""
         echo "    # === CDN 域名（不做本地解析，走上游 CDN）==="
-        for _dom in "${!_cdn_set[@]}"; do
+        for _dom in $cdn_str; do
             echo "    # CDN 域名: ${_dom}"
         done
     fi

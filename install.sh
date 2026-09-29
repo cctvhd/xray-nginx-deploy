@@ -889,7 +889,21 @@ regen_after_domain_change() {
         log_warn "Nginx 未配置，跳过 nginx 全量重建"
     fi
 
-    # 3) 客户端订阅统一重建：SUBSCRIPTION_PATH 是独立 token，纯换域不变
+    # 3) Unbound 自有域名内部解析：conf.d 里的 local-zone/local-data 随域名表重建。
+    #    纯转发模式下 server 段与上游都不含域名，只有这份清单会过期——不刷新的话
+    #    旧域仍被解析到本机、新域解析不到本机。refresh_unbound_generated_config
+    #    自带 restart + 存活校验，失败不中断整个级联。
+    if [[ "$(get_step INST_UNBOUND)" == "1" ]]; then
+        load_module unbound
+        if declare -F refresh_unbound_generated_config >/dev/null; then
+            refresh_unbound_generated_config && log_info "已重建: Unbound 自有域名解析" \
+                || log_warn "Unbound 刷新失败，请手动运行主菜单 3 → 4（仅刷新域名配置）"
+        else
+            manual+=("Unbound（主菜单 3 → 4 仅刷新域名配置）")
+        fi
+    fi
+
+    # 4) 客户端订阅统一重建：SUBSCRIPTION_PATH 是独立 token，纯换域不变
     #    → 同一订阅 URL 内容刷新，老客户端重拉即生效
     if [[ "$(get_step CONF_XRAY)" == "1" || "$(get_step CONF_SINGBOX)" == "1" || \
           "$(get_step CONF_HYSTERIA2)" == "1" || "$(get_step CONF_NAIVE)" == "1" ]]; then

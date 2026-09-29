@@ -2909,6 +2909,168 @@ migrate_cf_account_files() {
     [[ $migrated -gt 0 ]] && log_info "迁移完成，共处理 ${migrated} 个旧账号文件" || true
 }
 
+# ════════════════════════════════════════════════════════════
+# edit_nodes.py 集成：脚本定位 / TSV 切分 / 陈旧域名清理
+# ════════════════════════════════════════════════════════════
+
+# edit_nodes.py 的数据文件（config.txt / .config.tsv）落地目录。刻意放在仓库与
+# git 工作区之外，避免 API 令牌被写进代码目录。
+: "${EDIT_NODES_DATA_DIR:=/root}"
+_EDIT_NODES_CACHE="${STATE_DIR:-/etc/xray-deploy}/edit_nodes.py"
+
+# ── 定位 edit_nodes.py ───────────────────────────────────────
+# 与 load_module 相同的双模式：git 本地 → 仓库根目录；curl 模式 → 拉取到缓存。
+# stdout 输出脚本路径；找不到返回 1。
+resolve_edit_nodes_script() {
+    local repo_script
+    repo_script="$(dirname "${MODULES_DIR:-.}")/edit_nodes.py"
+    if [[ -f "$repo_script" ]]; then
+        printf '%s\n' "$repo_script"
+        return 0
+    fi
+    if [[ -s "$_EDIT_NODES_CACHE" ]]; then
+        printf '%s\n' "$_EDIT_NODES_CACHE"
+        return 0
+    fi
+    mkdir -p "$(dirname "$_EDIT_NODES_CACHE")"
+    if curl -fsSL "${BASE_URL:-}/edit_nodes.py" -o "$_EDIT_NODES_CACHE" 2>/dev/null; then
+        chmod 600 "$_EDIT_NODES_CACHE"
+        printf '%s\n' "$_EDIT_NODES_CACHE"
+        return 0
+    fi
+    return 1
+}
+
+# ── 按 Tab 切分一行 TSV ──────────────────────────────────────
+# 注意：Tab 属于 IFS 的「空白字符」类，`IFS=$'\t' read` 会吞掉行首的空字段并
+# 把整行左移——而配置表只有带令牌的行才填首列，多数行首列本就是空的。
+# 这里先把 Tab 换成非空白哨兵 \x01 再切分，空字段得以保留。
+# 用法: _tsv_split "$line" api_token protocol domain mode
+_tsv_split() {
+    local _line="${1//$'\t'/$'\x01'}"
+    shift
+    IFS=$'\x01' read -r "$@" <<< "$_line"
+}
+
+# ── 清理已从配置表移除的陈旧域名 ─────────────────────────────
+# 配置表是七个协议槽位的唯一事实来源：相对进入本流程前的快照 OLD_DOMAINS，
+# 不在表内的域视为已废弃 → 摘出 DOMAIN_REGISTRY、清 DOMAIN_MODE_*/PROTO_*，
+# 并在其根域名不再被任何存活域使用时删除 domain ini 与 Let's Encrypt 证书。
+# 用法: _purge_stale_domains <配置表内的域名>...
+_purge_stale_domains() {
+    local -A _keep=()
+    local _d
+    for _d in "$@"; do
+        [[ -n "$_d" ]] && _keep["$_d"]=1
+    done
+
+    # 1) 差集：旧有但已不在表内
+    local -a _stale=()
+    local _od
+    for _od in "${OLD_DOMAINS[@]:-}"; do
+        [[ -z "$_od" ]] && continue
+        [[ -n "${_keep[$_od]:-}" ]] && continue
+        _stale+=("$_od")
+    done
+    [[ ${#_stale[@]} -eq 0 ]] && return 0
+
+    log_warn "以下域名已不在配置表中，将从注册表移除："
+    for _d in "${_stale[@]}"; do echo "  - $_d"; done
+
+    # 2) 摘注册表 + 清标签
+    local _registry _new_reg="" _suffix
+    _registry=$(get_state "DOMAIN_REGISTRY" "")
+    for _d in $_registry; do
+        [[ " ${_stale[*]} " == *" $_d "* ]] && continue
+        _new_reg="${_new_reg:+$_new_reg }$_d"
+    done
+    save_state "DOMAIN_REGISTRY" "$_new_reg"
+    for _d in "${_stale[@]}"; do
+        _suffix=$(echo "$_d" | tr '.' '_')
+        save_state "DOMAIN_MODE_${_suffix}" ""
+        save_state "DOMAIN_PROTO_${_suffix}" ""
+    done
+
+    # 3) 根域名彻底无存活域 → 删 domain ini 与证书
+    # 存活集合 = 剪掉陈旧域后的注册表 ∪ 配置表内的域名。后者不可省：本函数在第 6
+    # 步注册新域之前运行，此刻新域还没进注册表，只看注册表会把新域所在的根误判为
+    # 已废弃，连证书一起删掉。
+    local -a _alive=()
+    for _d in $_new_reg; do
+        [[ -n "$_d" ]] && _alive+=("$_d")
+    done
+    for _d in "${!_keep[@]}"; do
+        [[ -n "$_d" ]] && _alive+=("$_d")
+    done
+
+    local _rd _d2 _rd2 _still _filebase
+    for _d in "${_stale[@]}"; do
+        _rd=$(echo "$_d" | awk -F. '{print $(NF-1)"."$NF}')
+        _still=false
+        for _d2 in "${_alive[@]}"; do
+            _rd2=$(echo "$_d2" | awk -F. '{print $(NF-1)"."$NF}')
+            [[ "$_rd2" == "$_rd" ]] && _still=true && break
+        done
+        $_still && continue
+
+        _filebase=$(domain_to_ini_name "$_rd")
+        if [[ -f "${CF_CONFIG_DIR}/domain_${_filebase}.ini" ]]; then
+            rm -f "${CF_CONFIG_DIR}/domain_${_filebase}.ini"
+            log_info "已删除 domain_${_filebase}.ini"
+        fi
+        if [[ -d "/etc/letsencrypt/live/${_rd}" ]]; then
+            if command -v certbot >/dev/null 2>&1; then
+                certbot delete --cert-name "$_rd" --non-interactive >/dev/null 2>&1 || \
+                    rm -rf "/etc/letsencrypt/live/${_rd}" \
+                           "/etc/letsencrypt/archive/${_rd}" \
+                           "/etc/letsencrypt/renewal/${_rd}.conf"
+            else
+                rm -rf "/etc/letsencrypt/live/${_rd}" \
+                       "/etc/letsencrypt/archive/${_rd}" \
+                       "/etc/letsencrypt/renewal/${_rd}.conf"
+            fi
+            log_info "已删除证书 ${_rd}"
+        fi
+        save_state "CERT_PATH_${_rd//./_}" ""
+    done
+}
+
+# ── 清理配置表不再引用的 CF 账号文件 ─────────────────────────
+# 配置表是令牌的唯一事实来源：表里没有的令牌，其账号文件就是孤儿。换一个域、换两个、
+# 全换、只换账号（账号数变少）都适用同一条规则，不需要为"换几个"写分支。
+#
+# 唯一的坑：老版本签发的证书，renewal conf 里 dns_cloudflare_credentials 可能直接
+# 指向 cf_account_N.ini 而不是 domain_<root>.ini。若证书还在（说明其根域名仍在表内），
+# 直接删文件会让 certbot renew 拿着已失效的凭证静默失败——所以先把引用改指到该根的
+# domain_<root>.ini（第 5 步刚用表中的令牌重写过），改不动才放弃删除。
+_purge_orphan_cf_files() {
+    local _f _base _ftok _ref _root _new
+    for _f in "${CF_CONFIG_DIR}"/*.ini; do
+        [[ -f "$_f" ]] || continue
+        _ftok=$(grep 'dns_cloudflare_api_token' "$_f" 2>/dev/null | head -1 | cut -d= -f2- | tr -d ' ')
+        # 令牌仍在配置表内 → 保留
+        [[ -n "$_ftok" && -n "${account_tokens[$_ftok]:-}" ]] && continue
+
+        _base=$(basename "$_f")
+        for _ref in /etc/letsencrypt/renewal/*.conf; do
+            [[ -f "$_ref" ]] || continue
+            grep -q "^dns_cloudflare_credentials *= *${_f}$" "$_ref" 2>/dev/null || continue
+            _root=$(basename "$_ref" .conf)
+            _new="${CF_CONFIG_DIR}/domain_$(domain_to_ini_name "$_root").ini"
+            if [[ -f "$_new" ]]; then
+                sed -i "s|^\(dns_cloudflare_credentials *= *\).*|\1${_new}|" "$_ref"
+                log_info "renewal 凭证已改指: ${_root} → domain_$(domain_to_ini_name "$_root").ini"
+            else
+                log_warn "${_root} 的续期仍引用 ${_base}，但它已不在配置表中；保留该文件以免续期失败"
+                continue 2
+            fi
+        done
+
+        rm -f "$_f"
+        log_info "已删除配置表不再引用的 CF 文件: ${_base}"
+    done
+}
+
 # ── 模块入口 ─────────────────────────────────────────────────
 run_cert() {
     set +e
@@ -2997,17 +3159,22 @@ run_cert() {
 
     # 2. 运行 edit_nodes.py 配置 API 令牌、域名、协议和模式
     log_step "运行 edit_nodes.py 配置"
-    cd /root
-    # 保存当前域名快照（用于智能证书申请）
+    local edit_nodes_script
+    if ! edit_nodes_script=$(resolve_edit_nodes_script); then
+        log_error "未找到 edit_nodes.py（git 模式应位于仓库根目录；curl 模式需能访问 ${BASE_URL}）"
+        return 1
+    fi
+    # 快照「进入本流程前」的域名集合，供第 3b 步清理已从配置表移除的陈旧域名。
+    # 必须显式从 state 读取：本函数可由主菜单直接进入，此前内存中未必加载过。
+    load_domain_state
     OLD_DOMAINS=("${ALL_DOMAINS[@]}")
 
-    python3 edit_nodes.py
+    python3 "$edit_nodes_script" "$EDIT_NODES_DATA_DIR"
     # 编辑后，用户按 S 保存并退出，或按 Q 放弃退出
     # 我们继续处理已保存的配置（如果用户放弃，则视为无更改）
-    cd -
 
     # 3. 解析 edit_nodes.py 生成的配置并更新 Cloudflare 账号和域名设置
-    TSV_FILE="/root/.config.tsv"
+    TSV_FILE="${EDIT_NODES_DATA_DIR}/.config.tsv"
     if [[ ! -f "$TSV_FILE" ]]; then
         log_error "未找到 edit_nodes.py 生成的配置文件 $TSV_FILE"
         return 1
@@ -3040,8 +3207,11 @@ run_cert() {
     fixed_row_to_slot[6]="naiveproxy"
 
     # 读取 TSV 文件
+    local _line
+    local -a _tsv_domains=()
     account_index=1
-    while IFS=$'\t' read -r api_token protocol domain mode; do
+    while IFS= read -r _line; do
+        _tsv_split "$_line" api_token protocol domain mode
         # 跳过空行
         [[ -z "$domain" && -z "$protocol" && -z "$api_token" && -z "$mode" ]] && continue
         # 去除首尾空格
@@ -3054,10 +3224,14 @@ run_cert() {
         if [[ -z "$domain" ]]; then
             continue
         fi
+        # 配置表内的域名集合（第 3b 步清陈旧域名的「保留集」）
+        _tsv_domains+=("$domain")
 
         # 记录 API token 对应的账号（如果 token 不为空）
+        # 注：本脚本运行在 install.sh 的 set -euo pipefail 之下，关联数组取未赋值
+        # 的 key 会被当成 unbound variable 直接中止，故一律用 ${arr[key]:-} 取值。
         if [[ -n "$api_token" ]]; then
-            if [[ -z "${account_tokens[$api_token]}" ]]; then
+            if [[ -z "${account_tokens[$api_token]:-}" ]]; then
                 account_tokens[$api_token]=$account_index
                 ((account_index++))
             fi
@@ -3065,14 +3239,14 @@ run_cert() {
         fi
 
         # 记录协议和模式
-        if [[ -n "$protocol" && -n "${protocol_map[$protocol]}" ]]; then
-            sys_proto="${protocol_map[$protocol]}"
-            if [[ -z "${domain_protocols[$domain]}" ]]; then
+        if [[ -n "$protocol" && -n "${protocol_map[$protocol]:-}" ]]; then
+            sys_proto="${protocol_map[$protocol]:-}"
+            if [[ -z "${domain_protocols[$domain]:-}" ]]; then
                 domain_protocols[$domain]="$sys_proto"
             else
                 # 避免重复
-                if [[ ! " ${domain_protocols[$domain]} " =~ " ${sys_proto} " ]]; then
-                    domain_protocols[$domain]="${domain_protocols[$domain]} $sys_proto"
+                if [[ ! " ${domain_protocols[$domain]:-} " =~ " ${sys_proto} " ]]; then
+                    domain_protocols[$domain]="${domain_protocols[$domain]:-} $sys_proto"
                 fi
             fi
         fi
@@ -3099,7 +3273,8 @@ run_cert() {
     # 我们需要重新读取 TSV 文件以获取行号，或者我们可以在上面的循环中保存行号。
     # 为了简单，我们重新读取文件并跟踪行号。
     row=0
-    while IFS=$'\t' read -r api_token protocol domain mode; do
+    while IFS= read -r _line; do
+        _tsv_split "$_line" api_token protocol domain mode
         [[ -z "$domain" && -z "$protocol" && -z "$api_token" && -z "$mode" ]] && continue
         api_token="$(echo "$api_token" | xargs)"
         protocol="$(echo "$protocol" | xargs)"
@@ -3107,30 +3282,35 @@ run_cert() {
         mode="$(echo "$mode" | xargs)"
         if [[ $row -lt 7 ]]; then
             slot="${fixed_row_to_slot[$row]}"
-            if [[ -n "$domain" && -n "${protocol_map[$protocol]}" ]]; then
-                sys_proto="${protocol_map[$protocol]}"
+            if [[ -n "$domain" && -n "${protocol_map[$protocol]:-}" ]]; then
+                sys_proto="${protocol_map[$protocol]:-}"
                 primary_domains[$sys_proto]=$domain
             fi
         fi
         ((row++))
     done < "$TSV_FILE"
 
+    # 3b. 清理已从配置表移除的陈旧域名（注册表 + 标签 + domain ini + 证书）
+    _purge_stale_domains "${_tsv_domains[@]}"
+
     # 4. 创建 Cloudflare 账号 ini 文件（基于唯一的 API token）
-    mkdir -p /etc/cloudflare
-    chmod 700 /etc/cloudflare
+    # 无条件覆写：配置表是令牌的唯一事实来源。索引相同的账号在换令牌后若沿用
+    # 旧文件，domain_*.ini 会拿到过期令牌，DNS-01 必然失败。
+    mkdir -p "$CF_CONFIG_DIR"
+    chmod 700 "$CF_CONFIG_DIR"
     CF_ACCOUNT_COUNT=0
     for token in "${!account_tokens[@]}"; do
         idx="${account_tokens[$token]}"
-        ini_file="/etc/cloudflare/cf_account_${idx}.ini"
-        if [[ ! -f "$ini_file" ]]; then
-            cat > "$ini_file" << EOF
+        ini_file="${CF_CONFIG_DIR}/cf_account_${idx}.ini"
+        cat > "$ini_file" << EOF
 # Cloudflare API Token - 账号 ${idx}
 dns_cloudflare_api_token = ${token}
 EOF
-            chmod 600 "$ini_file"
-            log_info "创建 CF 账号文件: $ini_file"
-        fi
-        CF_ACCOUNT_COUNT=$idx  # 保持最大索引
+        chmod 600 "$ini_file"
+        log_info "写入 CF 账号文件: $ini_file"
+        # 取最大索引而非最后一次遍历值：account_tokens 是关联数组，遍历顺序不定，
+        # 直接赋值会把账号总数写小，导致最大的账号被下游漏掉。
+        (( idx > CF_ACCOUNT_COUNT )) && CF_ACCOUNT_COUNT=$idx
     done
     save_state "CF_ACCOUNT_COUNT" "$CF_ACCOUNT_COUNT"
 
@@ -3138,11 +3318,11 @@ EOF
     for domain in "${!domain_to_token[@]}"; do
         token="${domain_to_token[$domain]}"
         idx="${account_tokens[$token]}"
-        ini_file="/etc/cloudflare/cf_account_${idx}.ini"
+        ini_file="${CF_CONFIG_DIR}/cf_account_${idx}.ini"
         # 创建 domain_<root>.ini 文件
         root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
         filebase=$(echo "$root_domain" | tr '.' '_')
-        domain_ini="/etc/cloudflare/domain_${filebase}.ini"
+        domain_ini="${CF_CONFIG_DIR}/domain_${filebase}.ini"
         if [[ -f "$ini_file" ]]; then
             cp "$ini_file" "$domain_ini"
             chmod 600 "$domain_ini"
@@ -3154,13 +3334,20 @@ EOF
         fi
     done
 
+    # 5b. 清理配置表不再引用的 CF 账号文件（换账号 / 账号数变少 / 旧命名残留）
+    _purge_orphan_cf_files
+
     # 6. 注册域名并设置其模式和协议
-    for domain in "${!domain_protocols[@]}"; do
+    # 按配置表顺序遍历（而非 "${!domain_protocols[@]}" 的 hash 顺序）：ALL_DOMAINS /
+    # CDN_DOMAINS / DIRECT_DOMAINS 是注册顺序的派生结果，而 _resolve_protocol_primary
+    # 在多候选时取"最新注册"那个，hash 顺序会让主域在多次运行间漂移。
+    for domain in "${_tsv_domains[@]}"; do
+        [[ -z "${domain_protocols[$domain]:-}" ]] && continue   # 协议列无法识别的行不注册
         # 获取模式（如果未设置，则根据协议推断：如果协议包含 xray-xhttp 或 xray-grpc 则为 cdn，否则 direct）
-        mode="${domain_mode[$domain]}"
+        mode="${domain_mode[$domain]:-}"
         if [[ -z "$mode" ]]; then
             # 默认推断：如果有 xray-xhttp 或 xray-grpc 则为 cdn
-            if [[ " ${domain_protocols[$domain]} " =~ " xray-xhttp " || " ${domain_protocols[$domain]} " =~ " xray-grpc " ]]; then
+            if [[ " ${domain_protocols[$domain]:-} " =~ " xray-xhttp " || " ${domain_protocols[$domain]:-} " =~ " xray-grpc " ]]; then
                 mode="cdn"
             else
                 mode="direct"
