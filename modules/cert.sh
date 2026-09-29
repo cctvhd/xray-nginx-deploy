@@ -2995,13 +2995,206 @@ run_cert() {
     # 1. 安装 certbot
     install_certbot
 
-    # 2. 配置 CF 账号
-    setup_cf_accounts
+    # 2. 运行 edit_nodes.py 配置 API 令牌、域名、协议和模式
+    log_step "运行 edit_nodes.py 配置"
+    cd /root
+    python3 edit_nodes.py
+    # 编辑后，用户按 S 保存并退出，或按 Q 放弃退出
+    # 我们继续处理已保存的配置（如果用户放弃，则视为无更改）
+    cd -
 
-    # 3. 收集域名信息（同时写入 domain_<root>.ini 映射文件）
-    collect_domains
+    # 3. 解析 edit_nodes.py 生成的配置并更新 Cloudflare 账号和域名设置
+    TSV_FILE="/root/.config.tsv"
+    if [[ ! -f "$TSV_FILE" ]]; then
+        log_error "未找到 edit_nodes.py 生成的配置文件 $TSV_FILE"
+        return 1
+    fi
 
-    # 4. 检查已有证书，有则跳过申请
+    # 初始化
+    declare -A domain_protocols   # key: domain, value: set of protocols (空格分隔)
+    declare -A domain_mode        # key: domain, value: mode (cdn 或 direct)
+    declare -A account_tokens     # key: API token, value: account index
+    declare -A token_to_account   # key: API token, value: account index (same as above)
+    declare -A domain_to_token    # key: domain, value: API token
+    declare -A primary_domains    # key: protocol slot (xray-xhttp, etc.), value: domain
+    declare -A protocol_map       # 从 edit_nodes.py 的协议名映射到系统协议标签
+    protocol_map["vless-xhttp"]="xray-xhttp"
+    protocol_map["vless-grpc"]="xray-grpc"
+    protocol_map["vless-xhttp-reality"]="xhttp-reality"
+    protocol_map["vless-reality"]="xray-reality"
+    protocol_map["Sing-Box AnyTLS"]="singbox"
+    protocol_map["Hysteria2"]="hysteria2"
+    protocol_map["Naiveproxy"]="naiveproxy"
+
+    # 固定行对应的协议槽位索引（0-based）
+    declare -A fixed_row_to_slot
+    fixed_row_to_slot[0]="xray-xhttp"
+    fixed_row_to_slot[1]="xray-grpc"
+    fixed_row_to_slot[2]="xhttp-reality"
+    fixed_row_to_slot[3]="xray-reality"
+    fixed_row_to_slot[4]="singbox"
+    fixed_row_to_slot[5]="hysteria2"
+    fixed_row_to_slot[6]="naiveproxy"
+
+    # 读取 TSV 文件
+    account_index=1
+    while IFS=$'\t' read -r api_token protocol domain mode; do
+        # 跳过空行
+        [[ -z "$domain" && -z "$protocol" && -z "$api_token" && -z "$mode" ]] && continue
+        # 去除首尾空格
+        api_token="$(echo "$api_token" | xargs)"
+        protocol="$(echo "$protocol" | xargs)"
+        domain="$(echo "$domain" | xargs | tr '[:upper:]' '[:lower:]')"
+        mode="$(echo "$mode" | xargs)"
+
+        # 如果域名为空，跳过此行（不处理）
+        if [[ -z "$domain" ]]; then
+            continue
+        fi
+
+        # 记录 API token 对应的账号（如果 token 不为空）
+        if [[ -n "$api_token" ]]; then
+            if [[ -z "${account_tokens[$api_token]}" ]]; then
+                account_tokens[$api_token]=$account_index
+                ((account_index++))
+            fi
+            domain_to_token[$domain]=$api_token
+        fi
+
+        # 记录协议和模式
+        if [[ -n "$protocol" && -n "${protocol_map[$protocol]}" ]]; then
+            sys_proto="${protocol_map[$protocol]}"
+            if [[ -z "${domain_protocols[$domain]}" ]]; then
+                domain_protocols[$domain]="$sys_proto"
+            else
+                # 避免重复
+                if [[ ! " ${domain_protocols[$domain]} " =~ " ${sys_proto} " ]]; then
+                    domain_protocols[$domain]="${domain_protocols[$domain]} $sys_proto"
+                fi
+            fi
+        fi
+
+        if [[ -n "$mode" ]]; then
+            # 标准化模式
+            if [[ "$mode" == "直连" ]]; then
+                norm_mode="direct"
+            else
+                norm_mode="cdn"
+            fi
+            domain_mode[$domain]=$norm_mode
+        fi
+
+        # 如果这是固定行（行号从0开始），记录主要域名
+        # 我们需要要知道当前行号；但我们在读取 TSV 时没有行号。
+        # 代わりに，我们可以在处理时假设 TSV 文件的行顺序与 edit_nodes.py 中的数据顺序相同。
+        # 为了简单，我们跳过此处的主要域名设置，稍后我们将通过另一种方式处理。
+        # 实际上，我们可以在读取时保持行号，但为了简化，我们稍后从固定行中读取域名来设置主要域名。
+        # 我们将在处理完所有行后，再根据固定行的域名设置主要域名。
+    done < "$TSV_FILE"
+
+    # 根据固定行设置主要域名（假设 TSV 文件的前 7 行对应固定行）
+    # 我们需要重新读取 TSV 文件以获取行号，或者我们可以在上面的循环中保存行号。
+    # 为了简单，我们重新读取文件并跟踪行号。
+    row=0
+    while IFS=$'\t' read -r api_token protocol domain mode; do
+        [[ -z "$domain" && -z "$protocol" && -z "$api_token" && -z "$mode" ]] && continue
+        api_token="$(echo "$api_token" | xargs)"
+        protocol="$(echo "$protocol" | xargs)"
+        domain="$(echo "$domain" | xargs | tr '[:upper:]' '[:lower:]')"
+        mode="$(echo "$mode" | xargs)"
+        if [[ $row -lt 7 ]]; then
+            slot="${fixed_row_to_slot[$row]}"
+            if [[ -n "$domain" && -n "${protocol_map[$protocol]}" ]]; then
+                sys_proto="${protocol_map[$protocol]}"
+                primary_domains[$sys_proto]=$domain
+            fi
+        fi
+        ((row++))
+    done < "$TSV_FILE"
+
+    # 4. 创建 Cloudflare 账号 ini 文件（基于唯一的 API token）
+    mkdir -p /etc/cloudflare
+    chmod 700 /etc/cloudflare
+    CF_ACCOUNT_COUNT=0
+    for token in "${!account_tokens[@]}"; do
+        idx="${account_tokens[$token]}"
+        ini_file="/etc/cloudflare/cf_account_${idx}.ini"
+        if [[ ! -f "$ini_file" ]]; then
+            cat > "$ini_file" << EOF
+# Cloudflare API Token - 账号 ${idx}
+dns_cloudflare_api_token = ${token}
+EOF
+            chmod 600 "$ini_file"
+            log_info "创建 CF 账号文件: $ini_file"
+        fi
+        CF_ACCOUNT_COUNT=$idx  # 保持最大索引
+    done
+    save_state "CF_ACCOUNT_COUNT" "$CF_ACCOUNT_COUNT"
+
+    # 5. 为每个域名链接到对应的 CF 账号（基于其 API token）
+    for domain in "${!domain_to_token[@]}"; do
+        token="${domain_to_token[$domain]}"
+        idx="${account_tokens[$token]}"
+        ini_file="/etc/cloudflare/cf_account_${idx}.ini"
+        # 创建 domain_<root>.ini 文件
+        root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+        filebase=$(echo "$root_domain" | tr '.' '_')
+        domain_ini="/etc/cloudflare/domain_${filebase}.ini"
+        if [[ -f "$ini_file" ]]; then
+            cp "$ini_file" "$domain_ini"
+            chmod 600 "$domain_ini"
+            # 移除可能的 email 行（如果存在）
+            sed -i '/^[[:space:]]*dns_cloudflare_email/d' "$domain_ini"
+            log_info "域名 *.${domain} → 账号${idx} (${domain_ini})"
+        else
+            log_warn "找不到 CF 账号文件 для токена $token"
+        fi
+    done
+
+    # 6. 注册域名并设置其模式和协议
+    for domain in "${!domain_protocols[@]}"; do
+        # 获取模式（如果未设置，则根据协议推断：如果协议包含 xray-xhttp 或 xray-grpc 则为 cdn，否则 direct）
+        mode="${domain_mode[$domain]}"
+        if [[ -z "$mode" ]]; then
+            # 默认推断：如果有 xray-xhttp 或 xray-grpc 则为 cdn
+            if [[ " ${domain_protocols[$domain]} " =~ " xray-xhttp " || " ${domain_protocols[$domain]} " =~ " xray-grpc " ]]; then
+                mode="cdn"
+            else
+                mode="direct"
+            fi
+        fi
+        # 协议列表（空格分隔转换为逗号分隔）
+        proto_list="${domain_protocols[$domain]}"
+        proto_list="${proto_list// /,}"
+        # 注册域名
+        register_domain "$domain" "$mode" "$proto_list"
+        log_info "已注册域名: $domain [mode=$mode, proto=$proto_list]"
+    done
+
+    # 7. 设置主要域名（协议槽位）
+    for slot in "${!primary_domains[@]}"; do
+        domain="${primary_domains[$slot]}"
+        case "$slot" in
+            "xray-xhttp") save_state "XHTTP_DOMAIN" "$domain" ;;
+            "xray-grpc") save_state "GRPC_DOMAIN" "$domain" ;;
+            "xhttp-reality") save_state "XHTTP_REALITY_DOMAIN" "$domain" ;;
+            "xray-reality") save_state "REALITY_DOMAIN" "$domain" ;;
+            "singbox") save_state "ANYTLS_DOMAIN" "$domain" ;;
+            "hysteria2") save_state "HYSTERIA2_DOMAIN" "$domain" ;;
+            "naiveproxy") save_state "NAIVE_DOMAIN" "$domain" ;;
+        esac
+        log_info "设置主要域名 $slot = $domain"
+    done
+
+    # 8. 重建协议域名（更新 state 中的 ALL_DOMAINS、CDN_DOMAINS、DIRECT_DOMAINS 等）
+    rebuild_protocol_domains
+    load_domain_state
+
+    # 9. 保存域名配置（生成 domain_map.conf）
+    save_domain_config
+    log_info "域名配置已保存"
+
+    # 10. 检查已有证书，有则跳过申请
     if check_existing_certs; then
         log_info "所有域名证书已存在，跳过申请"
         CERT_SUCCESS_ROOTS=()
@@ -3013,7 +3206,7 @@ run_cert() {
         request_certificates
     fi
 
-    # 5. 配置自动续期
+    # 11. 配置自动续期
     setup_auto_renew
 
     log_info "========== SSL 证书模块完成 =========="
