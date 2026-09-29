@@ -30,6 +30,8 @@ load_existing_params() {
     HYSTERIA2_PH_START=$(get_state "HYSTERIA2_PH_START")
     HYSTERIA2_PH_END=$(get_state "HYSTERIA2_PH_END")
     HYSTERIA2_OBFS=$(get_state "HYSTERIA2_OBFS")
+    HYSTERIA2_ECH=$(get_state "HYSTERIA2_ECH")
+    HYSTERIA2_ECH_PUBLIC=$(get_state "HYSTERIA2_ECH_PUBLIC")
     HYSTERIA2_CONGESTION=$(get_state "HYSTERIA2_CONGESTION")
     HYSTERIA2_UPLOAD=$(get_state "HYSTERIA2_UPLOAD")
     HYSTERIA2_DOWNLOAD=$(get_state "HYSTERIA2_DOWNLOAD")
@@ -322,6 +324,25 @@ print(urllib.parse.quote('${HYSTERIA2_PASSWORD}', safe=''))
     local extra_params="sni=${HYSTERIA2_DOMAIN}&insecure=0"
     [[ -n "${HYSTERIA2_PH_START:-}" && -n "${HYSTERIA2_PH_END:-}" ]] && extra_params+="&mport=${HYSTERIA2_PH_START}-${HYSTERIA2_PH_END}"
     [[ -n "${HYSTERIA2_OBFS:-}" ]] && extra_params+="&obfs=${HYSTERIA2_OBFS}&obfs-password=${password_encoded}"
+    if [[ -n "${HYSTERIA2_ECH:-}" ]]; then
+        # 只取 ECH CONFIGS 块 —— 同文件里的 ECH KEYS 是服务端私钥，绝不能进订阅
+        local _ech_cfg
+        _ech_cfg=$(awk '/-----BEGIN ECH CONFIGS-----/{f=1;next}
+                        /-----END ECH CONFIGS-----/{f=0}
+                        f' /etc/hysteria/ech.pem 2>/dev/null | tr -d '\n' || true)
+        if [[ -n "${_ech_cfg}" ]]; then
+            # 编码方式由实测确定（hysteria share -c 的输出）：ech= 用标准
+            # 百分号编码，即 base64 的 + → %2B、/ → %2F、= → %3D，不是 base64url
+            local _ech_encoded
+            _ech_encoded=$(ECH_CFG="${_ech_cfg}" python3 -c "
+import os, urllib.parse
+print(urllib.parse.quote(os.environ['ECH_CFG'], safe=''))
+" 2>/dev/null || echo "${_ech_cfg}")
+            extra_params+="&ech=${_ech_encoded}"
+        else
+            log_warn "已启用 ECH，但读不到 /etc/hysteria/ech.pem 的 ECH CONFIGS 块 —— 本条链接不含 ech 参数"
+        fi
+    fi
     if [[ "${HYSTERIA2_CONGESTION}" == "brutal" ]]; then
         [[ -n "${HYSTERIA2_UPLOAD:-}" ]] && extra_params+="&up=${HYSTERIA2_UPLOAD}"
         [[ -n "${HYSTERIA2_DOWNLOAD:-}" ]] && extra_params+="&down=${HYSTERIA2_DOWNLOAD}"
@@ -515,6 +536,9 @@ show_client_links() {
         echo -e "  密码:   ${HYSTERIA2_PASSWORD}"
         echo -e "  SNI:    ${HYSTERIA2_DOMAIN}"
         echo -e "  协议:   UDP"
+        if [[ -n "${HYSTERIA2_ECH:-}" ]]; then
+            echo -e "  ECH:    已启用 (外层 SNI: ${HYSTERIA2_ECH_PUBLIC:-未记录})"
+        fi
         echo ""
         {
             echo "# Hysteria2"

@@ -186,31 +186,113 @@ configure_hysteria2() {
         log_info "QUIC 窗口: 由 Hysteria2 自行管理"
     fi
 
-    # ── 7. 混淆（salamander / gecko）（参考 hy2.sh: 1465-1481）─
-    local obfs_status obfs_type obfs_pass
+    # ── 7. 伪装模式（不使用 / ECH / 混淆，四选一，互斥）───────
+    # ECH 与 obfs 是互斥的替代方案而非可叠加的开关：obfs 已把整包
+    # 混淆成无特征随机字节，SNI 本就不出现在明文里，再叠 ECH 零收益
+    # （官方文档：ECH matters in bare mode ... ECH adds nothing）。
+    local obfs_status obfs_type obfs_pass ech_public
+    obfs_status="false"; obfs_type=""; obfs_pass=""
+    ech_public=""
     echo ""
-    echo "是否使用流量混淆?"
+    echo "伪装模式?"
     echo "  1. 不使用 (默认，性能最好)"
-    echo "  2. salamander - 将数据包混淆为无特征随机字节"
-    echo "  3. gecko (实验性) - 在 salamander 基础上额外拆分 QUIC 握手包为随机分片，抗 DPI 检测更强"
-    read -rp "输入序号 [1-3，默认 1]: " obfs_num
+    echo "  2. ECH - 裸连接 + 加密 ClientHello，对中间盒隐藏真实 SNI"
+    echo "  3. salamander - 将数据包混淆为无特征随机字节"
+    echo "  4. gecko (实验性) - 在 salamander 基础上额外拆分 QUIC 握手包为随机分片，抗 DPI 检测更强"
+    read -rp "输入序号 [1-4，默认 1]: " obfs_num
     if [[ "${obfs_num}" == "2" ]]; then
+        mkdir -p /etc/hysteria
+        ech_public="$(get_state "HYSTERIA2_ECH_PUBLIC")"
+
+        if [[ -s /etc/hysteria/ech.pem ]]; then
+            # 密钥一旦变化，所有已配 ECH 的客户端立即断连（客户端 ECH
+            # 失败即硬失败，不降级），故已存在就原样复用，绝不自动轮换。
+            save_state "HYSTERIA2_OBFS" ""
+            log_info "复用已有 ECH 密钥 /etc/hysteria/ech.pem (不轮换，外层 SNI: ${ech_public:-未记录})"
+        else
+            save_state "HYSTERIA2_OBFS" ""
+            # 外层明文 SNI —— ECH 对中间盒可见的假名。以下候选均已实测
+            # 响应头带 alt-svc: h3（本机无 --http3，只能取这个间接信号），
+            # 且已排除在常见审查环境下自身被封锁的域名（用被墙域名做
+            # 外层 SNI 等于自曝）。
+            local -a _ech_names=(
+                www.cloudflare.com
+                cdn.jsdelivr.net
+                www.amazon.com
+                www.samsung.com
+                www.akamai.com
+            )
+            echo ""
+            echo "外层明文 SNI —— 中间盒只能看到这个名字，需确实跑 HTTP/3:"
+            local _n
+            for _n in "${_ech_names[@]}"; do
+                echo "    - ${_n}"
+            done
+            # 每台机器随机取默认值，避免部署出去的机器外层 SNI 全都一样
+            local _ech_default="${_ech_names[$(( RANDOM % ${#_ech_names[@]} ))]}"
+            local _ech_input
+            read -rp "外层 SNI [回车采用随机候选: ${_ech_default}]: " _ech_input
+            ech_public="${_ech_input:-${_ech_default}}"
+
+            # 软校验：只告警不拦截。脚本也测不了该域名在目标网络是否可达
+            # （本机出口在国外），可达性须由运维自行确认。
+            if [[ ! "${ech_public}" =~ ^([A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?\.)+[A-Za-z]{2,}$ ]]; then
+                log_warn "「${ech_public}」格式不像合法域名，仍按输入使用"
+            fi
+            if curl -sSI --max-time 8 "https://${ech_public}" 2>/dev/null | grep -i '^alt-svc' | grep -qi 'h3'; then
+                log_info "已确认 ${ech_public} 广告 HTTP/3"
+            else
+                log_warn "${ech_public} 未探测到 HTTP/3 广告（可能不支持 H3，也可能是本机网络/curl 限制）——不阻断，请确认其在目标网络可用"
+            fi
+
+            # 生成密钥：优先 hysteria 自带子命令（2.12.3+），它不可用**或
+            # 没产出文件**都回退 sing-box（输出格式同构：ECH CONFIGS +
+            # ECH KEYS 两个 PEM 块）。两处都失败才回退为「不使用伪装」。
+            if command -v hysteria >/dev/null 2>&1 && hysteria ech --help >/dev/null 2>&1; then
+                hysteria ech --public-name "${ech_public}" --output /etc/hysteria/ech.pem --overwrite >/dev/null 2>&1 || true
+            fi
+            if [[ ! -s /etc/hysteria/ech.pem ]] && command -v sing-box >/dev/null 2>&1; then
+                sing-box generate ech-keypair "${ech_public}" > /etc/hysteria/ech.pem 2>/dev/null || true
+            fi
+            [[ -s /etc/hysteria/ech.pem ]] && log_info "已生成 ECH 密钥 (外层 SNI: ${ech_public})"
+        fi
+
+        if [[ -s /etc/hysteria/ech.pem ]]; then
+            # 内含私钥，权限必须 600
+            chmod 600 /etc/hysteria/ech.pem
+            chown hysteria:hysteria /etc/hysteria/ech.pem 2>/dev/null || true
+            save_state "HYSTERIA2_ECH" "1"
+            save_state "HYSTERIA2_ECH_PUBLIC" "${ech_public}"
+            log_info "伪装模式: ECH (裸连接)"
+        else
+            log_warn "hysteria 与 sing-box 均无法生成 ECH 密钥，回退为「不使用伪装」"
+            ech_public=""
+            save_state "HYSTERIA2_ECH" ""
+            save_state "HYSTERIA2_ECH_PUBLIC" ""
+        fi
+    elif [[ "${obfs_num}" == "3" ]]; then
         obfs_status="true"
         obfs_type="salamander"
         obfs_pass="${HY2_PASS}"
         log_info "混淆: salamander (密码=认证口令)"
         save_state "HYSTERIA2_OBFS" "salamander"
-    elif [[ "${obfs_num}" == "3" ]]; then
+        save_state "HYSTERIA2_ECH" ""
+        save_state "HYSTERIA2_ECH_PUBLIC" ""
+    elif [[ "${obfs_num}" == "4" ]]; then
         obfs_status="true"
         obfs_type="gecko"
         obfs_pass="${HY2_PASS}"
         log_info "混淆: gecko (实验性，密码=认证口令)"
         save_state "HYSTERIA2_OBFS" "gecko"
+        save_state "HYSTERIA2_ECH" ""
+        save_state "HYSTERIA2_ECH_PUBLIC" ""
     else
         obfs_status="false"
         obfs_type=""
         log_info "混淆: 不使用"
         save_state "HYSTERIA2_OBFS" ""
+        save_state "HYSTERIA2_ECH" ""
+        save_state "HYSTERIA2_ECH_PUBLIC" ""
     fi
 
     # ── 8. 伪装类型（参考 hy2.sh: 1479-1543）─────────────────
@@ -368,6 +450,15 @@ tls:
   key: /etc/hysteria/privkey.pem
   sniGuard: strict
 EOF
+
+    # ech（裸连接 + 加密 ClientHello；与 obfs 互斥，故不同时出现）
+    # 该文件同时含 ECH KEYS(私钥，服务端用) 与 ECH CONFIGS(公开，客户端用)
+    if [[ -n "${ech_public}" ]]; then
+        cat >> "$yaml" << EOF
+ech:
+  keyPath: /etc/hysteria/ech.pem
+EOF
+    fi
 
     # auth
     cat >> "$yaml" << EOF
