@@ -334,6 +334,12 @@ print(urllib.parse.quote('${HYSTERIA2_PASSWORD}', safe=''))
             # 供 show_client_links 原样打印：Passwall 等客户端不认 URI 里的
             # ech=，需要用户手工填裸 base64（sing-box 则要 PEM 形式）
             HYSTERIA2_ECH_CFG="${_ech_cfg}"
+            # PEM 形式 = 同一份 base64 按 64 列折行 + 头尾标记。两种内联写法
+            # 恰好相反（实机验证）：hysteria 官方客户端内联只认裸 base64，填
+            # PEM 会 FATAL（它把整串当文件路径 open）；sing-box 的
+            # tls.ech.config 只认 PEM 原文，填裸 base64 会 FATAL。
+            HYSTERIA2_ECH_PEM="$(printf -- '-----BEGIN ECH CONFIGS-----\n%s\n-----END ECH CONFIGS-----' \
+                "$(printf '%s' "${_ech_cfg}" | fold -w 64)")"
             # 编码方式由实测确定（hysteria share -c 的输出）：ech= 用标准
             # 百分号编码，即 base64 的 + → %2B、/ → %2F、= → %3D，不是 base64url
             local _ech_encoded
@@ -541,16 +547,28 @@ show_client_links() {
         echo -e "  协议:   UDP"
         if [[ -n "${HYSTERIA2_ECH:-}" ]]; then
             echo -e "  ECH:    已启用 (外层 SNI: ${HYSTERIA2_ECH_PUBLIC:-未记录})"
-            echo -e "  ECH 参数(裸 base64，供 Passwall/hysteria 客户端手填):"
-            echo -e "    ${HYSTERIA2_ECH_CFG:-（未取到，检查 /etc/hysteria/ech.pem）}"
+            # 下面两段刻意顶格输出，便于整段选中复制：sing-box 的 PEM 解析
+            # 不接受前导空格，带缩进粘过去会 FATAL invalid ECH configs pem
+            # （实机验证；hysteria 对 base64 的前导空格则容忍）。两种写法相反，
+            # 务必按标注对应客户端。
+            echo -e "  ECH[hysteria 官方/Passwall，裸 base64]:"
+            echo "${HYSTERIA2_ECH_CFG:-（未取到，检查 /etc/hysteria/ech.pem）}"
+            if [[ -n "${HYSTERIA2_ECH_PEM:-}" ]]; then
+                echo -e "  ECH[sing-box，PEM 原文]:"
+                printf '%s\n' "${HYSTERIA2_ECH_PEM}"
+            fi
         fi
         echo ""
         {
             echo "# Hysteria2"
             echo "$HYSTERIA2_URL"
             if [[ -n "${HYSTERIA2_ECH:-}" && -n "${HYSTERIA2_ECH_CFG:-}" ]]; then
-                echo "# ECH 参数(裸 base64，供 Passwall/hysteria 客户端手填):"
+                echo "# ECH[hysteria 官方/Passwall，裸 base64]:"
                 echo "# ${HYSTERIA2_ECH_CFG}"
+                if [[ -n "${HYSTERIA2_ECH_PEM:-}" ]]; then
+                    echo "# ECH[sing-box，PEM 原文]:"
+                    printf '%s\n' "${HYSTERIA2_ECH_PEM}" | sed 's/^/# /'
+                fi
             fi
             echo ""
         } >> "$output_file"
