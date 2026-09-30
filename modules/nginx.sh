@@ -1523,8 +1523,16 @@ generate_servers_conf() {
         LATENCY_PROXY_TIMEOUT=7200
     fi
 
-    # 有意清空配置文件，后续以 >> 追加方式逐段写入
-    : > /etc/nginx/conf.d/servers.conf
+    # ── 先写临时文件，写完再原子替换 ──────────────────────────
+    # 原实现是 `: > servers.conf` 就地截断，之后逐段 >> 追加。这样中途失败
+    # （set -e 下任意报错、或 heredoc 里变量展开出错）就会把线上文件留成
+    # 0 字节或半截 —— 而 DoH 入口和其它所有代理都挂在这个文件上。
+    # 更阴的是菜单路径：run_menu_action 用 `"$@" || {...}` 调用，
+    # 整个函数体的 errexit 被关掉，中途失败不会中止，只会安静地写出半截文件。
+    # 临时文件名以 .new 结尾，不匹配 nginx 的 conf.d/*.conf 通配，不会被 include。
+    # 刻意不预先 `: >` 建文件：首个 cat >> 自会创建，这样「首次写入前就炸」
+    # 不留任何残留；写到一半才炸也只留一个不被 include 的临时文件。
+    local _out="/etc/nginx/conf.d/servers.conf.new"
 
     get_root_domain() {
         echo "$1" | awk -F. '{print $(NF-1)"."$NF}'
@@ -1577,7 +1585,7 @@ CONF
 )
         fi
 
-        cat >> /etc/nginx/conf.d/servers.conf << CONF
+        cat >> "$_out" << CONF
 
 # ===================================================================
 # CDN ${XHTTP_DOMAIN} — xhttp
@@ -1724,7 +1732,7 @@ CONF
         mkdir -p "/var/www/${GRPC_DOMAIN}"
         generate_fake_site "/var/www/${GRPC_DOMAIN}" 1
 
-        cat >> /etc/nginx/conf.d/servers.conf << CONF
+        cat >> "$_out" << CONF
 
 # ===================================================================
 # CDN ${GRPC_DOMAIN} — gRPC
@@ -1848,7 +1856,7 @@ CONF
         mkdir -p "/var/www/${REALITY_DOMAIN}"
         generate_fake_site "/var/www/${REALITY_DOMAIN}" 2
 
-        cat >> /etc/nginx/conf.d/servers.conf << CONF
+        cat >> "$_out" << CONF
 
 # ===================================================================
 # Reality dest 伪装站 ${REALITY_DOMAIN}（8321）
@@ -1893,7 +1901,7 @@ CONF
         mkdir -p "/var/www/${XHTTP_REALITY_DOMAIN}"
         generate_fake_site "/var/www/${XHTTP_REALITY_DOMAIN}" 3
 
-        cat >> /etc/nginx/conf.d/servers.conf << CONF
+        cat >> "$_out" << CONF
 
 # ===================================================================
 # XHTTP-Reality dest 伪装站 ${XHTTP_REALITY_DOMAIN}（8326）
@@ -1925,7 +1933,7 @@ CONF
     fi
 
     # 兜底 server 块
-    cat >> /etc/nginx/conf.d/servers.conf << 'CONF'
+    cat >> "$_out" << 'CONF'
 
 # ===================================================================
 # 兜底：SNI 不匹配拒绝握手
@@ -1942,7 +1950,7 @@ server {
 CONF
 
     # P3修复：8400 加自签证书完成 TLS 握手，返回伪装页而非 RST
-    cat >> /etc/nginx/conf.d/servers.conf << 'CONF'
+    cat >> "$_out" << 'CONF'
 
 # ===================================================================
 # SNI 陷阱伪装站（8400）
@@ -1989,7 +1997,7 @@ CONF
         all_domain_names+=" ${domain}"
     done
 
-    cat >> /etc/nginx/conf.d/servers.conf << CONF
+    cat >> "$_out" << CONF
 
 # ===================================================================
 # HTTP → HTTPS 重定向（证书用 DNS-Cloudflare，无需 webroot 验证）
@@ -2007,6 +2015,13 @@ CONF
 
     # 伪装站目录收尾：servers.conf 已定稿，此刻的引用关系才是权威
     _purge_orphan_webroots
+
+    # 同目录 rename，原子替换；失败则线上文件原样保留
+    if ! mv -f "$_out" /etc/nginx/conf.d/servers.conf; then
+        log_error "servers.conf 原子替换失败，已保留原文件"
+        rm -f "$_out"
+        return 1
+    fi
 
     log_info "servers.conf 生成完成"
 }
