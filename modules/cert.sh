@@ -3001,21 +3001,26 @@ run_cert() {
     echo "  请选择操作："
     echo "  1. 配置域名表（填表 → 自动处理新增CF账号/新增域名/补证书，并重建下游）"
     echo "  2. 检查/更新 Certbot 及 DNS 插件"
-    echo "  3. 刷新/修复域名协议分配"
+    echo "  3. 刷新/修复域名协议分配（同样先打开这张表，改完再刷新）"
     echo ""
     read -rp "  请选择 [1-3，默认1]: " cert_choice
     cert_choice="${cert_choice:-1}"
 
+    # ⚠️ 选项 3 **不再直接跑 refresh_domain_assignments**：用户的诉求是
+    # 「刷新修改域名以表格的方式呈现」「为什么不能像1这样显示完整表格修改」——
+    # 他要的是刷新这条路上**先看到那张完整的、能改的表**（与选项 1 同一张表），
+    # 而不是一张只读的一览（旧行为：直接打 7 行汇总，改不了，他还得退回选项 1）。
+    # 故 1 与 3 走**同一条路**（下面这段就是选项 1 的完整流程：打开表 → 应用表内容 →
+    # 级联重建），差别只在 3 最后多跑一轮 refresh_domain_assignments。
+    # 若按 Q 退出未改表，行为与旧的「纯刷新」基本一致（多走一遍幂等的应用逻辑）。
+    local _also_refresh=0
     case "$cert_choice" in
         2)
             update_certbot_deps
             return
             ;;
         3)
-            refresh_domain_assignments
-            return
-            ;;
-        1|*)
+            _also_refresh=1
             ;;
     esac
 
@@ -3410,5 +3415,12 @@ EOF
     echo ""
     log_info "账号映射文件（可随时查看/手动修改）："
     list_domain_ini_files | while read -r f; do echo "  $f"; done
+
+    # 选项 3：走完上面这条「完整表格 → 应用」的路之后，再补一轮刷新/修复
+    # （重建协议→域名映射、清理陈旧标签、级联重建下游），最后打出那张带框的一览表。
+    if (( _also_refresh )); then
+        echo ""
+        refresh_domain_assignments
+    fi
     set -e
 }
