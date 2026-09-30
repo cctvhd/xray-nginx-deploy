@@ -376,11 +376,15 @@ configure_doh_entry() {
     cur_domain=$(get_state "DOH_DOMAIN" "")
     cur_path=$(get_state "DOH_PATH" "")
 
-    # ── 已启用：回车保持 / 0 关闭 / 或换一个新域名 ──────────────
+    # ── 已启用：回车保持 / 0 关闭 / p 换路径 / 或换一个新域名 ──
     if [[ -n "$cur_domain" && -f /etc/nginx/conf.d/doh.conf ]]; then
         log_info "当前 DoH 入口: https://${cur_domain}${cur_path}"
+        echo "        回车 = 保持不变"
+        echo "        p    = 只换访问路径（/ 后面那一段）"
+        echo "        0    = 关闭该入口"
+        echo "        或直接输入新域名（路径不变）"
         local ans
-        read -rp "  回车 = 保持不变，输入 0 = 关闭该入口，或输入新域名: " ans
+        read -rp "  请选择: " ans
         ans="${ans// /}"
         if [[ -z "$ans" ]]; then
             log_info "DoH 入口保持不变"
@@ -391,6 +395,12 @@ configure_doh_entry() {
         # 吞掉 —— 用户看不到任何提示，而 return 一个多行文本会直接报错。
         if [[ "$ans" == "0" ]]; then
             _doh_entry_disable "$cur_domain"
+            return $?
+        fi
+        if [[ "${ans,,}" == "p" ]]; then
+            _doh_prompt_path || return 1
+            save_state "DOH_PATH" "$DOH_PATH_NEW"
+            _doh_entry_apply "$cur_domain"
             return $?
         fi
         ans="${ans,,}"
@@ -450,23 +460,32 @@ configure_doh_entry() {
 
     # 路径：回车随机；也可以手输固定值（须以 / 开头）
     if [[ -z "$cur_path" ]]; then
-        local _in
-        while true; do
-            read -rp "  访问路径（回车 = 随机生成，须以 / 开头）: " _in
-            if [[ -z "$_in" ]]; then
-                cur_path="/dns-$(openssl rand -hex 6)"
-                break
-            fi
-            if [[ "$_in" == /* && "$_in" != *[!A-Za-z0-9/_.-]* ]]; then
-                cur_path="$_in"
-                break
-            fi
-            log_warn "路径须以 / 开头，且只含字母数字与 / _ . - ，请重输"
-        done
+        _doh_prompt_path || return 1
+        cur_path="$DOH_PATH_NEW"
         save_state "DOH_PATH" "$cur_path"
     fi
 
     _doh_entry_apply "$_sel"
+}
+
+# 问一个新的访问路径（回车 = 随机重生成）。结果写进全局 DOH_PATH_NEW。
+# ⚠️ 刻意不用 stdout 回传：本仓库的 log_* 全是裸 echo，混在一起会被调用方
+# 一起捕获成一个多行「路径」（同 CLAUDE.md 里 resolve_edit_nodes_script 那条坑）。
+_doh_prompt_path() {
+    local _in
+    while true; do
+        read -rp "  访问路径（回车 = 随机生成，须以 / 开头）: " _in
+        _in="${_in// /}"
+        if [[ -z "$_in" ]]; then
+            DOH_PATH_NEW="/dns-$(openssl rand -hex 6)"
+            return 0
+        fi
+        if [[ "$_in" == /* && "$_in" != *[!A-Za-z0-9/_.-]* ]]; then
+            DOH_PATH_NEW="$_in"
+            return 0
+        fi
+        log_warn "路径须以 / 开头，且只含字母数字与 / _ . - ，请重输"
+    done
 }
 
 # 落 state 后固定收尾：ensure_doh_conf（写 doh.conf）→ sync_refresh_nginx_routes
@@ -542,9 +561,60 @@ _doh_entry_disable() {
     return 0
 }
 
+# ── 已安装后的子菜单 ─────────────────────────────────────────
+# 装完之后再进来，十有八九只是想换 DoH 那个域名或 / 后面的路径 —— 而入口的
+# 生成只动 nginx 的 doh.conf，跟 mosdns-x 本身没关系。所以已安装时不再走
+# 「重下二进制 → 备份配置 → 重启服务」这一整套（重启会瞬断家里的解析），
+# 而是先给一个明确的子菜单。
+_mosdns_menu_installed() {
+    local ver entry svc
+    ver=$(mosdns_build_version)
+    entry=$(get_state "DOH_DOMAIN" "")
+    [[ -n "$entry" ]] && entry="https://${entry}$(get_state 'DOH_PATH' '')"
+
+    log_info "mosdns-x 已安装${ver:+: build ${ver}}"
+    if command -v systemctl >/dev/null 2>&1; then
+        svc=$(systemctl is-active mosdns 2>/dev/null || true)
+        log_info "服务状态: ${svc:-未知}（systemctl is-active mosdns）"
+    fi
+    log_info "当前 DoH 入口: ${entry:-未启用}"
+    echo ""
+    echo "  1. 配置 DoH 入口（更换域名 / 访问路径）"
+    echo "  2. 重装 mosdns-x 并重启服务（改过 config.yaml 后用它）"
+    echo "  0. 返回"
+    echo ""
+
+    local ans
+    read -rp "  请选择 [1]: " ans
+    case "${ans:-1}" in
+        1)
+            # 只碰 nginx 侧：写 doh.conf + 重生成 SNI map + reload。
+            load_module sync
+            configure_doh_entry
+            return $?
+            ;;
+        2)
+            install_mosdns_binary --force || return 1
+            generate_mosdns_config || return 1
+            generate_mosdns_service || return 1
+            start_mosdns || return 1
+            verify_mosdns || log_warn "mosdns-x 自检未通过，请查 journalctl -u mosdns -n 50"
+            return 0
+            ;;
+        0) log_info "未做任何改动"; return 0 ;;
+        *) log_warn "无效选择，未做任何改动"; return 0 ;;
+    esac
+}
+
 # ── 模块入口 ─────────────────────────────────────────────────
 run_mosdns() {
-    log_step "========== mosdns-x 安装配置 =========="
+    log_step "========== mosdns-x =========="
+
+    # 已安装 → 子菜单，不再每进一次就重装一遍。
+    if mosdns_installed; then
+        _mosdns_menu_installed
+        return $?
+    fi
 
     local rc=0
 
