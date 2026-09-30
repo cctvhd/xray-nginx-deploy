@@ -163,6 +163,24 @@ def mouse_click():
     return ("edit" if double else "move",) + hit
 
 
+def set_mouse(on):
+    """开/关终端鼠标上报。
+    关掉后鼠标就交还给终端 —— 拖选复制、右键/中键粘贴都恢复（表格里按 M 切换）。
+    ⚠️ 开着的时候鼠标动作全被程序收走，终端的「右键=粘贴」会被 BUTTON3 事件顶掉，
+    用户会以为粘贴坏了，所以这个开关必须在提示行里能看见。"""
+    global MOUSE_OK, _last_click
+    try:
+        # ⚠️ Python 的 mousemask 返回的是 **元组 (availmask, oldmask)**，不是整数！
+        # 写成 `mousemask(...) != 0` 会恒为真 —— 于是关掉后 MOUSE_OK 仍为 True
+        # （提示行不翻、再也开不回来），终端不支持鼠标时也会谎报支持。
+        r = curses.mousemask(curses.ALL_MOUSE_EVENTS if on else 0)
+        avail = r[0] if isinstance(r, tuple) else r
+    except curses.error:
+        avail = 0
+    MOUSE_OK = bool(avail)
+    _last_click = (0.0, None)
+
+
 def load_file():
     """启动时读取上次保存的数据"""
     global LOAD_NOTE
@@ -257,9 +275,9 @@ def draw_table(stdscr, ri, ci):
                 x += 1
         return h
 
-    hint = "方向键移动 | Enter 编辑/切换 | S 保存 | Q 退出"
-    if MOUSE_OK:
-        hint = "方向键移动 | Enter 或鼠标双击 编辑/切换 | S 保存 | Q 退出"
+    hint = ("方向键移动 | Enter 编辑/切换 | S 保存 | Q 退出 | M 开鼠标"
+            if not MOUSE_OK else
+            "方向键/鼠标 移动 | Enter或双击 编辑/切换 | S 保存 | Q 退出 | M 关鼠标")
     safe_add(stdscr, 0, 1, trunc(hint, sw - 2))
     # 数据目录/读取状态顶格单独一行：屏幕会被 clear()，cert.sh 在此之前打的
     # 「配置表目录: ...」日志会被抹掉，这行是唯一能当场判断读到哪去了的依据。
@@ -341,15 +359,10 @@ def edit_cell(stdscr, r, c, input_y):
 
 
 def main(stdscr):
-    global MOUSE_OK
     load_file()
     curses.curs_set(0)
     stdscr.keypad(True)
-    try:
-        # 终端不支持鼠标时返回 0（此时终端也不会发鼠标序列，点击等于没点）
-        MOUSE_OK = curses.mousemask(curses.ALL_MOUSE_EVENTS) != 0
-    except curses.error:
-        MOUSE_OK = False
+    set_mouse(True)          # 终端不支持时内部置 MOUSE_OK=False，不抛错
     r, c = 0, 0
     while True:
         input_y = draw_table(stdscr, r, c)
@@ -372,6 +385,9 @@ def main(stdscr):
             c += 1
         elif key in (10, 13, curses.KEY_ENTER):
             edit_cell(stdscr, r, c, input_y)
+        elif key in (ord("m"), ord("M")):
+            # 把鼠标还给终端：拖选复制 / 右键粘贴都靠这个（开着时它们全被程序收走）
+            set_mouse(not MOUSE_OK)
         elif key in (ord("s"), ord("S")):
             # example.com 是源码里的占位符（RFC 2606 保留域），不是谁的域名。
             # 带着它保存 = 落盘一份「看起来正常」的空表，下游 _purge_stale_domains
