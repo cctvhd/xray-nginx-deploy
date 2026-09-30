@@ -95,6 +95,10 @@ log_step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 #    分隔线也长短不一，整张表是歪的。表格的全部价值在对齐，歪了等于没排。
 #    本函数按真实显示宽度补空格，中英混排一律对齐（edit_nodes.py 的 cw()/wlen() 同理）。
 # 依赖 python3（配置表编辑器 edit_nodes.py 本就要求它）。
+# ⚠️ modules/cert.sh 顶部有一份 `declare -F render_table || ...` 的**同实现兜底**，
+#    改这里必须同步改那里：install.sh 与模块是两条独立更新通道，模块可能比
+#    install.sh 新（curl 模式每次拉 / 菜单 s 同步），那时模块调不到本函数会报
+#    `render_table: command not found`，整张表变成一行报错（2026-09-30 实机踩到）。
 render_table() {
     local _spec="$1"
     python3 -c '

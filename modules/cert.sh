@@ -12,6 +12,42 @@
 # 选项6「刷新域名分配」内的 CF 线上盘点开关：测试 harness / 离线设 1 跳过（默认开）
 : "${CF_SCAN_OFF:=0}"
 
+# ── 表格渲染（东亚宽度感知）：install.sh 未定义时在本模块兜底 ──────────
+# ⚠️ 这段与 install.sh 里的 render_table() 是**同一实现，改一处必须改另一处**。
+# 为什么要两份：install.sh 与各模块是**两条独立的更新通道** —— install.sh 由用户
+# 启动的那份决定（本地 checkout / curl 一次拉取），模块却可能被单独刷新（curl 模式
+# 每次拉、或菜单 s「同步/更新模块到本地缓存」）。于是会出现「模块是新的、install.sh
+# 是旧的」这种组合：本文件 2140 行调 render_table 时函数压根不存在，报
+# `render_table: command not found`，**整张表变成一行报错**（2026-09-30 实机踩到）。
+# 结论（通用）：**模块不能依赖 install.sh 里「后加」的函数** —— 模块要用什么，
+# 就得自己能提供，或者只依赖 log_*/get_state/save_state 这类早已稳定的核心函数。
+if ! declare -F render_table >/dev/null 2>&1; then
+# stdin 每行 = \x01 分隔的单元格（$1 = 逗号分隔的各列显示宽度）；
+# 单行内容恰为 __RT_SEP__ 时输出一条 ─ 分隔线（按同样列宽）。
+# printf "%-20s" 按**字符数**补空格，而中文/全角在终端占 2 列 → 表头与数据行错开，
+# 故按真实显示宽度补（edit_nodes.py 的 cw()/wlen() 同理）。依赖 python3（既有依赖）。
+render_table() {
+    local _spec="$1"
+    python3 -c '
+import sys, unicodedata
+spec = [int(x) for x in sys.argv[1].split(",")]
+def w(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+out = sys.stdout
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if line == "__RT_SEP__":
+        cells = ["─" * n for n in spec]
+    else:
+        cells = []
+        for i, c in enumerate(line.split("\x01")):
+            n = spec[i] if i < len(spec) else 0
+            cells.append(c + " " * max(0, n - w(c)))
+    out.write("  " + " ".join(cells).rstrip() + "\n")
+' "$_spec"
+}
+fi
+
 # ── 检测 Certbot 是否已安装 ──────────────────────────────────
 check_certbot_installed() {
     if command -v certbot &>/dev/null; then
@@ -2110,6 +2146,9 @@ print_domain_protocol_overview() {
     # 表格先攒进数组、再一次性交给 render_table：**不能**写成 `{ ... } | render_table`——
     # 那会让整个生成循环跑在子 shell 里，`_unconf+=()` 出了管道就没了（下面「尚未配置」
     # 那行提示会永远为空）。同理各 printf 都是命令替换，只影响自身。
+    # 空槽**留空白**、不填 "(未配置)" 之类的占位字（2026-09-30 用户原话：
+    # 「即使没有配置相关域名和选项你可以显示空白」）—— 表格按行看的是「有没有域」，
+    # 空白最直观；哪个协议没配由表尾那行 WARN 汇总，不必在格子里重复。
     local -a _body=()
     _body+=("$(printf '表行\x01%s\x01%s\x01%s' "协议槽位" "域名 / 当前 SNI" "备注")")
     _body+=("__RT_SEP__")
@@ -2128,15 +2167,19 @@ print_domain_protocol_overview() {
             [[ -n "$_snk" ]] && _sni=$(get_state "$_snk" "")
             if [[ -n "$_sni" ]]; then
                 # Reality 槽借公共大站 SNI = 合法配置态，非缺口；自建与否由配置表第 3/4 行
-                # 决定（见 collect_reality_params）。仅真正「无域无 SNI」的槽才是未配置。
-                _body+=("$(printf '%s\x01%s\x01%s\x01%s' "$_row_no" "$_label" "(借公共 SNI: ${_sni})" "公共伪装")")
+                # 决定（见 collect_reality_params）。域名列留空白（本槽确实没有自有域），
+                # SNI 放备注列，信息不丢。
+                _body+=("$(printf '%s\x01%s\x01%s\x01%s' "$_row_no" "$_label" "" "借公共 ${_sni}")")
             else
-                _body+=("$(printf '%s\x01%s\x01%s\x01%s' "$_row_no" "$_label" "(未配置)" "—")")
+                _body+=("$(printf '%s\x01%s\x01%s\x01' "$_row_no" "$_label" "")")
                 _unconf+=("$_label")
             fi
         fi
     done
-    printf '%s\n' "${_body[@]}" | render_table "6,16,34,10"
+    # 列宽总和 = 2(缩进)+6+1+14+1+22+1+26 = 73 列，刻意压在 80 列终端内 —— 表格一旦
+    # 折行就全废了。故 域名 列只需容下域名本身（SNI 挪去备注），备注列容下
+    # 「借公共 <最长域名>」。加分隔线也不会更宽。
+    printf '%s\n' "${_body[@]}" | render_table "6,14,22,26"
 
     echo ""
     log_info "上表「表行」= 配置表（主菜单 5→1）里同一行的行号，两表行序一致"
