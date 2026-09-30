@@ -412,12 +412,22 @@ cleanup_mosdns_module() {
 
     systemctl daemon-reload >/dev/null 2>&1 || true
 
-    # DoH 入口：doh.conf 删掉即可（generate_sni_map 要求它存在才写 443 路由），
-    # 但 nginx.conf 里那条路由要重跑「配置 Nginx」才会消失。
+    # DoH 入口：两个文件都要删。
+    #   · doh.conf          —— 独立落点的 8410 vhost + 限流 zone 定义；
+    #                          generate_sni_map 要求它存在才写 443 路由。
+    #   · doh_location.conf —— location 正文，独立落点由 8410 vhost include，
+    #                          共用落点由 servers.conf 里那个协议的 vhost include。
+    # state 一清，下次「配置 Nginx」就不会再往 servers.conf 注入 include。
+    # 但 nginx.conf / servers.conf 里已经写下的那几行，要重跑「配置 Nginx」
+    # 才会消失（servers.conf 里的 include 指向已删文件 → nginx -t 会直接报错，
+    # 所以这里必须提示得明确些）。
     remove_path_if_exists "/etc/nginx/conf.d/doh.conf"
+    remove_path_if_exists "/etc/nginx/doh_location.conf"
     if [[ -n "$(get_state 'DOH_DOMAIN' '')" ]]; then
-        log_warn "DoH 入口已删除，但 nginx.conf 的 SNI map 里可能还留着这条 443 路由"
-        log_warn "  重跑一次「配置 Nginx」即可清掉（该域会回到伪装站）"
+        log_warn "DoH 入口已删除，但 nginx 现有配置里可能还留着它的路由/include"
+        log_warn "  重跑一次「配置 Nginx」即可清掉（该域会回到协议自己/伪装站）"
+        log_warn "  ⚠️ 在那之前 servers.conf 里若还 include 着刚删掉的 doh_location.conf，"
+        log_warn "     nginx -t 会报 no such file —— 别慌，重跑「配置 Nginx」即好"
     fi
 
     reset_mosdns_state

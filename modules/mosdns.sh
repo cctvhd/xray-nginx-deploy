@@ -348,10 +348,34 @@ verify_mosdns() {
     return 1
 }
 
+# Reality 域做 DoH 落点的代价：照实说明，但不阻拦（用户点名要放开这一类）。
+_doh_note_reality_penalty() {
+    case "${1:-}" in
+        reality|xhttp-reality)
+            log_warn "落点是 Reality 域：请求是 xray 的 fallback 转给 nginx 的，转过去时没有"
+            log_warn "  真实源地址（reality inbound 是 xver=0、不发 PROXY protocol，8321/8326 的"
+            log_warn "  listen 也没开 proxy_protocol）→ \$final_real_ip 退化成 127.0.0.1。"
+            log_warn "  后果：限流变成一个桶装所有客户端、access log 记不到真实 IP（2026-09-30 实测）。"
+            log_warn "  能用就行；要真实 IP 就改用 CDN 域或没被占用的域。"
+            ;;
+    esac
+}
+
 # ── DoH 入口（域名 / 路径）───────────────────────────────────
 # 从 nginx.sh 搬过来的问答：候选域名由 _doh_candidates 从配置表派生的
-# DOMAIN_REGISTRY 生成，并逐个用 _reality_domain_usable_fast 判「TCP/443
-# SNI 空闲」（它的排除表恰好就是占用 443 的协议全集；hysteria2 走 UDP 不在内）。
+# DOMAIN_REGISTRY 生成，逐个用 _doh_domain_usable 判「该域的 TLS 是否在
+# nginx 手里」（判据是协议标签 + 证书齐备）。
+#
+# ⚠️ 这里【不再】要求域名在 443 上空闲 —— 2026-09-30 实机逐协议实测：只要该域
+# 的 TLS 由 nginx 终结，DoH 就能与它共用同一个域名（nginx.sh 的
+# generate_servers_conf 会把 DoH 的 location include 进那个协议的 vhost）。
+# 实测结果：
+#   · xhttp / grpc / xhttp-reality / reality / 纯 nginx 站   → 可共用 ✓
+#   · Sing-Box AnyTLS、NaiveProxy（Caddy）                    → 不可共用 ✗
+# 后两者的 TLS 在它们自己手里，nginx 根本接不到那个 SNI 之后的 HTTP，location
+# 永远不执行 —— 这是技术限制，不是策略，故 _doh_domain_usable 直接把这两类排除。
+#
+# 免费域（没被任何协议占用）走的是另一条路：仍生成独立的 127.0.0.1:8410 vhost。
 configure_doh_entry() {
     # nginx 模块此刻可能还没载进来 —— 本菜单可以独立于「配置 Nginx」先跑
     # （装完 mosdns-x 就地配入口正是主要用法）。先载再判，否则下面的门控
@@ -364,12 +388,6 @@ configure_doh_entry() {
         log_warn "未加载 nginx 模块，跳过 DoH 入口配置"
         return 0
     fi
-    # _doh_candidates 走进程替换、跑在子 shell，那里 source 的模块函数父 shell
-    # 看不到 —— 必须在本体里先把 xray 模块载进来（同 ensure_doh_conf 的做法）。
-    if declare -F _doh_load_xray >/dev/null 2>&1; then
-        _doh_load_xray || log_warn "无法加载 xray 模块，DoH 域名的 443 占用校验可能不可用"
-    fi
-
     log_step "配置 DoH 入口（nginx 反代 mosdns-x）..."
 
     local cur_domain cur_path
@@ -404,39 +422,65 @@ configure_doh_entry() {
             return $?
         fi
         ans="${ans,,}"
-        if ! _reality_domain_usable_fast "$ans" 2>/dev/null; then
-            log_error "域名 ${ans} 不可用：需证书已签发，且 TCP/443 SNI 未被其它协议占用"
+        if ! _doh_domain_usable "$ans"; then
+            log_error "域名 ${ans} 不可用：需证书已签发，且该域的 TLS 由 nginx 终结"
+            log_error "  AnyTLS / NaiveProxy 的域不行 —— TLS 在 sing-box / Caddy 自己手里，"
+            log_error "  nginx 挂不上 location（实测），其余协议（xhttp / grpc / reality）都可以"
             log_error "  入口保持原样未改动"
             return 1
         fi
         save_state "DOH_DOMAIN" "$ans"
+        _doh_note_reality_penalty "$(_doh_target_mode "$ans")"
         _doh_entry_apply "$ans"
         return $?
     fi
 
-    # ── 未启用：默认取配置表派生的第一个直连域 ─────────────────
-    local -a _direc=() _cdn=()
+    # ── 未启用：默认取配置表派生的可用域 ───────────────────────
+    # 优先级：CDN 域 > 直连域 > Reality 域。
+    # CDN 域最好：有 CF 那一层在，$final_real_ip 拿到的就是真实客户端 IP。
+    # Reality 域最差：请求是 xray fallback 转过来的，没有真实源地址（见
+    # _doh_note_reality_penalty），限流会退化成单桶、日志也记不到真实 IP。
+    local -a _cdn=() _plain=() _reality=()
     local _d _m _p
     while IFS=$'\t' read -r _d _m _p; do
         [[ -n "$_d" ]] || continue
-        if [[ "$_m" == "cdn" ]]; then _cdn+=("$_d"); else _direc+=("$_d"); fi
+        if [[ "$_m" == "cdn" ]]; then
+            _cdn+=("$_d")
+        elif [[ "$_p" == *reality* ]]; then
+            _reality+=("$_d")
+        else
+            _plain+=("$_d")
+        fi
     done < <(_doh_candidates 2>/dev/null)
 
-    local _default="${_direc[0]:-${_cdn[0]:-}}"
+    if [[ $(( ${#_cdn[@]} + ${#_plain[@]} + ${#_reality[@]} )) -gt 0 ]]; then
+        echo "  可用域名（同一个域名可以既跑协议又跑 DoH，共用即可）:"
+        local _i=0
+        for _d in "${_cdn[@]}" "${_plain[@]}" "${_reality[@]}"; do
+            _i=$(( _i + 1 ))
+            echo "    ${_i}. ${_d}"
+        done
+    fi
+
+    local _default="${_cdn[0]:-${_plain[0]:-${_reality[0]:-}}}"
     if [[ -n "$_default" ]]; then
-        if [[ ${#_direc[@]} -gt 0 ]]; then
-            log_info "DoH 入口域名自动取自配置表: ${_default}（已注册域名里第一个直连域）"
+        local _why
+        if [[ ${#_cdn[@]} -gt 0 ]]; then
+            _why="配置表里第一个 CDN 域，客户端 IP 最完整"
+        elif [[ ${#_plain[@]} -gt 0 ]]; then
+            _why="无可用 CDN 域，取第一个直连域"
         else
-            log_info "DoH 入口域名自动取自配置表: ${_default}（无可用直连域，取第一个 CDN 域）"
+            _why="只剩 Reality 域可用，客户端 IP 会退化（见下方提醒）"
         fi
+        log_info "DoH 入口域名自动取自配置表: ${_default}（${_why}）"
     else
-        log_warn "未找到可用域名：需「证书已签发」且「TCP/443 SNI 未被其它协议占用」"
-        log_warn "  新增方法：Cloudflare 加一条灰云 A 记录指向本机 → 菜单里申请证书"
+        log_warn "未找到可用域名：需「证书已签发」且「该域 TLS 由 nginx 终结」"
+        log_warn "  AnyTLS / NaiveProxy 的域不能共用；可新增一条 A 记录指向本机后申请证书"
     fi
 
     local _sel
     while true; do
-        read -rp "  回车 = ${_default:-不启用}，可输入自定义域名，或输入 0 不启用: " _sel
+        read -rp "  回车 = ${_default:-不启用}，可输入域名（或上面列表的序号），或输入 0 不启用: " _sel
         _sel="${_sel// /}"
         if [[ -z "$_sel" ]]; then
             if [[ -z "$_default" ]]; then
@@ -447,16 +491,27 @@ configure_doh_entry() {
         elif [[ "$_sel" == "0" ]]; then
             log_info "未启用 DoH 入口"
             return 0
+        elif [[ "$_sel" =~ ^[0-9]+$ ]]; then
+            # 序号选择：列表是 CDN → 直连 → Reality 拼起来的，顺序与上面一致
+            local -a _all=( "${_cdn[@]}" "${_plain[@]}" "${_reality[@]}" )
+            if (( _sel < 1 || _sel > ${#_all[@]} )); then
+                log_warn "序号超出范围（1-${#_all[@]}），请重输或直接输入域名"
+                continue
+            fi
+            _sel="${_all[$(( _sel - 1 ))]}"
         else
             _sel="${_sel,,}"
-            if ! _reality_domain_usable_fast "$_sel" 2>/dev/null; then
-                log_warn "域名 ${_sel} 不可用：需证书已签发，且 TCP/443 SNI 未被其它协议占用"
+            if ! _doh_domain_usable "$_sel"; then
+                log_warn "域名 ${_sel} 不可用：需证书已签发，且该域 TLS 由 nginx 终结"
+                log_warn "  AnyTLS / NaiveProxy 的域不能共用（TLS 不在 nginx 手里）"
                 continue
             fi
         fi
         save_state "DOH_DOMAIN" "$_sel"
         break
     done
+
+    _doh_note_reality_penalty "$(_doh_target_mode "$_sel")"
 
     # 路径：回车随机；也可以手输固定值（须以 / 开头）
     if [[ -z "$cur_path" ]]; then
@@ -494,8 +549,9 @@ _doh_prompt_path() {
 # 后者依赖 REALITY_DOMAIN / XHTTP_DOMAIN 等一批内存全局，不先恢复域名数组
 # 就会生成一份【丢掉全部 SNI 路由】的 nginx.conf。
 _doh_entry_apply() {
-    local domain="$1"
-
+    # $1 = 要生效的域名。刻意【不】存进局部变量：bash 动态作用域下它会被
+    # sync_refresh_nginx_routes 里那些 `for domain in ...` 改掉（见文末说明），
+    # 而下面报 URL 的那行改成读 state 了 —— state 才是真正生效的那个值。
     local cur_path
     cur_path=$(get_state "DOH_PATH" "")
     if [[ -z "$cur_path" ]]; then
@@ -512,17 +568,22 @@ _doh_entry_apply() {
         # 新域名去找文件（文件在，条件成立）→ 443 上把 A 路由到 8410，而 8410 的
         # server 块里 server_name 还是 B → 该 SNI 命中 default 陷阱端口，DoH 断。
         # 先删即强制重生成；路径取自 state，所以内容仍然是确定的那一份。
-        rm -f /etc/nginx/conf.d/doh.conf
+        # doh_location.conf 同理：它里面写死了 location = <旧路径>，换路径/换落点
+        # 时不删就还是旧的（虽然 _doh_write_location_file 会按内容比对重写，但删掉
+        # 更彻底，也让「写不出来」这件事在下面的断言里暴露出来）。
+        rm -f /etc/nginx/conf.d/doh.conf /etc/nginx/doh_location.conf
         ensure_doh_conf || return 1
     else
         log_error "modules/nginx.sh 版本过旧（无 ensure_doh_conf），无法生成 DoH 入口"
         return 1
     fi
-    # 上面的删除是破坏性的：ensure_doh_conf 在证书缺失等情况下会【静默 return 0】，
-    # 此时文件已被删且没有重建，必须当场拦住，不能让它带着「成功」往下走。
-    if [[ ! -f /etc/nginx/conf.d/doh.conf ]]; then
-        log_error "DoH 入口文件未生成: /etc/nginx/conf.d/doh.conf"
+    # 上面的删除是破坏性的：ensure_doh_conf 在证书缺失、落点不可用（AnyTLS/Naive
+    # 域）等情况下会【静默 return 0】，此时文件已被删且没有重建，必须当场拦住，
+    # 不能让它带着「成功」往下走。
+    if [[ ! -f /etc/nginx/conf.d/doh.conf || ! -f /etc/nginx/doh_location.conf ]]; then
+        log_error "DoH 入口文件未生成（doh.conf / doh_location.conf 至少缺一个）"
         log_error "  常见原因：该域证书不存在（CERT_PATH_<根域> 解析不到 / 无 fullchain.pem）"
+        log_error "            或该域是 AnyTLS/Naive 域（TLS 不在 nginx 手里，挂不上 location）"
         log_error "  上一步 ensure_doh_conf 的输出里有具体原因；入口路由不会被写入"
         return 1
     fi
@@ -534,16 +595,29 @@ _doh_entry_apply() {
         return 1
     fi
 
-    log_info "DoH 入口已生效: https://${domain}${cur_path}"
+    # ⚠️ 这一行【不能】用函数开头那个 $domain —— bash 是动态作用域，而
+    # sync_refresh_nginx_routes 会调到 create_nginx_dirs / generate_servers_conf
+    # 里的 `for domain in "${ALL_DOMAINS[@]}"`（那两处都没有 local），于是本函数的
+    # 局部变量会被一路改写成 ALL_DOMAINS 的最后一个元素。2026-09-30 活机实测：
+    # state / doh.conf / servers.conf 全部是对的（它们都读 state），只有这行日志
+    # 配路由器就会配错域名。改成从 state 取，顺带保证「报出来的就是真正生效的那个」。
+    log_info "DoH 入口已生效: https://$(get_state 'DOH_DOMAIN' '')${cur_path}"
     return 0
 }
 
 # 关闭入口：清 state + 删 doh.conf。doh.conf 不在，generate_sni_map 就不会
 # 再写那条 443 路由（它要求 doh.conf 存在），443 上该域回到伪装站。
 _doh_entry_disable() {
-    local domain="$1"
+    # ⚠️ 局部变量名刻意加前缀：bash 动态作用域下，sync_refresh_nginx_routes 里
+    # 那串 `for domain in "${ALL_DOMAINS[@]}"`（无 local）会把调用方的同名的局部
+    # 变量改掉（见 _doh_entry_apply 末尾的说明）。这里 state 已经被清空、没法像
+    # 那边一样回读 state，所以只能靠改名字躲开。
+    local _doh_off_domain="$1"
     log_step "关闭 DoH 入口..."
-    rm -f /etc/nginx/conf.d/doh.conf
+    # 两个文件都要删：共用落点时 include 行还在 servers.conf 里，光删 doh.conf
+    # 不够 —— 下一次「配置 Nginx」按 state 重生成时才不会再注入 include。
+    # （DOH_DOMAIN 一清，_doh_target_mode 就是 off，generate_servers_conf 不再注入。）
+    rm -f /etc/nginx/conf.d/doh.conf /etc/nginx/doh_location.conf
     save_state "DOH_DOMAIN" ""
     save_state "DOH_PATH" ""
 
@@ -557,7 +631,7 @@ _doh_entry_disable() {
         log_warn "  重跑一次「配置 Nginx」即可清掉"
         return 0
     fi
-    log_info "DoH 入口已关闭（${domain} 的 443 已不再路由到 8410）"
+    log_info "DoH 入口已关闭（${_doh_off_domain} 的 443 已不再路由到 DoH）"
     return 0
 }
 

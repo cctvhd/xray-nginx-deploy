@@ -108,6 +108,12 @@ create_nginx_dirs() {
         /etc/nginx/certs
     )
 
+    # ⚠️ 这两个 `local` 不能省：bash 是动态作用域，循环变量会一路改到【调用方】
+    # 同名的局部变量上。2026-09-30 活机实测：mosdns.sh 的 _doh_entry_apply 有
+    # `local domain`，它调 sync_refresh_nginx_routes → 本函数，循环结束后那个局部
+    # 变量就成了 ALL_DOMAINS 的最后一个元素，于是日志里报出了错误的 DoH 域名
+    # （state / 磁盘配置都对，只有那行提示错 —— 用户照着它配就会配错）。
+    local dir domain
     for dir in "${dirs[@]}"; do
         mkdir -p "$dir"
         chmod 755 "$dir"
@@ -1100,9 +1106,8 @@ generate_sni_map() {
         echo "        ${NAIVE_DOMAIN}       127.0.0.1:8370;"
     fi
 
-    # DoH 入口（conf.d/doh.conf 的 server 块）。域名在 modules/mosdns.sh 的
-    # configure_doh_entry 里选定，候选已排除占用 443 的协议，所以这里的
-    # seen_sni 去重只是防御性的。
+    # DoH 入口（独立落点才走这里）。域名在 modules/mosdns.sh 的
+    # configure_doh_entry 里选定。
     #
     # ⚠️ 域名【必须】从 state 读，不能只用内存里的 $DOH_DOMAIN。
     # $DOH_DOMAIN 只是 ensure_doh_conf 顺手赋的全局，而下面这两条路径都
@@ -1114,8 +1119,14 @@ generate_sni_map() {
     # state 才是「当前生效配置」的事实来源，读它就不依赖调用顺序。
     # 同时要求 doh.conf 存在：路由只在 server 块确实存在时才该出现，
     # 否则 443 会把该 SNI 转到没人监听的 8410。
+    #
+    # ⚠️ 只有【独立落点】才写这条：共用落点下该域的 443 必须继续指向协议
+    # 自己的后端（8380/8390/8320/8325），写了这条会把协议流量全抢到 8410 ——
+    # 协议当场断，且症状是「协议连不上而 DoH 反而是好的」，极难联想。
+    # 落点由 _doh_target_mode 读 state 得出，与调用顺序无关。
     local _doh_domain="${DOH_DOMAIN:-$(get_state 'DOH_DOMAIN' '')}"
-    if [[ -n "$_doh_domain" && -f /etc/nginx/conf.d/doh.conf \
+    if [[ -n "$_doh_domain" && "$(_doh_target_mode "$_doh_domain")" == "standalone" \
+          && -f /etc/nginx/conf.d/doh.conf \
           && -z "${seen_sni[$_doh_domain]:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- DoH 入口 -> 8410 ---------------------------------"
@@ -1124,40 +1135,78 @@ generate_sni_map() {
     fi
 }
 
-# ── DoH 入口（独立 include，反代本机 mosdns-x）────────────────
-# 与 generate_servers_conf 分开：servers.conf 每次重配都被重写，
-# 本函数只在 doh.conf 缺失时生成，所以入口能扛过重配。
+# ── DoH 入口（反代本机 mosdns-x）─────────────────────────────
+# 入口本体是 /etc/nginx/doh_location.conf 里那一个 location 块，落点有两种：
+#   · 独立落点：该域没有别的协议占 443 → 本函数写 conf.d/doh.conf 的 8410
+#     vhost，location 在它里面，443 路由由 generate_sni_map 指向 8410。
+#   · 共用落点：该域的 443 已经被 xhttp/grpc/Reality 的 vhost 占了 → 那个
+#     vhost（在 servers.conf 里，每次重配都会被重写）include 同一个 location
+#     文件，【不再写 8410 那条路由】—— 写了会把协议流量全抢走。
+# 两种落点的 doh.conf 都必须存在，见下面 body 里的说明。
 # TLS 在 nginx 终结，后端是 127.0.0.1:15353/dns-query（明文 http）。
-# 443 路由由 generate_sni_map 指向 127.0.0.1:8410；端口见
-# install.sh 的 _preflight_check_internal_ports。
-# state: DOH_DOMAIN（空 = 不启用）/ DOH_PATH（生成后保存）。
+# state: DOH_DOMAIN（空 = 不启用）/ DOH_PATH（生成后保存）/
+#        DOMAIN_PROTO_<域> 的标签决定落点。
 # ⚠️ 本函数【只认 state，不提问】：域名/路径的问答在 modules/mosdns.sh 的
 # configure_doh_entry（主菜单 y「安装 mosdns-x」）—— DoH 入口的后端就是
 # mosdns-x，配入口属于装 mosdns-x 的一部分，不该长在「配置 Nginx」中间。
 #
-# DoH 候选域名 = 已入册 且 TCP/443 SNI 空闲。判定复用 xray.sh 的
-# _reality_domain_usable_fast —— 它的排除表恰好就是占用 443 的协议全集
-# （hysteria2 走 UDP 不在表内），证书路径解析也与 generate_servers_conf 一致。
+# DoH 候选域名与「能否共用」的判据见上面 _doh_domain_usable。
 # _doh_candidates 现在只被 modules/mosdns.sh 调用（本文件内已无读者），保留。
 
-# 确保 _reality_domain_usable_fast 可用。必须在调用 _doh_candidates 之前调用：
-# _doh_candidates 走进程替换、跑在子 shell，那里 source 的模块函数父 shell 看不到。
-_doh_load_xray() {
-    declare -F _reality_domain_usable_fast >/dev/null 2>&1 && return 0
-    declare -F load_module >/dev/null 2>&1 || return 1
-    load_module xray >/dev/null 2>&1 || true
-    declare -F _reality_domain_usable_fast >/dev/null 2>&1
+# ── DoH 候选与落点判定 ───────────────────────────────────────
+# DoH 的入口本体是一个 nginx 的 location 块，所以【能不能和别的协议共用域名】
+# 只取决于：该域 443 分流过去之后，TLS 是在谁那里终结的。nginx 终结 → 把
+# location 塞进那个 vhost 即可共用；别的组件终结 → nginx 那段根本不跑。
+# 2026-09-30 在测试机逐协议实测（临时往各 vhost 注入 location 后打真查询）：
+# 所以下面的过滤只排除 singbox / naiveproxy，其余一律可用。
+
+# 该域能否作为 DoH 落点：TLS 在 nginx 终结（即不属于那两个组件）+ 证书已签。
+# 证书路径解析与 generate_servers_conf 完全一致。
+_doh_domain_usable() {
+    local domain="$1"
+    [[ -n "$domain" ]] || return 1
+    local suffix protos
+    suffix=$(printf '%s' "$domain" | tr '.' '_')
+    protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+    case ",${protos}," in
+        *,singbox,*|*,naiveproxy,*) return 1 ;;
+    esac
+    local root cert_path
+    root=$(printf '%s' "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+    cert_path=$(get_state "CERT_PATH_${root//./_}" "")
+    [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${root}"
+    [[ -f "${cert_path}/fullchain.pem" ]]
+}
+
+# DoH 落点模式（由 DOH_DOMAIN 的 DOMAIN_PROTO_ 标签决定），$1 省略时读 state：
+#   off        未启用
+#   blocked    该域的 TLS 由 AnyTLS/Naive 自己终结，nginx 挂不上 DoH
+#   standalone 该域没有 TCP/443 的 nginx vhost → 独立 8410 vhost（doh.conf）
+#   xhttp / grpc / reality / xhttp-reality → 塞进对应的那个 vhost，共用域名
+# 判定只读 state，不依赖内存全局，故任何调用顺序下都一致。
+_doh_target_mode() {
+    local domain="${1:-$(get_state 'DOH_DOMAIN' '')}"
+    [[ -n "$domain" ]] || { echo "off"; return 0; }
+    local suffix protos
+    suffix=$(printf '%s' "$domain" | tr '.' '_')
+    protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
+    case ",${protos}," in
+        *,singbox,*|*,naiveproxy,*) echo "blocked";       return 0 ;;
+        *,xray-xhttp,*)             echo "xhttp";         return 0 ;;
+        *,xray-grpc,*)              echo "grpc";          return 0 ;;
+        *,xray-reality,*)           echo "reality";       return 0 ;;
+        *,xhttp-reality,*)          echo "xhttp-reality"; return 0 ;;
+    esac
+    echo "standalone"
 }
 
 # stdout 每行 "域名<TAB>mode<TAB>protos"。纯查询：不加载模块。
 _doh_candidates() {
-    declare -F _reality_domain_usable_fast >/dev/null 2>&1 || return 0
-
     local registry d suffix
     registry=$(get_state "DOMAIN_REGISTRY" "")
     for d in $registry; do
         [[ -n "$d" ]] || continue
-        _reality_domain_usable_fast "$d" || continue
+        _doh_domain_usable "$d" || continue
         suffix=$(echo "$d" | tr '.' '_')
         printf '%s\t%s\t%s\n' "$d" \
             "$(get_state "DOMAIN_MODE_${suffix}" "direct")" \
@@ -1165,10 +1214,69 @@ _doh_candidates() {
     done
 }
 
+# 写 DoH 的 location 正文 —— 全仓库唯一一份实现，两种落点共用：
+#   · 独立落点 → conf.d/doh.conf 的 8410 vhost include 它
+#   · 共用落点 → servers.conf 里对应协议的 vhost include 它
+# 放 /etc/nginx/ 而不是 conf.d/：conf.d/*.conf 是在 http 块里【整段】include 的，
+# 这里装的是 location 块，放进 conf.d 会变成 http 级指令 → nginx -t 直接报错。
+# 内容一致时不重写（mtime 稳定，便于用 cmp 核对是否真的变过）。
+_doh_write_location_file() {
+    local path="$1"
+    [[ -n "$path" ]] || return 1
+    local out="/etc/nginx/doh_location.conf"
+    local want
+    want=$(cat << CONF
+# ===================================================================
+# /etc/nginx/doh_location.conf — DoH 的 location 正文（只此一份）
+# 自动生成，请勿手动编辑 | 由 modules/nginx.sh 的 _doh_write_location_file 写出
+#
+# 两种落点共用本文件：
+#   · 独立落点（hysteria2 域 / 无协议的空闲域）→ conf.d/doh.conf 的 8410 vhost
+#   · 共用落点（xhttp / grpc / Reality 域）→ servers.conf 里对应协议的 vhost
+# 路径取自 state 的 DOH_PATH；换路径 = 主菜单 y 改完重跑。
+# ===================================================================
+location = ${path} {
+    # DoH 只需 GET/POST（RFC 8484）
+    limit_except GET POST { deny all; }
+    # zone=doh 定义在 conf.d/doh.conf —— 两种落点都会生成那份文件，且它在
+    # conf.d 里 glob 排在 servers.conf 之前（nginx 是 parse 期按名查 zone 的）。
+    # 直连域名（无 Cloudflare 一层），防滥用只能靠这里。
+    limit_req zone=doh burst=900 nodelay;
+    # ⚠️ 必须同时降日志级别，否则限流拒绝会变成「客户端被封 24h」。
+    # 默认 limit_req_log_level=error，拒绝时往 error.log 写
+    # "limiting requests, excess: ... by zone \\"doh\\""；
+    # 而 /etc/crowdsec/acquis.yaml 采集的就是 /var/log/nginx/error.log，
+    # 场景 crowdsecurity/nginx-req-limit-exceeded（leakspeed 60s / capacity 5）
+    # 只要同一 IP 在 60 秒内拒 5 次就下 24h ban。后果不是「丢几个包」而是
+    # 整个 IP 被 nftables 丢掉、连重试都进不来 —— 自家路由器一触发就是
+    # 全量 DNS 断 24h 且无法自愈，且是自激的（拒绝→解析器重试→更多拒绝）。
+    # 注意【把 doh.log 移出采集目录挡不住这条路】：触发物在 error.log。
+    # 本机 error_log 级别是 warn，notice 低于阈值会被直接丢弃、不落盘；
+    # 限流本身照常生效（照样回 503），503 仍记在上面那行 access_log 里。
+    limit_req_log_level notice;
+    client_max_body_size 4k;
+    # 独立目录，避开 CrowdSec 的 /var/log/nginx/*.log 采集
+    access_log /var/log/nginx-doh/doh.log main;
+
+    proxy_pass         http://127.0.0.1:15353/dns-query;
+    proxy_http_version 1.1;
+    proxy_set_header   X-Real-IP \$final_real_ip;
+    proxy_set_header   X-Forwarded-For \$final_real_ip;
+    proxy_connect_timeout 5s;
+    proxy_send_timeout    10s;
+    proxy_read_timeout    10s;
+    proxy_buffering    off;
+}
+CONF
+)
+    if [[ -f "$out" ]] && [[ "$(cat "$out")" == "$want" ]]; then
+        return 0
+    fi
+    printf '%s\n' "$want" > "${out}.new" && mv -f "${out}.new" "$out"
+}
+
 ensure_doh_conf() {
     local conf="/etc/nginx/conf.d/doh.conf"
-
-    _doh_load_xray || log_warn "无法加载 xray 模块，DoH 域名探测/校验可能不可用"
 
     DOH_DOMAIN=$(get_state "DOH_DOMAIN" "")
     DOH_PATH=$(get_state "DOH_PATH" "")
@@ -1185,11 +1293,28 @@ ensure_doh_conf() {
     chown -R nginx:nginx /var/log/nginx-doh 2>/dev/null || \
     chown -R www-data:www-data /var/log/nginx-doh 2>/dev/null || true
 
-    # 已配置且文件在 → 幂等：不重写、不打扰，只回显 URL
-    if [[ -n "$DOH_DOMAIN" && -f "$conf" ]]; then
-        log_info "DoH 入口: https://${DOH_DOMAIN}${DOH_PATH}"
+    # ── 落点模式 ─────────────────────────────────────────────
+    # 只读 state 的协议标签（不看内存全局），与 generate_sni_map /
+    # generate_servers_conf 读到的是同一个答案，故任何调用顺序下都一致。
+    local mode
+    mode=$(_doh_target_mode "$DOH_DOMAIN")
+
+    # 该域的 TLS 由 AnyTLS/Naive 组件自己终结，nginx 的 location 挂不上去
+    # （实测：AnyTLS 域 HTTP2 framing 错、Naive 域被 Caddy 自己回了 404）。
+    # 不静默 —— 把原因喊出来，并清掉可能残留的产物，否则残留的 doh.conf 配上
+    # 旧路由会让 443 一直被转到没人应答的 8410（同一类「静默少一条」故障）。
+    if [[ "$mode" == "blocked" ]]; then
+        log_error "DoH 落点 ${DOH_DOMAIN} 不可用：该域 TLS 由 AnyTLS/Naive 组件自己终结，nginx 挂不上 DoH"
+        log_error "  改选 xhttp/grpc/Reality 域，或一个没有被协议占用的空闲域（主菜单 y）"
+        rm -f "$conf" /etc/nginx/doh_location.conf
         return 0
     fi
+
+    # ⚠️ 这里【没有】「文件已存在就早返回」的幂等分支（旧版有）。加它会让
+    # 「落点模式变了」变成静默 no-op：state 说共用、磁盘上还是旧的 8410 vhost，
+    # 而 generate_sni_map 已经按新模式不写那条路由 → 443 上该域既不路由到 8410、
+    # 也没人 include location，DoH 全断而脚本一路报成功。现在一律按 state 重算，
+    # 只在内容真的不同时才落盘（mtime 稳定，可用 cmp 核对）。
 
     # ── 未启用则【静默跳过】，本函数不再提问 ─────────────────
     # 域名/路径的问答属于「安装/配置 mosdns-x」那条菜单（modules/mosdns.sh 的
@@ -1212,24 +1337,34 @@ ensure_doh_conf() {
         save_state "DOH_PATH" "$DOH_PATH"
     fi
 
-    # ── 证书（复用 generate_servers_conf 的解析方式）────────
-    local root cert_path
-    root=$(printf '%s' "$DOH_DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
-    cert_path=$(get_state "CERT_PATH_${root//./_}" "")
-    [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${root}"
-    if [[ ! -f "${cert_path}/fullchain.pem" ]]; then
-        log_error "证书不存在: ${cert_path}/fullchain.pem，跳过 DoH 入口"
-        DOH_DOMAIN=""
+    # ── location 正文（两种落点共用同一份，先落盘）──────────
+    # 后面 doh.conf / servers.conf 都只是 include 它，实现只有这一处。
+    if ! _doh_write_location_file "$DOH_PATH"; then
+        log_error "DoH location 文件写出失败（DOH_PATH='${DOH_PATH}'），跳过 DoH 入口"
         return 0
     fi
 
-    # ── 写 conf.d/doh.conf（独立文件，重配 servers.conf 不会碰它）──
-    cat > "$conf" << CONF
+    local want_conf mode_note=""
+    if [[ "$mode" == "standalone" ]]; then
+        # ── 证书（复用 generate_servers_conf 的解析方式）────────
+        local root cert_path
+        root=$(printf '%s' "$DOH_DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
+        cert_path=$(get_state "CERT_PATH_${root//./_}" "")
+        [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${root}"
+        if [[ ! -f "${cert_path}/fullchain.pem" ]]; then
+            log_error "证书不存在: ${cert_path}/fullchain.pem，跳过 DoH 入口"
+            DOH_DOMAIN=""
+            return 0
+        fi
+
+        want_conf=$(cat << CONF
 # ===================================================================
 # /etc/nginx/conf.d/doh.conf — DoH 入口（反代本机 mosdns-x）
-# 由 install.sh 生成；无变更时重复执行不会改写本文件。
+# 落点：独立（该域没有别的协议占 443）。由 install.sh 生成；
+# 内容一致时重复执行不会改写本文件。
 # 换域名/路径：主菜单 y「安装 mosdns-x」（它会先删本文件再重生成）。
 # 443 路由在 nginx.conf 的 stream map 里指向 127.0.0.1:8410。
+# location 正文不在这里，见 /etc/nginx/doh_location.conf。
 # ===================================================================
 
 # 限流 key 必须用 \$final_real_ip，不能用 \$remote_addr：请求经 stream 的
@@ -1241,6 +1376,9 @@ ensure_doh_conf() {
 # 取 300r/s + burst 900 让真实突发整体通过，只拦持续洪水（5000/s 会被削到
 # ~300/s）。凭直觉写小值（如 20r/s + burst 60）会把自家路由器的缓存未命中
 # 突发打掉 —— 那等于自己把家里 DNS 弄挂，比不限流更糟。
+# ⚠️ 共用落点时不生成 8410 vhost，但【本文件的 zone 定义照旧生成】—— zone=doh
+# 得有个家，且 conf.d 里 doh.conf 的 glob 顺序排在 servers.conf 之前
+# （d < s），而 nginx 是 parse 期按名查 zone 的。改名/挪走会让 nginx 起不来。
 limit_req_zone \$final_real_ip zone=doh:10m rate=300r/s;
 
 server {
@@ -1253,42 +1391,43 @@ server {
 
     server_tokens off;
 
-    location = ${DOH_PATH} {
-        # DoH 只需 GET/POST（RFC 8484）
-        limit_except GET POST { deny all; }
-        # 直连域名（无 Cloudflare 一层），防滥用只能靠这里
-        limit_req zone=doh burst=900 nodelay;
-        # ⚠️ 必须同时降日志级别，否则限流拒绝会变成「客户端被封 24h」。
-        # 默认 limit_req_log_level=error，拒绝时往 error.log 写
-        # "limiting requests, excess: ... by zone \"doh\""；
-        # 而 /etc/crowdsec/acquis.yaml 采集的就是 /var/log/nginx/error.log，
-        # 场景 crowdsecurity/nginx-req-limit-exceeded（leakspeed 60s / capacity 5）
-        # 只要同一 IP 在 60 秒内拒 5 次就下 24h ban。后果不是「丢几个包」而是
-        # 整个 IP 被 nftables 丢掉、连重试都进不来 —— 自家路由器一触发就是
-        # 全量 DNS 断 24h 且无法自愈，且是自激的（拒绝→解析器重试→更多拒绝）。
-        # 注意【把 doh.log 移出采集目录挡不住这条路】：触发物在 error.log。
-        # 本机 error_log 级别是 warn，notice 低于阈值会被直接丢弃、不落盘；
-        # 限流本身照常生效（照样回 503），503 仍记在上面那行 access_log 里。
-        limit_req_log_level notice;
-        client_max_body_size 4k;
-        # 独立目录，避开 CrowdSec 的 /var/log/nginx/*.log 采集（见函数头说明）
-        access_log /var/log/nginx-doh/doh.log main;
-
-        proxy_pass         http://127.0.0.1:15353/dns-query;
-        proxy_http_version 1.1;
-        proxy_set_header   X-Real-IP \$final_real_ip;
-        proxy_set_header   X-Forwarded-For \$final_real_ip;
-        proxy_connect_timeout 5s;
-        proxy_send_timeout    10s;
-        proxy_read_timeout    10s;
-        proxy_buffering    off;
-    }
+    include /etc/nginx/doh_location.conf;
 
     location / {
         return 404;
     }
 }
 CONF
+)
+    else
+        # ── 共用落点：location 由 servers.conf 里对应协议的 vhost include ──
+        # 本文件只负责 zone 定义与「DoH 已启用」标记。
+        want_conf=$(cat << CONF
+# ===================================================================
+# /etc/nginx/conf.d/doh.conf — DoH 限流区（反代本机 mosdns-x）
+# 落点：与 ${DOH_DOMAIN} 的 ${mode} vhost 共用域名 —— server 块与
+# location 在 servers.conf 的那个 vhost 里（include
+# /etc/nginx/doh_location.conf），本文件不生成 8410 vhost。
+# 由 install.sh 生成；内容一致时重复执行不会改写本文件。
+# ===================================================================
+
+# 限流 key 必须用 \$final_real_ip，不能用 \$remote_addr（见 doh_location.conf 说明）。
+# \$final_real_ip 的 map 在 /etc/nginx/cloudflare_real_ip.conf，由 nginx.conf:26
+# 加载，早于 conf.d（nginx.conf:109），此处 parse 期可解析。
+# 阈值按实测定：单个客户端峰值 301 次/秒；取 300r/s + burst 900 让真实突发
+# 整体通过，只拦持续洪水。写小值会把自家路由器的缓存未命中突发打掉。
+# ⚠️ 本文件即使在不生成 8410 vhost 的共用落点下也【必须】存在：zone=doh 得
+# 有个家，且 conf.d 里它 glob 排在 servers.conf 之前（d < s），而 nginx 是
+# parse 期按名查 zone 的。改名/挪走会让 nginx 起不来。
+limit_req_zone \$final_real_ip zone=doh:10m rate=300r/s;
+CONF
+)
+        mode_note="（与 ${DOH_DOMAIN} 的 ${mode} vhost 共用域名，未占用 8410）"
+    fi
+
+    if [[ ! -f "$conf" ]] || [[ "$(cat "$conf")" != "$want_conf" ]]; then
+        printf '%s\n' "$want_conf" > "${conf}.new" && mv -f "${conf}.new" "$conf"
+    fi
 
     # 该目录不在 /etc/logrotate.d/nginx 的 /var/log/nginx/*.log 通配内，
     # 必须自带轮转，否则无限增长。
@@ -1308,7 +1447,21 @@ CONF
 }
 CONF
 
-    log_info "DoH 入口已生成: https://${DOH_DOMAIN}${DOH_PATH}"
+    log_info "DoH 入口已生成: https://${DOH_DOMAIN}${DOH_PATH}${mode_note}"
+}
+
+# servers.conf 里是否存在「server_name == $1 且块内 include 了
+# /etc/nginx/doh_location.conf」的 vhost。逐 server 块解析，不整文件 grep：
+# 共用落点时 include 只在目标 vhost 里，而文件里有六七个 vhost，全文匹配会把
+# 「include 跑到别的 vhost 去了」也判成通过。
+_doh_servers_has_include() {
+    awk -v d="$1" '
+        /^server *\{/ { inb=1; hit=0; name=0; next }
+        inb && /server_name/ { for (i=2; i<=NF; i++) { gsub(/;/,"",$i); if ($i==d) name=1 } }
+        inb && /include[ \t]+\/etc\/nginx\/doh_location\.conf/ { hit=1 }
+        inb && /^\}/ { if (name && hit) found=1; inb=0 }
+        END { exit !found }
+    ' /etc/nginx/conf.d/servers.conf
 }
 
 # ── DoH 入口自检（由 reload_nginx 在重启后调用）────────────────
@@ -1323,35 +1476,70 @@ CONF
 # 从 127.0.0.1 连 443、不直连 8410：8410 要 proxy_protocol，直连必然失败，
 # 且只有走 443 才真正经过那张会静默出错的 SNI map。
 verify_doh_entry() {
-    local domain path
+    local domain path mode
     domain=$(get_state 'DOH_DOMAIN' '')
     path=$(get_state 'DOH_PATH' '')
 
     # 未启用 DoH → 静默通过（绝大多数机器走这条，不留噪音）
     [[ -z "$domain" ]] && return 0
 
-    if [[ ! -f /etc/nginx/conf.d/doh.conf ]]; then
-        log_error "DoH 自检失败：state 里有 DOH_DOMAIN='${domain}'，但 /etc/nginx/conf.d/doh.conf 不存在"
-        log_error "  443 上该域没有对应的 server 块。重跑「配置 Nginx」重新生成入口。"
+    if [[ ! -f /etc/nginx/doh_location.conf ]]; then
+        log_error "DoH 自检失败：state 里有 DOH_DOMAIN='${domain}'，但 /etc/nginx/doh_location.conf 不存在"
+        log_error "  location 正文没落盘，入口等于不存在。重跑「配置 Nginx」重新生成。"
         return 1
     fi
 
-    # ① 先确定性地断言 SNI map 里有这条路由。
+    mode=$(_doh_target_mode "$domain")
+
+    # ① 先确定性地断言「这个域的 vhost 里确实挂了 DoH 的 location」。
     # 放在 curl 之前，因为这是本功能唯一会【静默】出错的环节，而它的判定
-    # 不依赖网络结果 —— 反过来说，路由缺失时 curl 只会给出 000 或「打到了
+    # 不依赖网络结果 —— 反过来说，挂不上时 curl 只会给出 000 或「打到了
     # 别处」这类模糊结果，照着那个报错去查会查错方向（实测踩过：报成
     # 「443 无响应」，真因是 map 里少了这一行）。
-    if ! awk -v d="$domain" '$1==d && $2=="127.0.0.1:8410;"{f=1} END{exit !f}' \
-         /etc/nginx/nginx.conf; then
-        log_error "DoH 自检失败：nginx.conf 的 stream SNI map 里没有这条路由"
-        log_error "      ${domain}       127.0.0.1:8410;"
-        log_error "  443 上该域会落到 default 陷阱端口 —— DoH 全断，而其它步骤全部正常。"
-        log_error "  修：重跑「配置 Nginx」（generate_sni_map 会从 state 补回该条目并重启）"
-        return 1
-    fi
+    case "$mode" in
+        blocked)
+            log_error "DoH 自检失败：${domain} 的 TLS 由 AnyTLS/Naive 组件自己终结，nginx 挂不上 DoH"
+            log_error "  换个落点域名：主菜单 y"
+            return 1
+            ;;
+        standalone)
+            if ! awk -v d="$domain" '$1==d && $2=="127.0.0.1:8410;"{f=1} END{exit !f}' \
+                 /etc/nginx/nginx.conf; then
+                log_error "DoH 自检失败：nginx.conf 的 stream SNI map 里没有这条路由"
+                log_error "      ${domain}       127.0.0.1:8410;"
+                log_error "  443 上该域会落到 default 陷阱端口 —— DoH 全断，而其它步骤全部正常。"
+                log_error "  修：重跑「配置 Nginx」（generate_sni_map 会从 state 补回该条目并重启）"
+                return 1
+            fi
+            ;;
+        *)
+            # 共用落点：断言 include 行确实在【该域那个 vhost】里。不能整文件
+            # grep —— servers.conf 里有六七个 vhost，include 跑到别的 vhost 里
+            # 一样会被判成通过，而实际入口是不通的。
+            if ! _doh_servers_has_include "$domain"; then
+                log_error "DoH 自检失败：servers.conf 里没有「server_name ${domain} 且 include /etc/nginx/doh_location.conf」的 vhost"
+                log_error "  443 上该域回到了协议自己的后端，DoH 全断而协议本身正常（最容易被忽略的一种）"
+                log_error "  修：重跑「配置 Nginx」（generate_servers_conf 会按 state 重新注入 include）"
+                return 1
+            fi
+            ;;
+    esac
+
+    # CDN 回源落点（xhttp/grpc）不做本机端到端探测，而且是【必然失败】——
+    # 那两个 vhost 开头有 `if (\$redirect_to_fake) { rewrite ^ /_fake last; }`，
+    # 它按 `geo \$remote_addr` 判「是不是从 Cloudflare 来的」，而 127.0.0.1
+    # 一律判为不是 → 当场被 rewrite 到伪装页。经 CF 打进来才是正常的。
+    # 后端是否活着由 verify_mosdns（直连 127.0.0.1:15353）另外保证。
+    case "$mode" in
+        xhttp|grpc)
+            log_info "DoH 自检通过（确定性）: https://${domain}${path} → 已并入 ${mode} vhost"
+            log_info "  ⚠️ 该域的反探测规则会把本机探测重写到伪装页，端到端必须从 CF 侧验"
+            return 0
+            ;;
+    esac
 
     if ! command -v curl >/dev/null 2>&1; then
-        log_warn "DoH 自检：SNI 路由已确认存在，但本机无 curl，无法确认端到端是否真的通"
+        log_warn "DoH 自检：落点已确认，但本机无 curl，无法确认端到端是否真的通"
         return 0
     fi
 
@@ -1590,6 +1778,42 @@ generate_servers_conf() {
         echo "$1" | awk -F. '{print $(NF-1)"."$NF}'
     }
 
+    # ── DoH 共用落点：把 location include 进目标协议的 vhost ────
+    # 落点模式读 state（不看内存全局），与 ensure_doh_conf / generate_sni_map
+    # 读到的是同一个答案。location 正文由 _doh_write_location_file 落到
+    # /etc/nginx/doh_location.conf，这里只是「在谁里面 include 它」。
+    # ⚠️ 注入必须在这里做（而不是像独立落点那样单开一个文件），因为共用落点的
+    # server 块【就是】servers.conf 里这些 vhost —— 而 servers.conf 每次重配都
+    # 被整体重写，手工往 vhost 里加 location 一定会被抹掉（当年 DoH 入口被从
+    # servers.conf 里拎出来独立成文件，正是因为它扛不住重写；共用落点的解法
+    # 不是绕开重写，而是让重写本身产出正确的注入）。
+    local _doh_domain _doh_mode _doh_inc=""
+    _doh_domain=$(get_state 'DOH_DOMAIN' '')
+    _doh_mode=$(_doh_target_mode "$_doh_domain")
+    case "$_doh_mode" in
+        xhttp|grpc|reality|xhttp-reality)
+            local _doh_path
+            _doh_path=$(get_state 'DOH_PATH' '')
+            if [[ -n "$_doh_path" ]] && _doh_write_location_file "$_doh_path"; then
+                # 前导换行、结尾不带：空值时整段消失，输出与改造前逐字节一致
+                _doh_inc=$(printf '\n    # DoH 入口 —— 与 %s 共用本域，别删（删了入口就断）\n    # location 正文在 /etc/nginx/doh_location.conf，由 state 的 DOH_PATH 生成\n    include /etc/nginx/doh_location.conf;' "$_doh_mode")
+            else
+                log_warn "DoH 落点 ${_doh_domain} 缺 DOH_PATH 或写不出 location 文件，本次不注入"
+                _doh_mode="off"
+            fi
+            ;;
+    esac
+
+    # 只注入到「server_name 就是落点域名」的那份 vhost。按域名比对而不是按模式名：
+    # xhttp 与 grpc 同域合并成一份 vhost 时也能正确落到那一份上。
+    local _doh_inc_xhttp="" _doh_inc_grpc="" _doh_inc_reality="" _doh_inc_xr=""
+    if [[ -n "$_doh_inc" ]]; then
+        if [[ "${XHTTP_DOMAIN:-}" == "$_doh_domain" ]]; then _doh_inc_xhttp="$_doh_inc"; fi
+        if [[ "${GRPC_DOMAIN:-}" == "$_doh_domain" ]]; then _doh_inc_grpc="$_doh_inc"; fi
+        if [[ "${REALITY_DOMAIN:-}" == "$_doh_domain" ]]; then _doh_inc_reality="$_doh_inc"; fi
+        if [[ "${XHTTP_REALITY_DOMAIN:-}" == "$_doh_domain" ]]; then _doh_inc_xr="$_doh_inc"; fi
+    fi
+
     # xhttp CDN server 块
     if [[ -n "${XHTTP_DOMAIN:-}" ]]; then
         local xhttp_root cert_path
@@ -1719,7 +1943,7 @@ server {
         keepalive_requests          5000;
     }
 ${grpc_merged_location}
-
+${_doh_inc_xhttp}
     location = /health {
         limit_req  zone=health burst=5 nodelay;
         access_log off;
@@ -1842,7 +2066,7 @@ server {
         client_body_timeout   ${LATENCY_GRPC_TIMEOUT}s;
         send_timeout          ${LATENCY_GRPC_TIMEOUT}s;
     }
-
+${_doh_inc_grpc}
     location = /health {
         limit_req  zone=health burst=5 nodelay;
         access_log off;
@@ -1926,7 +2150,7 @@ server {
     index       index.html;
     server_tokens off;
     access_log  off;
-
+${_doh_inc_reality}
     location / {
         try_files \$uri \$uri/ /index.html;
         add_header Cache-Control "public, max-age=3600" always;
@@ -1970,7 +2194,7 @@ server {
     index       index.html;
     server_tokens off;
     access_log  off;
-
+${_doh_inc_xr}
     location / {
         try_files \$uri \$uri/ /index.html;
         add_header Cache-Control "public, max-age=3600" always;
@@ -2044,7 +2268,8 @@ server {
 CONF
 
     # HTTP 重定向
-    local all_domain_names=""
+    # ⚠️ `local domain` 同上（动态作用域会污染调用方的同名局部变量）
+    local all_domain_names="" domain
     for domain in "${ALL_DOMAINS[@]}"; do
         all_domain_names+=" ${domain}"
     done
