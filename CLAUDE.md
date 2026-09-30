@@ -181,6 +181,12 @@ state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读�
     **回退**：`git revert c60e9f2`（退回 3 = 纯刷新 + 只读汇总）。
     ⚠️ **教训（比技术更重要）**：用户三次说「表格」，我三次改了**渲染**（对齐 → 边框 → 折行），而他真正要的是**交互位置**（那条路上有没有那张能改的表）。**他的抱怨句里如果有动词（「修改」「刷新」），先按「流程/入口」找问题，别急着改排版。** 判据是他贴的截图：他贴哪张屏，就是拿哪张屏当标准 —— 这次贴的是选项 1 的表，答案就是「让那条路也变成这张表」。
 
+- **配置表支持鼠标：单击选中 / 双击 = Enter（`edit_nodes.py`，2026-09-30）**：用户问「表格可以设置双击输入吗」。改的是 `edit_nodes.py` 一个文件（`bash <(curl ...)` 模式经 `${BASE_URL}/edit_nodes.py` 拉取，**改完必须 push 到 `BASE_URL` 分支**；本机缓存 `${STATE_DIR}/edit_nodes.py` 由 `resolve_edit_nodes_script` 每次重拉）。`main` 里 `curses.mousemask(ALL_MOUSE_EVENTS)`，不支持则 `MOUSE_OK=False`（提示行也就不写「双击」那半句）；`draw_table` 顺手把行/列落点记进 `HIT_ROWS`/`HIT_COLS`（**行高随折行变、列宽随内容变，只有它知道落点**，别另算一份），`hit_test` 换算成 `(行,列)`，`mouse_click` 返回 `('move'|'edit', 行, 列)`，`edit` 走的就是 Enter 那条 `edit_cell`（模式列＝切换）。
+  ⚠️ **双击有两条路径，缺一条就「按不出来」**（pty 探针实测，不是推理）：**① 间隔 < ~166ms**：ncurses 按自己的 mouseinterval 合并，只交**一个** `BUTTON1_DOUBLE_CLICKED` 事件（**第一次单击被它吞掉**）→ 必须直接判 `bstate & BUTTON1_DOUBLE_CLICKED`；**② 166ms~600ms**：终端给**两个**独立事件，ncurses 不管，只能自己按时间窗判（`MOUSE_DOUBLE_MS=600`）。**Python 的 curses 没暴露 `curses.mouseinterval`**，调不了它的阈值，所以慢速双击只可能靠自己那条路兜住。另有一处防抖：同一物理点击在部分终端/协议下报成「按下+抬起」两个事件（实测 `TERM=xterm-256color` 下 ncurses 只报 **RELEASED** 一个），50ms 内的第二个事件并掉 —— 否则一次单击会被自己数成两击。
+  ⚠️ **`KEY_MOUSE` 必须 `getmouse()` 取走**：`input_line` 的 `get_wch()` 分支不处理它就会**空转死循环**（下一次 `get_wch` 立刻再吐一个 `KEY_MOUSE`）。`edit_cell` 进入时清 `_last_click`，免得改完随手再点一下又进编辑。
+  **副作用（要告诉用户的）**：终端一旦开了鼠标上报，**用鼠标选文字复制要按住 Shift**；tmux 里需 `set -g mouse on` 才会转发点击。**回退**：`git revert <sha>`（单文件，无需重跑安装；回退后鼠标点击等于没点，键盘照旧）。
+  **验证**：新增 `/tmp/ed_nodes_mouse_unit_test.py`（假 `curses`/`time`，20 项：命中边界含折行行、越界/边框/滚轮/表格外、防抖合并、600ms 窗口、快双击 `DOUBLE_CLICKED`、`TRIPLE`、编辑后清计时）与 `/tmp/ed_nodes_mouse_pty_test.py`（**真 pty + 真鼠标转义序列**：SGR 1006 自动识别、屏幕网格还原后**从画面上读回**「域名」列坐标再点，断言单击只选中（状态行 `当前 [域名]: …` 佐证）、快双击弹出 `修改[域名]`、慢速双击 300ms 切换「模式」列、Esc 取消后 Q 仍能退出）全绿；7 套既有沙箱套件全绿；`python3 -m py_compile` 通过。
+
 ## 活机探索记录：unbound 自带 DoH 当反代上游（2026-09-30，**未进脚本，仅活机手工配置**）
 
 背景：想给家里路由器提供自建 DoH（`https://<域名>/dns-query`）时，除了装 mosdns-x，也可以直接用 unbound 自带的 DoH 服务端（1.12+ 支持；活机 1.24.2 实测全指令可用）。两个**很容易再踩一次、且很难第一时间联想到**的坑：
