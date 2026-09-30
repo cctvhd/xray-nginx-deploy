@@ -97,9 +97,16 @@ def safe_add(stdscr, y, x, text, attr=0):
         pass
 
 
+LOAD_NOTE = ""
+
+
 def load_file():
     """启动时读取上次保存的数据"""
+    global LOAD_NOTE
     if not os.path.exists(DATA_FILE):
+        # 必须吵：此时表格显示的是写死在源码里的默认值（example.com），
+        # 看起来跟「读到了表」一模一样，曾因此被误判成「表没存上」查错方向。
+        LOAD_NOTE = f"⚠ 未找到 {DATA_FILE} — 下表是内置默认值，不是本机配置！按 S 才会写出"
         return
     try:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -113,8 +120,9 @@ def load_file():
             if row[3] not in ("cdn", "直连", ""):
                 row[3] = data[i][3]
             data[i] = row
-    except Exception:
-        pass
+        LOAD_NOTE = f"数据目录 {BASE_DIR}"
+    except Exception as e:
+        LOAD_NOTE = f"⚠ {DATA_FILE} 解析失败({e}) — 下表是内置默认值，不是本机配置！"
 
 
 def save_file():
@@ -156,7 +164,7 @@ def draw_table(stdscr, ri, ci):
 
     heights = [max(len(wrap(row[c], widths[c])) for c in range(4)) for row in data]
     header_h = max(len(wrap(headers[c], widths[c])) for c in range(4))
-    base = 1 + 1 + header_h + 1 + sum(heights) + 1 + 1 + 1
+    base = 1 + 1 + 1 + header_h + 1 + sum(heights) + 1 + 1 + 1
     row_lines = ROW_LINES and sh >= base + (len(data) - 1)
 
     def hline(y):
@@ -181,8 +189,12 @@ def draw_table(stdscr, ri, ci):
         return h
 
     safe_add(stdscr, 0, 1, trunc("方向键移动 | Enter 编辑/切换 | S 保存 | Q 退出", sw - 2))
-    hline(1)
-    y = 2 + row_block(2, headers, bold=True)
+    # 数据目录/读取状态顶格单独一行：屏幕会被 clear()，cert.sh 在此之前打的
+    # 「配置表目录: ...」日志会被抹掉，这行是唯一能当场判断读到哪去了的依据。
+    note_attr = curses.A_BOLD if LOAD_NOTE.startswith("⚠") else curses.A_DIM
+    safe_add(stdscr, 1, 1, trunc(LOAD_NOTE, sw - 2), note_attr)
+    hline(2)
+    y = 3 + row_block(3, headers, bold=True)
     hline(y)
     y += 1
     for r in range(len(data)):

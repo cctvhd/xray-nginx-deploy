@@ -2653,13 +2653,24 @@ resolve_edit_nodes_script() {
         printf '%s\n' "$repo_script"
         return 0
     fi
-    if [[ -s "$_EDIT_NODES_CACHE" ]]; then
+    # curl 模式：**每次都重新拉取**，与 load_module 同理（见 install.sh:1094-1096）。
+    # 这里原先「缓存存在就直接用」，而缓存一旦写出就再也不会刷新 —— 改了
+    # edit_nodes.py 等于没改，只是换个方式重演本文件顶部记的那个「缓存掩盖修复」。
+    # 先落 .tmp 再 mv：curl 中途失败不会留下半截脚本。
+    mkdir -p "$(dirname "$_EDIT_NODES_CACHE")"
+    local _tmp="${_EDIT_NODES_CACHE}.tmp.$$"
+    if curl -fsSL "${BASE_URL:-}/edit_nodes.py" -o "$_tmp" 2>/dev/null && [[ -s "$_tmp" ]]; then
+        chmod 600 "$_tmp"
+        mv -f "$_tmp" "$_EDIT_NODES_CACHE"
         printf '%s\n' "$_EDIT_NODES_CACHE"
         return 0
     fi
-    mkdir -p "$(dirname "$_EDIT_NODES_CACHE")"
-    if curl -fsSL "${BASE_URL:-}/edit_nodes.py" -o "$_EDIT_NODES_CACHE" 2>/dev/null; then
-        chmod 600 "$_EDIT_NODES_CACHE"
+    rm -f "$_tmp"
+    if [[ -s "$_EDIT_NODES_CACHE" ]]; then
+        # ⚠️ 必须重定向到 stderr：本函数用 stdout 回传脚本路径，而 log_* 全是
+        # `echo`（install.sh:85-88）—— 不重定向的话这行警告会被调用方的
+        # `$( ... )` 一起捕获，拼成一个不存在的路径传给 python3。
+        log_warn "下载 edit_nodes.py 失败，使用缓存（可能过期；若随后出错请重跑并选择 s 同步）" >&2
         printf '%s\n' "$_EDIT_NODES_CACHE"
         return 0
     fi
