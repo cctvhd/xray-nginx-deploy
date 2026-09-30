@@ -201,6 +201,10 @@ state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读�
   - **验证**：`/tmp/mosdns_test.sh` 加第 4b（`p` 换路径后 state 与 `doh.conf` 同步换、域名不被顺手改掉、回车=随机重生）与第 9 节（三个选项的动作分流 + 「未安装状态成立」反向自检），**68 项全绿**；其余 6 套沙箱 + 2 套 python 套件 exit 0。
   - **回退**：`git revert b92b180`（回到「每次进来一条龙 + 路径改不了」）。
 
+  ⚠️ **子菜单第 3 项「检查更新」**（`ef39a05`）：用户接着说 **「还有这7个域名都可以使用吗,会不会和其他协议冲突.还有可以提供一个更新选项」** —— 又是**一句里两件事**（域名能不能复用 / 要个更新入口）。更新做在子菜单里（`3. 检查更新（比对 GitHub 最新发布版）`），两个新函数 `_mosdns_latest_version`（自己 curl GitHub `releases/latest` 解析 tag 的数字部分，**刻意不调 install.sh 的 `upgrade_github_latest`** —— 模块不能依赖 install.sh 里后加的函数，见 [[project-module-vs-installsh]]）与 `_mosdns_check_update`。**两边都取数字部分比对**（本机取 `build time`）：拿二进制自报的 `v4.6.0` 去比 tag `v26.05.25` 会**永远**判「有新版」而下载回来的其实一模一样。已最新 → 一个动作都不发生（不白下一遍）；有新版 → 问 `y/N`；**取不到版本号 → 明确报错并 `return 1`，绝不静默当成「已最新」**。更新动作与选项 2 同一条路径（`install_mosdns_binary --force` → 重写 unit → 重启 → `verify_mosdns` 只告警），**绝不重跑 `generate_mosdns_config`**（禁忌同下）。另：全局 `v. 升级组件` 菜单里本就有 `6. mosdns-x`，这一项是给「就在 mosdns 这条路上」的人用的。**回退**：`git revert ef39a05`（只影响第 3 项，1/2/0 与 DoH 入口都不受影响）。
+
+  ⚠️ **测试脚本两个坑（这次双双踩到，写新沙箱前先看这两条）**：**(1)** `/tmp/mosdns_test.sh` 是 `source <(sed -n '1,…' install.sh)` 取 install.sh 前缀的，而**从第 1 行开始截就把它的 `set -euo pipefail` 一并 source 了进来** —— 于是「断言一个**预期失败**的调用」（更新检查那条 `printf '3\n' | run_mosdns` 返回 1）会让整个脚本**静默中止**：屏幕上一堆 ✓ 却没有汇总行，看起来像「跑到一半崩了」。测试要的是逐条断言、不是 fail-fast，故在 source 之后显式 `set +e`，要判退出码的地方自己收 `$?`。**(2)** `mosdns_installed` 是 `[[ -x "$MOSDNS_BIN" ]] || command -v mosdns` —— 上一节往 `$WORK/bin` 写过一个 `mosdns` 桩而 `$WORK/bin` 在 `PATH` 里，于是「未安装时仍走一条龙」的反向自检**永远失败**（它一直判「已安装」）。删桩或换个不冲突的名字再测。修完 9 节 **79 项全绿**。
+
   **(1) 位置错**：DoH 入口的域名/路径问答长在 `modules/nginx.sh` 的 `ensure_doh_conf()` 里，**混在「配置 Nginx」流程中间** —— 重配一次 Nginx 就被问一次，而入口的后端是 mosdns-x，这事跟 Nginx 关系不大。
 
   **(2) 能力缺失才是「隐藏了」的真身**：`grep mosdns modules/*.sh` 当时只命中 `modules/nginx.sh` 的注释 —— **仓库里根本没有 mosdns 模块**。`ensure_doh_conf` 生成的入口 `proxy_pass http://127.0.0.1:15353/dns-query` 在新机器上必然 502，自检里只能写一句「需另装 mosdns-x…新机器上属预期」。活机那台是**手工装好**的。⚠️ **通用教训**：用户说「某个选项藏起来了」时，**先确认那件事在仓库里到底存不存在**，别只查它是不是可达 —— 这次「藏起来」的字面意思是「活机有、脚本里没有」。
