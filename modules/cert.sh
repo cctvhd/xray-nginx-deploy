@@ -23,27 +23,78 @@
 # 就得自己能提供，或者只依赖 log_*/get_state/save_state 这类早已稳定的核心函数。
 if ! declare -F render_table >/dev/null 2>&1; then
 # stdin 每行 = \x01 分隔的单元格（$1 = 逗号分隔的各列显示宽度）；
-# 单行内容恰为 __RT_SEP__ 时输出一条 ─ 分隔线（按同样列宽）。
+# 单行内容恰为 __RT_SEP__ 时输出一条横线（表头下 / 分组之间）。
+# 输出**带 ASCII 边框**（+ - |，与 edit_nodes.py 的配置表同一视觉语言）：
+# 只有空格对齐、没有竖线的输出，读起来是「一列列文本」而不是表格 —— 用户
+# 2026-09-30 的原话「我要的是表格」；边框是「这是个表格」的视觉标志。
 # printf "%-20s" 按**字符数**补空格，而中文/全角在终端占 2 列 → 表头与数据行错开，
-# 故按真实显示宽度补（edit_nodes.py 的 cw()/wlen() 同理）。依赖 python3（既有依赖）。
+# 故按真实显示宽度补（edit_nodes.py 的 cw()/wlen() 同理），并忽略 ANSI 颜色序列。
+# 依赖 python3（既有依赖）。
 render_table() {
     local _spec="$1"
     python3 -c '
-import sys, unicodedata
+import sys, re, unicodedata
 spec = [int(x) for x in sys.argv[1].split(",")]
+_ansi = re.compile(r"\x1b\[[0-9;]*m")
 def w(s):
-    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in _ansi.sub("", s))
+def units(s):
+    # 把串切成「零宽的 ANSI 序列」与「单字符」两类单元，切词时不致把 \x1b[..m 拦腰截断
+    out, i = [], 0
+    while i < len(s):
+        m = _ansi.match(s, i)
+        if m:
+            out.append((m.group(0), 0)); i = m.end()
+        else:
+            ch = s[i]
+            out.append((ch, 2 if unicodedata.east_asian_width(ch) in "WF" else 1)); i += 1
+    return out
+def wrapcell(s, n):
+    # 超宽单元格**折行**而不是把边框撑破 —— 域名的长度没法预先定死（真实数据里
+    # 「借公共 solanolibrary.com」就撑破过 23 宽的列），一撑破整张表就散了。
+    # 优先在空格处折；单个词比整列还宽（长域名）时硬切。
+    if n <= 0 or w(s) <= n:
+        return [s]
+    lines, cur, curw = [], "", 0
+    for tok in re.split(r"( )", s):
+        tw = w(tok)
+        if tw > n:
+            if cur.strip():
+                lines.append(cur.rstrip()); cur, curw = "", 0
+            while w(tok) > n:
+                piece, pw = "", 0
+                for u, uw in units(tok):
+                    if pw + uw > n:
+                        break
+                    piece += u; pw += uw
+                lines.append(piece); tok = tok[len(piece):]
+            cur, curw = tok, w(tok)
+        elif curw + tw > n:
+            lines.append(cur.rstrip())
+            cur, curw = ("" if tok == " " else tok), (0 if tok == " " else tw)
+        else:
+            cur += tok; curw += tw
+    if cur.strip():
+        lines.append(cur.rstrip())
+    return lines or [""]
+def rule():
+    return "  +" + "+".join("-" * (n + 2) for n in spec) + "+"
 out = sys.stdout
+out.write(rule() + "\n")
 for line in sys.stdin:
     line = line.rstrip("\n")
     if line == "__RT_SEP__":
-        cells = ["─" * n for n in spec]
-    else:
+        out.write(rule() + "\n")
+        continue
+    parts = line.split("\x01")
+    cols = [wrapcell(parts[i] if i < len(parts) else "", n) for i, n in enumerate(spec)]
+    for k in range(max(len(c) for c in cols)):
         cells = []
-        for i, c in enumerate(line.split("\x01")):
-            n = spec[i] if i < len(spec) else 0
+        for i, n in enumerate(spec):
+            c = cols[i][k] if k < len(cols[i]) else ""
             cells.append(c + " " * max(0, n - w(c)))
-    out.write("  " + " ".join(cells).rstrip() + "\n")
+        out.write("  | " + " | ".join(cells) + " |\n")
+out.write(rule() + "\n")
 ' "$_spec"
 }
 fi
@@ -2176,10 +2227,11 @@ print_domain_protocol_overview() {
             fi
         fi
     done
-    # 列宽总和 = 2(缩进)+6+1+14+1+22+1+26 = 73 列，刻意压在 80 列终端内 —— 表格一旦
-    # 折行就全废了。故 域名 列只需容下域名本身（SNI 挪去备注），备注列容下
-    # 「借公共 <最长域名>」。加分隔线也不会更宽。
-    printf '%s\n' "${_body[@]}" | render_table "6,14,22,26"
+    # 行宽 = 2(缩进)+1(|)+Σ(列宽+3)+1(|) = 4+64+9+2 = 79 列，刻意压在 80 列终端内 ——
+    # 终端一旦把表格折行就全废了（带边框后每列要多占 3 个字符，故比无边框时收窄了）。
+    # 域名 列只需容下域名本身（SNI 挪去备注），备注列容下「借公共 <最长域名>」；
+    # 真超出也只是该格折一行，边框不会破（render_table 的 wrapcell）。
+    printf '%s\n' "${_body[@]}" | render_table "6,14,20,24"
 
     echo ""
     log_info "上表「表行」= 配置表（主菜单 5→1）里同一行的行号，两表行序一致"

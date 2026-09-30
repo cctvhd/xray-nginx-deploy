@@ -87,13 +87,24 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 
-# ── 表格渲染（东亚宽度感知）────────────────────────────────
+# ── 表格渲染（带边框 + 东亚宽度感知）────────────────────────
 # stdin 每行 = \x01 分隔的单元格（$1 = 逗号分隔的各列显示宽度）；
-# 单行内容恰为 __RT_SEP__ 时输出一条 ─ 分隔线（按同样列宽）。
+# 单行内容恰为 __RT_SEP__ 时输出一条横线（用于表头下 / 分组之间）。
+# 输出形如（首尾自动补边框，与 edit_nodes.py 的配置表**同一视觉语言**）：
+#   +------+--------------+--------------------+
+#   | 表行 | 协议槽位     | 域名               |
+#   +------+--------------+--------------------+
+#   | 1    | VLESS-XHTTP  | example.com        |
+#   +------+--------------+--------------------+
+# ⚠️ 为什么要**画边框**（ASCII 的 + - |，与 edit_nodes.py 一致）：只有空格对齐、没有竖线的
+#    输出，肉眼读起来是「一列列的文本」而不是表格 —— 用户 2026-09-30 的原话是
+#    「我要的是表格」「你这是逗我吗」。他平时在配置表（5→1）里看到的就是这种带框的
+#    ASCII 表，**边框是「这是个表格」的视觉标志**，不是装饰。
 # ⚠️ 为什么不用 printf "%-20s"：printf 按**字符数**补空格，而中文/全角符号在终端
 #    占 2 列 —— 表头（多为中文）与数据行（多为 ASCII）从第二列起就差几个字符，
-#    分隔线也长短不一，整张表是歪的。表格的全部价值在对齐，歪了等于没排。
-#    本函数按真实显示宽度补空格，中英混排一律对齐（edit_nodes.py 的 cw()/wlen() 同理）。
+#    竖线对不齐，整张表是歪的。表格的全部价值在对齐，歪了等于没排。
+#    本函数按真实显示宽度补空格，中英混排一律对齐（edit_nodes.py 的 cw()/wlen() 同理），
+#    且**忽略 ANSI 颜色序列**（`\x1b[..m` 不计宽），故带色的单元格也能直接进来。
 # 依赖 python3（配置表编辑器 edit_nodes.py 本就要求它）。
 # ⚠️ modules/cert.sh 顶部有一份 `declare -F render_table || ...` 的**同实现兜底**，
 #    改这里必须同步改那里：install.sh 与模块是两条独立更新通道，模块可能比
@@ -102,21 +113,68 @@ log_step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 render_table() {
     local _spec="$1"
     python3 -c '
-import sys, unicodedata
+import sys, re, unicodedata
 spec = [int(x) for x in sys.argv[1].split(",")]
+_ansi = re.compile(r"\x1b\[[0-9;]*m")
 def w(s):
-    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in _ansi.sub("", s))
+def units(s):
+    # 把串切成「零宽的 ANSI 序列」与「单字符」两类单元，切词时不致把 \x1b[..m 拦腰截断
+    out, i = [], 0
+    while i < len(s):
+        m = _ansi.match(s, i)
+        if m:
+            out.append((m.group(0), 0)); i = m.end()
+        else:
+            ch = s[i]
+            out.append((ch, 2 if unicodedata.east_asian_width(ch) in "WF" else 1)); i += 1
+    return out
+def wrapcell(s, n):
+    # 超宽单元格**折行**而不是把边框撑破 —— 域名的长度没法预先定死（真实数据里
+    # 「借公共 solanolibrary.com」就撑破过 23 宽的列），一撑破整张表就散了。
+    # 优先在空格处折；单个词比整列还宽（长域名）时硬切。
+    if n <= 0 or w(s) <= n:
+        return [s]
+    lines, cur, curw = [], "", 0
+    for tok in re.split(r"( )", s):
+        tw = w(tok)
+        if tw > n:
+            if cur.strip():
+                lines.append(cur.rstrip()); cur, curw = "", 0
+            while w(tok) > n:
+                piece, pw = "", 0
+                for u, uw in units(tok):
+                    if pw + uw > n:
+                        break
+                    piece += u; pw += uw
+                lines.append(piece); tok = tok[len(piece):]
+            cur, curw = tok, w(tok)
+        elif curw + tw > n:
+            lines.append(cur.rstrip())
+            cur, curw = ("" if tok == " " else tok), (0 if tok == " " else tw)
+        else:
+            cur += tok; curw += tw
+    if cur.strip():
+        lines.append(cur.rstrip())
+    return lines or [""]
+def rule():
+    return "  +" + "+".join("-" * (n + 2) for n in spec) + "+"
 out = sys.stdout
+out.write(rule() + "\n")
 for line in sys.stdin:
     line = line.rstrip("\n")
     if line == "__RT_SEP__":
-        cells = ["─" * n for n in spec]
-    else:
+        out.write(rule() + "\n")
+        continue
+    parts = line.split("\x01")
+    cols = [wrapcell(parts[i] if i < len(parts) else "", n) for i, n in enumerate(spec)]
+    for k in range(max(len(c) for c in cols)):
         cells = []
-        for i, c in enumerate(line.split("\x01")):
-            n = spec[i] if i < len(spec) else 0
+        for i, n in enumerate(spec):
+            c = cols[i][k] if k < len(cols[i]) else ""
             cells.append(c + " " * max(0, n - w(c)))
-    out.write("  " + " ".join(cells).rstrip() + "\n")
+        out.write("  | " + " | ".join(cells) + " |\n")
+out.write(rule() + "\n")
 ' "$_spec"
 }
 
@@ -1760,22 +1818,24 @@ show_domain_allocation() {
     echo "  [证书到期]  （wildcard，/etc/letsencrypt/live/<根域名>）"
     declare -A root_done=()
     local root cert expiry exp_ep exp_d days color state
+    # 同一张屏上的两张表用同一种画法（都走 render_table，带 + - | 边框）——
+    # 一张带框一张不带框，看着像两个来源、不像一套东西。第三列带 ANSI 颜色，
+    # render_table 计宽时跳过 `\x1b[..m` 序列，故颜色不会把列撑歪。
+    local -a _cbody=()
+    _cbody+=("$(printf '%s\x01%s\x01%s' "证书（*.根域名）" "到期日" "剩余")")
+    _cbody+=("__RT_SEP__")
     for d in "${doms[@]}"; do
         root=$(printf '%s' "$d" | awk -F. '{print $(NF-1)"."$NF}')
         [[ -n "${root_done[$root]:-}" ]] && continue
         root_done["$root"]=1
         cert="/etc/letsencrypt/live/${root}/fullchain.pem"
-        # 本子表两列都是 ASCII，printf 的字符数=显示列数，本就对齐，故不走 render_table
-        # （第三列含 ANSI 颜色，交给 render_table 反而要把转义序列算进宽度）。
-        # 但「未申请/读取失败」行原先只印两列，状态挤进到期日那一列、与其它行错开 ——
-        # 这里补一个占位列（用 ASCII "-"，em dash 在中英混排里宽度不确定）让它对齐。
         if [[ ! -f "$cert" ]]; then
-            printf "  %-16s  %-10s  %s\n" "*.${root}" "-" "未申请"
+            _cbody+=("$(printf '%s\x01%s\x01%s' "*.${root}" "-" "未申请")")
             continue
         fi
         expiry=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
         if [[ -z "$expiry" ]]; then
-            printf "  %-16s  %-10s  %s\n" "*.${root}" "-" "读取失败"
+            _cbody+=("$(printf '%s\x01%s\x01%s' "*.${root}" "-" "读取失败")")
             continue
         fi
         exp_ep=$(date -d "$expiry" +%s 2>/dev/null || echo 0)
@@ -1790,8 +1850,9 @@ show_domain_allocation() {
         else
             color=$GREEN; state="剩 ${days} 天"
         fi
-        printf "  %-16s  %s  %b%s%b\n" "*.${root}" "$exp_d" "$color" "$state" "$NC"
+        _cbody+=("$(printf '%s\x01%s\x01%b%s%b' "*.${root}" "$exp_d" "$color" "$state" "$NC")")
     done
+    printf '%s\n' "${_cbody[@]}" | render_table "16,11,22"
     echo -e "${BLUE}==========================================${NC}"
     echo ""
 }
