@@ -1102,11 +1102,24 @@ generate_sni_map() {
 
     # DoH 入口（conf.d/doh.conf 的 server 块）。域名由 ensure_doh_conf 选定，
     # 候选已排除占用 443 的协议，所以这里的 seen_sni 去重只是防御性的。
-    if [[ -n "${DOH_DOMAIN:-}" && -z "${seen_sni[${DOH_DOMAIN}]:-}" ]]; then
+    #
+    # ⚠️ 域名【必须】从 state 读，不能只用内存里的 $DOH_DOMAIN。
+    # $DOH_DOMAIN 只是 ensure_doh_conf 顺手赋的全局，而下面这两条路径都
+    # 直接调 generate_nginx_conf、不经过 ensure_doh_conf：
+    #   · modules/sync.sh:157  —— 模块热更新
+    #   · run_nginx()          —— nginx.sh 自己的完整流程
+    # 那样本段会被静默跳过：443 上该域落到 default 陷阱端口、DoH 全断，
+    # 而脚本一路报成功（与 ensure_doh_conf 门控是同一类「静默少一条」故障）。
+    # state 才是「当前生效配置」的事实来源，读它就不依赖调用顺序。
+    # 同时要求 doh.conf 存在：路由只在 server 块确实存在时才该出现，
+    # 否则 443 会把该 SNI 转到没人监听的 8410。
+    local _doh_domain="${DOH_DOMAIN:-$(get_state 'DOH_DOMAIN' '')}"
+    if [[ -n "$_doh_domain" && -f /etc/nginx/conf.d/doh.conf \
+          && -z "${seen_sni[$_doh_domain]:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- DoH 入口 -> 8410 ---------------------------------"
-        echo "        ${DOH_DOMAIN}       127.0.0.1:8410;"
-        seen_sni["${DOH_DOMAIN}"]=1
+        echo "        ${_doh_domain}       127.0.0.1:8410;"
+        seen_sni["$_doh_domain"]=1
     fi
 }
 
@@ -1280,7 +1293,11 @@ ensure_doh_conf() {
 # 一个桶装全部客户端，一触发限流就是全员被拒。
 # \$final_real_ip 的 map 在 /etc/nginx/cloudflare_real_ip.conf，由 nginx.conf:26
 # 加载，早于 conf.d（nginx.conf:109），此处 parse 期可解析。
-limit_req_zone \$final_real_ip zone=doh:10m rate=20r/s;
+# 阈值按实测定：单个客户端峰值 301 次/秒（12 小时样本里有 12 个秒超 60/s）。
+# 取 300r/s + burst 900 让真实突发整体通过，只拦持续洪水（5000/s 会被削到
+# ~300/s）。凭直觉写小值（如 20r/s + burst 60）会把自家路由器的缓存未命中
+# 突发打掉 —— 那等于自己把家里 DNS 弄挂，比不限流更糟。
+limit_req_zone \$final_real_ip zone=doh:10m rate=300r/s;
 
 server {
     listen 127.0.0.1:8410 ssl proxy_protocol;
@@ -1296,7 +1313,19 @@ server {
         # DoH 只需 GET/POST（RFC 8484）
         limit_except GET POST { deny all; }
         # 直连域名（无 Cloudflare 一层），防滥用只能靠这里
-        limit_req zone=doh burst=60 nodelay;
+        limit_req zone=doh burst=900 nodelay;
+        # ⚠️ 必须同时降日志级别，否则限流拒绝会变成「客户端被封 24h」。
+        # 默认 limit_req_log_level=error，拒绝时往 error.log 写
+        # "limiting requests, excess: ... by zone \"doh\""；
+        # 而 /etc/crowdsec/acquis.yaml 采集的就是 /var/log/nginx/error.log，
+        # 场景 crowdsecurity/nginx-req-limit-exceeded（leakspeed 60s / capacity 5）
+        # 只要同一 IP 在 60 秒内拒 5 次就下 24h ban。后果不是「丢几个包」而是
+        # 整个 IP 被 nftables 丢掉、连重试都进不来 —— 自家路由器一触发就是
+        # 全量 DNS 断 24h 且无法自愈，且是自激的（拒绝→解析器重试→更多拒绝）。
+        # 注意【把 doh.log 移出采集目录挡不住这条路】：触发物在 error.log。
+        # 本机 error_log 级别是 warn，notice 低于阈值会被直接丢弃、不落盘；
+        # 限流本身照常生效（照样回 503），503 仍记在上面那行 access_log 里。
+        limit_req_log_level notice;
         client_max_body_size 4k;
         # 独立目录，避开 CrowdSec 的 /var/log/nginx/*.log 采集（见函数头说明）
         access_log /var/log/nginx-doh/doh.log main;
