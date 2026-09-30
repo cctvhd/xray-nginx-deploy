@@ -229,6 +229,19 @@ state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读�
 
   ⚠️🩸 **push 后 CDN 逐字节核对又抓到「逐文件独立缓存」**：本轮 6 个文件里 **5 个立即可见、`modules/modules.list` 仍是旧货**（`x-cache: HIT`、`source-age: 267`，`max-age:300`）。**这个文件恰好是最危险的那个** —— curl 模式下它决定「下哪些模块」，拿到旧的（无 `mosdns`）而 `install.sh` 是新的（`DEFAULT_MODULES` 含 mosdns），菜单项会因为模块没下载而失败。**只有 `cmp` 是判据，且必须逐文件比对。**
 
+- **DoH 入口可以绑「已被别的协议占用的域名」（CDN 域 / Reality 域）（2026-09-30）**：用户原话 —— **「你没有明白,doh应该绑定cdn 的域名和hysteria2协议,不是固定那个域名.按照你的说法其他协议和域名都不能用,你到底有测试吗.还是猜的,这个机器是测试机,如果可能你可以每个协议都测试一下是否可以和doh共用一个域名」**。他说得对，我错了：此前我**没测就下结论**，说不开 CDN 的域才能做 DoH，理由是「一个 SNI 只能有一个后端」。**那个推理只对了一半** —— stream 的 `map $ssl_preread_server_name $backend` 确实是一 SNI 一后端，但**如果那个后端是 nginx 自己的 HTTP vhost，就能把 DoH 的 `location` 塞进那个 vhost**，域名照样共用。
+
+
+  **改动**：`modules/nginx.sh` 拆出落点判定与正文两件东西 —— `_doh_domain_usable <域>`（能否共用）、`_doh_target_mode <域>`（`off` / `standalone` / `shared`）、`_doh_candidates`；location 正文**只写一份**到独立文件 `/etc/nginx/doh_location.conf`（⚠️ 不能写在 `conf.d/*.conf` 里 —— 那是 http 级 include，裸 `location` 块在那会语法错），两种落点各自 include 它：
+    - **standalone**（域没被占）：仍生成 127.0.0.1:**8410** 的 vhost + SNI map 里加一条 `<域> 127.0.0.1:8410`（老行为，逐字节不变）；
+    - **shared**（域已被占）：**不生成 8410**、SNI map 里**不加条目**（该域本来就有路由），改为在 `generate_servers_conf` 生成 vhost 时，给**`server_name` 正是落点域名**的那一份注入 `include /etc/nginx/doh_location.conf;`。注入点选在 `generate_servers_conf` 里而不是手改文件，是为了**扛重生成**（这正是当初 DoH 入口被挪进 `doh.conf` 的原因）。
+  `doh.conf` 两种落点都生成（落点不同只影响注释与是否带 8410 server 块），**`limit_req_zone ... zone=doh` 的定义留在里面** —— 老机器的旧 `doh.conf` 里还带着那行，若新版只在 standalone 下写它，共用落点上就会出现「zone 无处定义」，而 `conf.d` 是 glob、`doh.conf`（d）排在 `servers.conf`（s）之前、`limit_req` 是 **parse 期按名查 zone** —— 顺序与共存都必须保住。`modules/mosdns.sh` 的候选问答同步放开（分 `_cdn` / `_plain` / `_reality` 三桶，默认取**第一个 CDN 域**，可输序号或域名，`0` = 不启用）；`modules/uninstall.sh` 两个文件一起删。
+
+
+
+
+  **两条已知代价（要真实 IP 就别选 Reality 落点）**：落点若选 Reality 域（`reality` / `xhttp-reality`），请求是 xray 的 fallback 转给 nginx 的，**转过去时不带真实源地址**（reality inbound 是 `xver=0`、不发 PROXY protocol，8321/8326 的 `listen` 也没开 `proxy_protocol`）→ `$final_real_ip` 退化成 `127.0.0.1`：限流变成**一个桶装所有客户端**、access log 记不到真实 IP。当选这类落点时脚本会打 5 行 WARN 明说（实测确认，不是推断）。另一条：**CDN 落点只对「经 CF 进来」的请求生效**（见上条 `$redirect_to_fake`）—— 家里必须走 `https://<域><路径>` 经 CF，直连源站那条路会被伪装页接走。
+
 ## 活机探索记录：unbound 自带 DoH 当反代上游（2026-09-30，**未进脚本，仅活机手工配置**）
 
 背景：想给家里路由器提供自建 DoH（`https://<域名>/dns-query`）时，除了装 mosdns-x，也可以直接用 unbound 自带的 DoH 服务端（1.12+ 支持；活机 1.24.2 实测全指令可用）。两个**很容易再踩一次、且很难第一时间联想到**的坑：
