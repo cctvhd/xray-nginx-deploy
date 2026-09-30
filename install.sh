@@ -1865,7 +1865,7 @@ do_sync_modules() {
 
     # ⚠️ 本项【只更新 modules/】，而主菜单与各流程的文字都在 install.sh 里 ——
     # 它是启动时读一次的，本项动不了它。于是会出现「模块缓存 18/18 全绿，菜单里
-    # 却看不到新增那一项」的错觉（2026-09-30 实际发生：mosdns-x 的菜单 15 已进
+    # 却看不到新增那一项」的错觉（2026-09-30 实际发生：mosdns-x 的菜单项已进
     # 仓库，用户同步完模块后菜单里没有 15，看起来像模块没下发）。
     # 这里把话说透，省得再去猜「是模块没下来还是菜单没更新」。
     echo ""
@@ -2127,7 +2127,7 @@ do_inst_naive() {
     done_return
 }
 
-# ── 15. 安装/配置 mosdns-x（DoH 入口）──────────────────────────
+# ── y. 安装 mosdns-x（DoH 入口）──────────────────────────
 # 一键：装后端 → 写配置/unit → 起服务 → 自检 → 配 DoH 入口（域名/路径）。
 # DoH 入口的域名/路径问答从「配置 Nginx」搬到这里 —— 入口的后端就是 mosdns-x，
 # 配它属于装 mosdns-x 的一部分。
@@ -4214,6 +4214,7 @@ main_menu_loop() {
         echo "  7. 安装 Sing-Box"
         echo "  8. 安装 Hysteria2"
         echo "  9. 安装 NaiveProxy"
+        echo "  y. 安装 mosdns-x（DoH 入口：装后端 + 配置入口域名/路径）"
         echo ""
         echo "  === 配置 ==="
         echo "  10. 配置 Nginx"
@@ -4221,7 +4222,6 @@ main_menu_loop() {
         echo "  12. 配置 Sing-Box"
         echo "  13. 配置 Hysteria2"
         echo "  14. 配置 NaiveProxy"
-        echo "  15. 安装/配置 mosdns-x（DoH 入口：装后端 + 选域名/路径）"
         echo " n. 重新配置 Nginx（先清理再生成）"
         echo " x. 重新配置 Xray（先清理再生成）"
         echo " g. 重新配置 Sing-Box（先清理再生成）"
@@ -4264,12 +4264,12 @@ main_menu_loop() {
             7) run_menu_action "安装 Sing-Box"     do_inst_singbox ;;
             8) run_menu_action "安装 Hysteria2"    do_inst_hysteria2 ;;
             9) run_menu_action "安装 NaiveProxy"   do_inst_naive ;;
+          y|Y) run_menu_action "安装 mosdns-x"      do_inst_mosdns ;;
            10) run_menu_action "配置 Nginx"        do_conf_nginx ;;
            11) run_menu_action "配置 Xray"         do_conf_xray ;;
            12) run_menu_action "配置 Sing-Box"     do_conf_singbox ;;
            13) run_menu_action "配置 Hysteria2"    do_conf_hysteria2 ;;
            14) run_menu_action "配置 NaiveProxy"   do_conf_naive ;;
-           15) run_menu_action "安装/配置 mosdns-x" do_inst_mosdns ;;
           n|N) run_menu_action "重新配置 Nginx"      do_reconf_nginx ;;
           x|X) run_menu_action "重新配置 Xray"       do_reconf_xray ;;
           g|G) run_menu_action "重新配置 Sing-Box"   do_reconf_singbox ;;

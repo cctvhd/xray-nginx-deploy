@@ -1132,7 +1132,7 @@ generate_sni_map() {
 # install.sh 的 _preflight_check_internal_ports。
 # state: DOH_DOMAIN（空 = 不启用）/ DOH_PATH（生成后保存）。
 # ⚠️ 本函数【只认 state，不提问】：域名/路径的问答在 modules/mosdns.sh 的
-# configure_doh_entry（主菜单 15「安装/配置 mosdns-x」）—— DoH 入口的后端就是
+# configure_doh_entry（主菜单 y「安装 mosdns-x」）—— DoH 入口的后端就是
 # mosdns-x，配入口属于装 mosdns-x 的一部分，不该长在「配置 Nginx」中间。
 #
 # DoH 候选域名 = 已入册 且 TCP/443 SNI 空闲。判定复用 xray.sh 的
@@ -1198,7 +1198,7 @@ ensure_doh_conf() {
     # 这件事跟 Nginx 关系不大（用户原话：「这个设置不合理,应该列一个单独的选项」）。
     # 现在本函数只认 state：DOH_DOMAIN 为空 = 未启用，直接返回，不阻塞、不重写。
     if [[ -z "$DOH_DOMAIN" ]]; then
-        log_info "未启用 DoH 入口（启用/修改：主菜单 15「安装/配置 mosdns-x」）"
+        log_info "未启用 DoH 入口（启用/修改：主菜单 y「安装 mosdns-x」）"
         return 0
     fi
 
@@ -1228,7 +1228,7 @@ ensure_doh_conf() {
 # ===================================================================
 # /etc/nginx/conf.d/doh.conf — DoH 入口（反代本机 mosdns-x）
 # 由 install.sh 生成；无变更时重复执行不会改写本文件。
-# 换域名/路径：主菜单 15「安装/配置 mosdns-x」（它会先删本文件再重生成）。
+# 换域名/路径：主菜单 y「安装 mosdns-x」（它会先删本文件再重生成）。
 # 443 路由在 nginx.conf 的 stream map 里指向 127.0.0.1:8410。
 # ===================================================================
 
@@ -1372,12 +1372,12 @@ verify_doh_entry() {
     fi
 
     # 502/504 → SNI 路由通、TLS 通，只是后端没起。后端是 mosdns-x，由
-    # modules/mosdns.sh 安装（主菜单 15）。老机器上若 DoH 入口是手工配的、
+    # modules/mosdns.sh 安装（主菜单 y）。老机器上若 DoH 入口是手工配的、
     # 后端从未装过，这里也是同一副样子——故只告警不失败。
     if [[ "$code" == "502" || "$code" == "504" ]]; then
         log_warn "DoH 自检：入口已通，但后端 127.0.0.1:15353 无响应（HTTP ${code}）"
         log_warn "  后端是 mosdns-x：systemctl status mosdns 看是否在跑"
-        log_warn "  未安装/未运行 → 主菜单 15「安装/配置 mosdns-x」"
+        log_warn "  未安装/未运行 → 主菜单 y「安装 mosdns-x」"
         return 0
     fi
 
