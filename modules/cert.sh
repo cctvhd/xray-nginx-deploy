@@ -2713,6 +2713,21 @@ _purge_stale_domains() {
     log_warn "以下域名已不在配置表中，将从注册表移除："
     for _d in "${_stale[@]}"; do echo "  - $_d"; done
 
+    # 删证书不可恢复（certbot delete 连 archive/renewal 一起抹），所以必须由人确认。
+    # 上面两道护栏挡的是「表不可信」，这道挡的是**其余一切**让它跑歪的原因 ——
+    # 手滑删一行、域名打错、换根域名……任何一条都会走到这里。无 tty（脚本/CI）
+    # 一律中止：宁可少删，也不能在没人看着的时候自毁。
+    local _confirm=""
+    if [[ -t 0 && -t 1 ]]; then
+        log_warn "上述域名对应的证书将被 certbot delete（不可恢复）"
+        printf '确认继续？输入 yes 继续，其它任意输入中止: '
+        read -r _confirm || true
+    fi
+    if [[ "$_confirm" != "yes" ]]; then
+        log_warn "已中止：未删除任何域名/证书，注册表与 state 均未改动"
+        return 1
+    fi
+
     # 2) 摘注册表 + 清标签
     local _registry _new_reg="" _suffix
     _registry=$(get_state "DOMAIN_REGISTRY" "")
@@ -3039,9 +3054,28 @@ run_cert() {
         log_error "  确实要停用全部域名请走 主菜单 u（卸载/清理）；只改协议请保留域名列。"
         return 1
     fi
+    # ⚠️ 内置占位符 example.com（RFC 2606 保留域，不可能有真证书）= 表根本没被填过。
+    # 这条比空表更危险：表**非空**，看起来正常，于是 _purge_stale_domains 把本机
+    # 真实域名全判为「已不在表中」，清 DOMAIN_REGISTRY、删 domain_*.ini、
+    # certbot delete **一次删光所有证书**。实机已发生过一次（表是 edit_nodes.py
+    # 的默认值落在 /root，用户按 1 直接跑完），故在此硬拦。
+    local _placeholder_dom=""
+    for _d in ${_tsv_domains[@]+"${_tsv_domains[@]}"}; do
+        [[ "$_d" == "example.com" ]] && { _placeholder_dom="$_d"; break; }
+    done
+    if [[ -n "$_placeholder_dom" ]]; then
+        log_error "配置表仍是 edit_nodes.py 的内置默认值（$HOME 下的占位符 example.com），已中止"
+        log_error "  这不是本机配置。继续跑会删掉本机已注册的全部域名与证书，故直接停。"
+        log_error "  请在表格里填好自己的域名与 Cloudflare API 令牌，按 S 保存后再跑。"
+        log_error "  确实要停用全部域名请走 主菜单 u（卸载/清理）。"
+        return 1
+    fi
 
     # 3b. 清理已从配置表移除的陈旧域名（注册表 + 标签 + domain ini + 证书）
-    _purge_stale_domains "${_tsv_domains[@]}"
+    if ! _purge_stale_domains "${_tsv_domains[@]}"; then
+        log_error "域名清理未获确认，已中止本次配置（此后未再改动任何配置/证书）"
+        return 1
+    fi
 
     # 4. 创建 Cloudflare 账号 ini 文件（基于唯一的 API token）
     # 无条件覆写：配置表是令牌的唯一事实来源。索引相同的账号在换令牌后若沿用

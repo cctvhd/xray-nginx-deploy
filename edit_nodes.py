@@ -276,6 +276,16 @@ def main(stdscr):
         elif key in (10, 13, curses.KEY_ENTER):
             edit_cell(stdscr, r, c, input_y)
         elif key in (ord("s"), ord("S")):
+            # example.com 是源码里的占位符（RFC 2606 保留域），不是谁的域名。
+            # 带着它保存 = 落盘一份「看起来正常」的空表，下游 _purge_stale_domains
+            # 会把本机真实域名全判为陈旧、连证书一起删光（实机发生过）。
+            # 这里拦一道，确认后才落盘。
+            if any(r[2] == "example.com" for r in data):
+                safe_add(stdscr, input_y, 1, "⚠ 还有一行是内置占位符 example.com，不是你自己的域名！")
+                safe_add(stdscr, input_y + 1, 1, "  这样保存会删掉本机已注册的全部证书。按 Y 仍要保存 / 其它键返回修改")
+                stdscr.refresh()
+                if stdscr.getch() not in (ord("y"), ord("Y")):
+                    continue
             save_file()
             safe_add(stdscr, input_y, 1, f"【保存成功!】已导出到 {SAVE_FILE},按任意键继续")
             stdscr.refresh()
