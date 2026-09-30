@@ -2913,9 +2913,13 @@ migrate_cf_account_files() {
 # edit_nodes.py 集成：脚本定位 / TSV 切分 / 陈旧域名清理
 # ════════════════════════════════════════════════════════════
 
-# edit_nodes.py 的数据文件（config.txt / .config.tsv）落地目录。刻意放在仓库与
-# git 工作区之外，避免 API 令牌被写进代码目录。
-: "${EDIT_NODES_DATA_DIR:=/root}"
+# edit_nodes.py 的数据文件（config.txt / .config.tsv）落地目录。
+# 【不读机器默认路径（原来是 /root）】：目录固定跟随 edit_nodes.py 脚本所在目录，
+# 脚本在哪数据就在哪 —— git 模式是仓库根、curl 模式是 /etc/xray-deploy。这样换一台
+# 机器测试时，「刚才按 S 存下去的表」总在同一个可预期的位置，不会因为 $HOME 不同而
+# 报「找不到配置文件」。仓库 .gitignore 已兜底这两个文件名，故脚本落进仓库也不怕。
+# 逃生口：显式 export EDIT_NODES_DATA_DIR 仍以其为准，留空即跟随脚本。
+: "${EDIT_NODES_DATA_DIR:=}"
 _EDIT_NODES_CACHE="${STATE_DIR:-/etc/xray-deploy}/edit_nodes.py"
 
 # ── 定位 edit_nodes.py ───────────────────────────────────────
@@ -3164,19 +3168,26 @@ run_cert() {
         log_error "未找到 edit_nodes.py（git 模式应位于仓库根目录；curl 模式需能访问 ${BASE_URL}）"
         return 1
     fi
+    # 数据目录固定跟随脚本所在目录（理由见 EDIT_NODES_DATA_DIR 定义处），
+    # 写与读用同一个值，不依赖机器默认路径。
+    local edit_nodes_dir="${EDIT_NODES_DATA_DIR:-$(dirname "$edit_nodes_script")}"
+    log_info "配置表目录: $edit_nodes_dir"
+
     # 快照「进入本流程前」的域名集合，供第 3b 步清理已从配置表移除的陈旧域名。
     # 必须显式从 state 读取：本函数可由主菜单直接进入，此前内存中未必加载过。
     load_domain_state
     OLD_DOMAINS=("${ALL_DOMAINS[@]}")
 
-    python3 "$edit_nodes_script" "$EDIT_NODES_DATA_DIR"
+    python3 "$edit_nodes_script" "$edit_nodes_dir"
     # 编辑后，用户按 S 保存并退出，或按 Q 放弃退出
     # 我们继续处理已保存的配置（如果用户放弃，则视为无更改）
 
     # 3. 解析 edit_nodes.py 生成的配置并更新 Cloudflare 账号和域名设置
-    TSV_FILE="${EDIT_NODES_DATA_DIR}/.config.tsv"
+    TSV_FILE="${edit_nodes_dir}/.config.tsv"
     if [[ ! -f "$TSV_FILE" ]]; then
-        log_error "未找到 edit_nodes.py 生成的配置文件 $TSV_FILE"
+        log_error "未找到配置表 $TSV_FILE"
+        log_error "  编辑界面里按 S 才会写出该文件；按 Q/^C 退出则不写（属正常）。"
+        log_error "  要配置域名请重跑本项，在界面里填好并按 S 保存。"
         return 1
     fi
 

@@ -6,10 +6,13 @@ import unicodedata
 
 locale.setlocale(locale.LC_ALL, '')
 
-# 数据目录由调用方传入（cert.sh 传 $EDIT_NODES_DATA_DIR，默认 /root），
-# 刻意不放在脚本所在目录：config.txt / .config.tsv 含 Cloudflare API 令牌，
-# 不能落进仓库与 git 工作区。
-BASE_DIR = sys.argv[1] if len(sys.argv) > 1 else "/root"
+# 数据目录 = 本脚本所在目录（cert.sh 会显式把该目录作为 argv[1] 传入，两者一致）。
+# 刻意【不用 /root 这类机器默认路径】：换一台机器、换个 $HOME 就会出现「刚按 S 存
+# 下去的文件找不到」，而这个目录只由脚本部署位置决定 —— git 模式是仓库根、curl
+# 模式是 /etc/xray-deploy，到哪台机器都是同一个可预期的位置。
+# config.txt / .config.tsv 含 Cloudflare API 令牌明文，仓库 .gitignore 已兜底这两个
+# 文件名，脚本被放进仓库时令牌不会被误 add。
+BASE_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
 os.makedirs(BASE_DIR, exist_ok=True)
 SAVE_FILE = os.path.join(BASE_DIR, "config.txt")     # 对齐版,给人看
 DATA_FILE = os.path.join(BASE_DIR, ".config.tsv")    # Tab 分隔,程序读取
