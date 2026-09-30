@@ -128,6 +128,9 @@ state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读�
 
   **这条的通用教训**：一个会「静默回落到内置默认值」的读取失败，比直接报错危险得多 —— 它把「没读到」伪装成「读到了但内容不对」，把人支到错误方向去查存储。**凡是有内置默认值的加载逻辑，都要把「用的是默认值」这件事显式吼出来**。
 
+    三层封堵（缺一不可）：**(1)** `cert.sh` 解析完 TSV 后硬拦 —— 只要域名列出现 `example.com`（RFC 2606 保留域，不可能有真证书）就断定表没被填过，在**任何写操作之前** `return 1`；**(2)** `_purge_stale_domains` 内部加人工确认（列清将删的域名、要求输入 `yes`，非 tty 一律中止），调用点检查返回值并在未确认时中止整条流程 —— 这道挡的是其余一切让它跑歪的原因（手滑删行、域名打错、换根域名）；**(3)** `edit_nodes.py` 按 S 时若仍有 `example.com` 先警告并要求 `Y` 二次确认，从源头拦住「把默认表落盘」。回归用例 E 复现该事故，断言 `_purge_stale_domains` 不被调用、无任何域名/证书写操作。
+    **回退**：`git revert f5be08f`（**不建议** —— 回退即恢复该自毁路径）。
+
   - **历史落点回退（`b0c2083`）**：用户**另一台**机器报警的是 `⚠ 未找到 /root/.config.tsv` —— 落点是 `/root`，而 `/root` 只可能来自 `7db1482`~`5d5afdd` 之间那版 cert.sh（`EDIT_NODES_DATA_DIR:=/root`）；`STATE_DIR` 从建立起就一直是 `/etc/xray-deploy`（逐提交核过，`git log -S'STATE_DIR:=/root'` 无结果）。也就是说那台机器是「**新 edit_nodes.py + 旧 cert.sh**」的组合。与其继续追版本组合，不如从根上认下这件事：**表是用户资产**，不该因为脚本换了个算法就「找不到自己的配置」而白屏 `example.com`。现在 `run_cert` 在主目录 `${STATE_DIR}` 里没有 `.config.tsv` 时，依次回退到 `/root` 与 `$(dirname "$edit_nodes_script")`（= `5d5afdd` 那版的仓库根落点），命中即用并打警告 + 给出迁移命令。**只在「确实存在表」时才回退** —— 空目录回退没有意义，还会把真正的首次安装伪装成「找到过」；回退后**读与写共用同一个目录**，不制造第二个分叉。**回退**：`git revert b0c2083`。
 
   ⚠️ **push 完别立刻断言「远端已生效」**：`raw.githubusercontent.com` 是 Fastly CDN，响应头 `cache-control: max-age=300`、`x-cache: HIT`，**push 后仍可能继续供旧文件，实测约 90 秒后刷新**（`install.sh` 自己因为每次都被 curl 新拉所以没事，但**单文件缓存是各自独立**的 —— 同一提交里 `cert.sh` 已刷新而 `edit_nodes.py` 还是旧的很正常）。带 `?cb=<随机>` 也绕不过去，`x-cache` 仍是 `HIT`。**唯一可靠的判据是逐字节比对**：`curl -fsSL "$BASE_URL/<file>" -o /tmp/_r && cmp /tmp/_r <file>`。这一坑当轮就踩到了 —— 拿 CDN 旧货覆盖了活机缓存，等于把刚写的诊断行又抹掉。所以 push 后要让远程机器验证，先 `cmp` 一遍再说「重跑就好了」。
