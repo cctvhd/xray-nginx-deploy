@@ -2,6 +2,7 @@ import curses
 import locale
 import os
 import sys
+import time
 import unicodedata
 
 locale.setlocale(locale.LC_ALL, '')
@@ -99,6 +100,68 @@ def safe_add(stdscr, y, x, text, attr=0):
 
 LOAD_NOTE = ""
 
+# ── 鼠标（单击选中 / 双击 = Enter，进入编辑或切换）────────────────────────
+# 双击有**两条**路径，都得接住（实机 pty 探针实测出来的，不是猜的）：
+#   ① 两次点击间隔在 ncurses 自己的 mouseinterval（约 166ms）**之内**：ncurses 会把
+#      它们并成**一个** BUTTON1_DOUBLE_CLICKED 事件（中间的第一次单击被它吞掉），
+#      自己数点击数在这里数不出来 —— 见 mouse_click 里对这个 bstate 的直接处理。
+#   ② 间隔在 166ms~600ms 之间：终端给的是**两个**独立事件，ncurses 不认，只能自己
+#      按时间窗判定。Python 的 curses 没暴露 curses.mouseinterval，调不了它的阈值，
+#      所以慢速双击只可能靠自己这条路径兜住。
+MOUSE_OK = False             # 终端不支持鼠标时保持 False，提示行也就不写「双击」那半句
+MOUSE_DOUBLE_MS = 600
+_last_click = (0.0, None)    # 上一次点击的 (时刻, (行,列))，只用来判双击
+_last_event_t = 0.0          # 部分终端把一次物理点击报成「按下」+「抬起」两个事件，靠它并成一个
+HIT_ROWS = []                # draw_table 记下的行落点 [(y, 行高, 行号)]
+HIT_COLS = []                # 列落点 [(x, 列宽, 列号)]
+
+
+def hit_test(my, mx):
+    """屏幕坐标 → (行, 列)；落在表格外（提示行、边框、表格上下方）返回 None。"""
+    r = None
+    for y, h, ri in HIT_ROWS:
+        if y <= my < y + h:
+            r = ri
+            break
+    if r is None:
+        return None
+    for x, w, ci in HIT_COLS:
+        if x <= mx < x + w + 2:      # 单元格含左右各一个空格
+            return (r, ci)
+    return None
+
+
+def mouse_click():
+    """取走一个鼠标事件，返回 ('move'|'edit', 行, 列) 或 None（事件一律取走，不能留）。"""
+    global _last_click, _last_event_t
+    try:
+        _id, mx, my, _z, bstate = curses.getmouse()
+    except curses.error:
+        return None
+    if not bstate & (curses.BUTTON1_CLICKED | curses.BUTTON1_PRESSED |
+                     curses.BUTTON1_RELEASED | curses.BUTTON1_DOUBLE_CLICKED |
+                     curses.BUTTON1_TRIPLE_CLICKED):
+        return None                  # 滚轮/中键等：忽略，但事件已取走
+    now = time.monotonic()
+    if bstate & (curses.BUTTON1_DOUBLE_CLICKED | curses.BUTTON1_TRIPLE_CLICKED):
+        # 路径①：ncurses 已替我们认定是双击（快双击），直接进编辑。
+        # 放在防抖判定之前 —— 它可能就是紧跟着上一个事件来的。
+        _last_event_t = now
+        _last_click = (0.0, None)
+        hit = hit_test(my, mx)
+        return None if hit is None else ("edit",) + hit
+    if now - _last_event_t < 0.05:   # 同一次点击的「按下/抬起」：并成一个
+        _last_event_t = now
+        return None
+    _last_event_t = now
+    hit = hit_test(my, mx)
+    if hit is None:
+        return None
+    t0, rc0 = _last_click
+    double = rc0 == hit and (now - t0) <= MOUSE_DOUBLE_MS / 1000.0
+    _last_click = (now, hit)
+    return ("edit" if double else "move",) + hit
+
 
 def load_file():
     """启动时读取上次保存的数据"""
@@ -161,6 +224,12 @@ def draw_table(stdscr, ri, ci):
     stdscr.clear()
     sh, sw = stdscr.getmaxyx()
     widths = calc_widths(sw)
+    del HIT_ROWS[:]
+    del HIT_COLS[:]
+    _x = 2                       # 第一列文字起点：1(左边框) + 1(边框与文字间的空格)
+    for _c in range(4):          # 每列占 列宽+2(空格) 再加一根竖线
+        HIT_COLS.append((_x, widths[_c], _c))
+        _x += widths[_c] + 3
 
     heights = [max(len(wrap(row[c], widths[c])) for c in range(4)) for row in data]
     header_h = max(len(wrap(headers[c], widths[c])) for c in range(4))
@@ -188,7 +257,10 @@ def draw_table(stdscr, ri, ci):
                 x += 1
         return h
 
-    safe_add(stdscr, 0, 1, trunc("方向键移动 | Enter 编辑/切换 | S 保存 | Q 退出", sw - 2))
+    hint = "方向键移动 | Enter 编辑/切换 | S 保存 | Q 退出"
+    if MOUSE_OK:
+        hint = "方向键移动 | Enter 或鼠标双击 编辑/切换 | S 保存 | Q 退出"
+    safe_add(stdscr, 0, 1, trunc(hint, sw - 2))
     # 数据目录/读取状态顶格单独一行：屏幕会被 clear()，cert.sh 在此之前打的
     # 「配置表目录: ...」日志会被抹掉，这行是唯一能当场判断读到哪去了的依据。
     note_attr = curses.A_BOLD if LOAD_NOTE.startswith("⚠") else curses.A_DIM
@@ -198,7 +270,9 @@ def draw_table(stdscr, ri, ci):
     hline(y)
     y += 1
     for r in range(len(data)):
-        y += row_block(y, data[r], sel_c=ci if r == ri else None)
+        h = row_block(y, data[r], sel_c=ci if r == ri else None)
+        HIT_ROWS.append((y, h, r))     # 行高随折行变化，只有这里知道落点
+        y += h
         if row_lines and r < len(data) - 1:
             hline(y)
             y += 1
@@ -242,11 +316,20 @@ def input_line(stdscr, y, prompt, default=""):
                 break
             elif ch == curses.KEY_BACKSPACE and buf:
                 buf.pop()
+            elif ch == curses.KEY_MOUSE:
+                # 编辑途中点鼠标：必须把事件取走。留着不取，下一次 get_wch 会立刻
+                # 再吐一个 KEY_MOUSE，这里又不处理 → 空转死循环。
+                try:
+                    curses.getmouse()
+                except curses.error:
+                    pass
     curses.curs_set(0)
     return "".join(buf).strip()
 
 
 def edit_cell(stdscr, r, c, input_y):
+    global _last_click
+    _last_click = (0.0, None)          # 编辑完清掉双击计时，免得改完随手再点一下又进编辑
     if c == 1 and r < FIXED_ROWS:      # 原有协议名不让改,备用行可以填
         return
     if c == 3:
@@ -258,13 +341,27 @@ def edit_cell(stdscr, r, c, input_y):
 
 
 def main(stdscr):
+    global MOUSE_OK
     load_file()
     curses.curs_set(0)
     stdscr.keypad(True)
+    try:
+        # 终端不支持鼠标时返回 0（此时终端也不会发鼠标序列，点击等于没点）
+        MOUSE_OK = curses.mousemask(curses.ALL_MOUSE_EVENTS) != 0
+    except curses.error:
+        MOUSE_OK = False
     r, c = 0, 0
     while True:
         input_y = draw_table(stdscr, r, c)
         key = stdscr.getch()
+        if key == curses.KEY_MOUSE:
+            act = mouse_click()
+            if act is None:
+                continue
+            r, c = act[1], act[2]
+            if act[0] == "edit":       # 双击：与 Enter 同义
+                edit_cell(stdscr, r, c, input_y)
+            continue
         if key == curses.KEY_UP and r > 0:
             r -= 1
         elif key == curses.KEY_DOWN and r < len(data) - 1:
