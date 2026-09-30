@@ -83,6 +83,14 @@ reset_nginx_state() {
     save_state "CONF_NGINX" "0"
 }
 
+reset_mosdns_state() {
+    save_state "INST_MOSDNS" "0"
+    # DoH 入口的域名/路径随 mosdns-x 一起清掉：入口的后端就是它，留着 state
+    # 会让「配置 Nginx」继续生成一个指向已卸载后端的 doh.conf（必然 502）。
+    save_state "DOH_DOMAIN" ""
+    save_state "DOH_PATH" ""
+}
+
 reset_cert_state() {
     save_state "XHTTP_DOMAIN" ""
     save_state "GRPC_DOMAIN" ""
@@ -387,6 +395,35 @@ cleanup_naive_module() {
     log_info "NaiveProxy 清理完成"
 }
 
+cleanup_mosdns_module() {
+    log_step "清理 mosdns-x..."
+
+    systemctl disable --now mosdns >/dev/null 2>&1 || true
+
+    remove_path_if_exists "/etc/systemd/system/mosdns.service"
+    remove_path_if_exists "/usr/local/bin/mosdns"
+
+    # /etc/mosdns 里可能躺着用户手工调过的 config.yaml 与它的 .bk.* 备份
+    # （install 时我们刻意不覆盖）——整目录留着，只提示，不替他做决定。
+    if [[ -d /etc/mosdns ]]; then
+        log_warn "保留 /etc/mosdns（含可能手工调过的 config.yaml 与 .bk 备份）"
+        log_warn "  确认不再需要后手工删除: rm -rf /etc/mosdns"
+    fi
+
+    systemctl daemon-reload >/dev/null 2>&1 || true
+
+    # DoH 入口：doh.conf 删掉即可（generate_sni_map 要求它存在才写 443 路由），
+    # 但 nginx.conf 里那条路由要重跑「配置 Nginx」才会消失。
+    remove_path_if_exists "/etc/nginx/conf.d/doh.conf"
+    if [[ -n "$(get_state 'DOH_DOMAIN' '')" ]]; then
+        log_warn "DoH 入口已删除，但 nginx.conf 的 SNI map 里可能还留着这条 443 路由"
+        log_warn "  重跑一次「配置 Nginx」即可清掉（该域会回到伪装站）"
+    fi
+
+    reset_mosdns_state
+    log_info "mosdns-x 清理完成"
+}
+
 cleanup_warp_module() {
     log_step "清理 Cloudflare WARP..."
 
@@ -475,6 +512,7 @@ cleanup_all_modules() {
     cleanup_system_module
     cleanup_hysteria2_module
     cleanup_naive_module
+    cleanup_mosdns_module
 
     remove_path_if_exists "$STATE_FILE"
     rmdir "$STATE_DIR" 2>/dev/null || true

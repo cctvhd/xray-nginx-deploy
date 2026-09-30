@@ -4,6 +4,7 @@ cleanup
 crowdsec
 firewall
 hysteria2
+mosdns
 naive
 nginx
 security

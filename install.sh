@@ -30,7 +30,7 @@ MODULES_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/modules"
 : "${STATE_FILE:=${STATE_DIR}/config.env}"
 LOCAL_MODULES_DIR="${STATE_DIR}/modules"
 
-DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive warp client sync security firewall crowdsec cleanup uninstall upgrade)
+DEFAULT_MODULES=(system unbound nginx cert xray singbox hysteria2 naive mosdns warp client sync security firewall crowdsec cleanup uninstall upgrade)
 ALL_MODULES=()
 
 init_module_list() {
@@ -585,13 +585,14 @@ _preflight_check_internal_ports() {
         [8390]="nginx grpc ssl"
         [8400]="nginx SNI trap"
         [8410]="nginx DoH 入口"
+        [15353]="mosdns-x DoH 后端"
     )
-    if (( ${#_internal_ports[@]} != 13 )); then
+    if (( ${#_internal_ports[@]} != 14 )); then
         _preflight_fail \
             "Check 4a: 内部端口表数量异常" \
-            "期望 13 个端口，实际 ${#_internal_ports[@]} 个 —— 可能某两个常量被改成同值" \
+            "期望 14 个端口，实际 ${#_internal_ports[@]} 个 —— 可能某两个常量被改成同值" \
             "nginx upstream / proxy_pass 会指向错误后端，整个栈不可用" \
-            "检查 modules/{nginx,xray,singbox,naive}.sh 中的端口常量"
+            "检查 modules/{nginx,xray,singbox,naive,mosdns}.sh 中的端口常量"
     fi
 }
 
@@ -2111,6 +2112,28 @@ do_inst_naive() {
     done_return
 }
 
+# ── 15. 安装/配置 mosdns-x（DoH 入口）──────────────────────────
+# 一键：装后端 → 写配置/unit → 起服务 → 自检 → 配 DoH 入口（域名/路径）。
+# DoH 入口的域名/路径问答从「配置 Nginx」搬到这里 —— 入口的后端就是 mosdns-x，
+# 配它属于装 mosdns-x 的一部分。
+do_inst_mosdns() {
+    load_os_info
+    load_module mosdns
+
+    # 入口要写进 nginx.conf 的 SNI map，没有 Nginx 配了也白配。
+    if ! command -v nginx &>/dev/null; then
+        log_warn "未检测到 Nginx，DoH 入口无法生效（mosdns-x 本体仍会安装并启动）"
+        log_warn "  先完成步骤 4（安装 Nginx）与步骤 5（申请 SSL 证书）再回来配入口"
+    fi
+    if [[ -z "$(get_state 'DOMAIN_REGISTRY' '')" ]]; then
+        log_warn "配置表里还没有已注册域名，DoH 入口需要证书 + 一个 443 SNI 空闲的域"
+    fi
+
+    run_mosdns
+    save_state "INST_MOSDNS" "1"
+    done_return
+}
+
 do_conf_nginx() {
     if [[ "$(get_step INST_NGINX)" != "1" ]] && ! command -v nginx &>/dev/null; then
         log_warn "请先完成步骤 4（安装 Nginx）"
@@ -2956,6 +2979,7 @@ upgrade_component_method() {
         singbox) echo "系统仓库安装" ;;
         xray|hysteria2) echo "脚本安装" ;;
         naive) echo "编译安装" ;;
+        mosdns) echo "GitHub 二进制" ;;
         *) echo "未知" ;;
     esac
 }
@@ -2967,6 +2991,7 @@ upgrade_component_label() {
         singbox) echo "Sing-Box" ;;
         hysteria2) echo "Hysteria2" ;;
         naive) echo "NaiveProxy(Caddy)" ;;
+        mosdns) echo "mosdns-x" ;;
         all) echo "全部组件" ;;
         *) echo "$1" ;;
     esac
@@ -2979,6 +3004,11 @@ upgrade_command_version() {
         singbox) sing-box version 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
         hysteria2) hysteria version 2>&1 | grep -oP '[0-9]+(\.[0-9]+)+' | head -1 || true ;;
         naive) caddy-naive version 2>&1 | grep -oP 'v?[0-9]+(\.[0-9]+)+' | head -1 | sed 's/^v//' || true ;;
+        # ⚠️ 必须取 build time，不能取 mosdns 自报的版本号：
+        # `mosdns version` 输出 "version: v4.6.0, build time: 26.05.25"，其中
+        # v4.6.0 是 mosdns-x 自己的版本，发布 tag 才是 v26.05.25。用 4.6.0 去比
+        # tag 会永远判「可升级」，升级动作却什么也升不动（同 nginx mainline/stable 那类坑）。
+        mosdns) mosdns version 2>&1 | grep -oP 'build time:\s*\K[0-9]+(\.[0-9]+)+' | head -1 || true ;;
     esac
 }
 
@@ -3053,6 +3083,7 @@ upgrade_remote_version() {
         xray)      upgrade_github_latest XTLS/Xray-core ;;
         hysteria2) upgrade_github_latest apernet/hysteria ;;
         naive)     upgrade_github_latest caddyserver/caddy ;;
+        mosdns)    upgrade_github_latest pmkol/mosdns-x ;;
     esac
 }
 
@@ -3135,6 +3166,20 @@ upgrade_script_component() {
             install_hysteria2
             restart_service_if_configured "hysteria-server.service"
             save_state "INST_HYSTERIA2" "1"
+            ;;
+        mosdns)
+            # ⚠️ 升级路径只能重装【二进制】，绝不能重跑 generate_mosdns_config：
+            # 那份 config.yaml 是用户按自家网络手工调过的（活机就如此），
+            # 覆盖 = 他的 ECS 分流行为当场变化（modules/mosdns.sh 同一禁忌）。
+            if mosdns_upgrade_up_to_date; then
+                log_info "mosdns-x 已是最新，跳过下载"
+                save_state "INST_MOSDNS" "1"
+                return 0
+            fi
+            load_module mosdns
+            install_mosdns_binary --force
+            restart_service_if_configured "mosdns.service"
+            save_state "INST_MOSDNS" "1"
             ;;
     esac
 }
@@ -3283,6 +3328,19 @@ upgrade_compiled_component() {
     esac
 }
 
+# ── mosdns-x 升级辅助：判定是否真的需要重新下载 ──
+# 比较的是【发布号（build time）】：mosdns 自报的 v4.6.0 与 GitHub tag
+# v26.05.25 不同源，拿它比会永远判「可升级」。任一读不到即返回 1（保守重装）。
+mosdns_upgrade_up_to_date() {
+    local current latest
+    current=$(upgrade_command_version mosdns 2>/dev/null || true)
+    latest=$(upgrade_remote_version mosdns 2>/dev/null || true)
+    log_info "mosdns-x: 当前=${current:-未知} 最新=${latest:-未知}"
+    [[ -z "$current" || -z "$latest" ]] && return 1
+    [[ "$current" != "$latest" ]] && return 1
+    return 0
+}
+
 # ── NaiveProxy(Caddy) 升级辅助：判定是否真的需要重新编译 ──
 # 两个上游：caddyserver/caddy（latest release tag）+ klzgrad/forwardproxy@naive（HEAD commit）
 # 任一变化即返回 1（需升级）；都未变返回 0（跳过）；网络失败时返回 1（保守触发编译）
@@ -3322,7 +3380,7 @@ run_upgrade_component() {
     local label method before after
 
     case "$component" in
-        nginx|xray|singbox|hysteria2|naive|all) ;;
+        nginx|xray|singbox|hysteria2|naive|mosdns|all) ;;
         *)
             log_error "不支持的升级组件: ${component:-<空>}"
             exit 1
@@ -3330,7 +3388,7 @@ run_upgrade_component() {
     esac
 
     if [[ "$component" == "all" ]]; then
-        for component in nginx xray singbox hysteria2 naive; do
+        for component in nginx xray singbox hysteria2 naive mosdns; do
             run_upgrade_component "$component"
         done
         return 0
@@ -3345,7 +3403,7 @@ run_upgrade_component() {
 
     case "$component" in
         nginx|singbox) upgrade_repo_component "$component" ;;
-        xray|hysteria2) upgrade_script_component "$component" ;;
+        xray|hysteria2|mosdns) upgrade_script_component "$component" ;;
         naive) upgrade_compiled_component "$component" ;;
     esac
 
@@ -3578,7 +3636,8 @@ do_upgrade_menu() {
         upgrade_menu_line 3 "Sing-Box"   singbox
         upgrade_menu_line 4 "Hysteria2"  hysteria2
         upgrade_menu_line 5 "NaiveProxy" naive
-        echo "  6. 全部升级（仅升级有更新的组件）"
+        upgrade_menu_line 6 "mosdns-x"   mosdns
+        echo "  7. 全部升级（仅升级有更新的组件）"
         echo "  l. 查看最近升级状态/日志"
         echo "  t. 实时跟踪最近一次升级（tail -f）"
         echo "  q. 返回主菜单"
@@ -3596,7 +3655,8 @@ do_upgrade_menu() {
             3) component="singbox" ;;
             4) component="hysteria2" ;;
             5) component="naive" ;;
-            6) component="all" ;;
+            6) component="mosdns" ;;
+            7) component="all" ;;
             l|L)
                 show_upgrade_status
                 read -rp "按回车继续..." _
@@ -3676,6 +3736,7 @@ do_uninstall_menu() {
     echo "  10. 清理全部"
     echo "  11. 清理 CrowdSec"
     echo "  12. 清理 nftables 防火墙"
+    echo "  13. 清理 mosdns-x（DoH 后端，含 DoH 入口）"
     echo "  q. 返回主菜单"
     echo ""
     read -rp "  请选择: " cleanup_choice
@@ -3704,6 +3765,7 @@ do_uninstall_menu() {
             ;;
        11) cleanup_crowdsec_module ;;
        12) cleanup_firewall_module ;;
+       13) cleanup_mosdns_module ;;
         q|Q)
             ;;
         *)
@@ -4144,6 +4206,7 @@ main_menu_loop() {
         echo "  12. 配置 Sing-Box"
         echo "  13. 配置 Hysteria2"
         echo "  14. 配置 NaiveProxy"
+        echo "  15. 安装/配置 mosdns-x（DoH 入口：装后端 + 选域名/路径）"
         echo " n. 重新配置 Nginx（先清理再生成）"
         echo " x. 重新配置 Xray（先清理再生成）"
         echo " g. 重新配置 Sing-Box（先清理再生成）"
@@ -4191,6 +4254,7 @@ main_menu_loop() {
            12) run_menu_action "配置 Sing-Box"     do_conf_singbox ;;
            13) run_menu_action "配置 Hysteria2"    do_conf_hysteria2 ;;
            14) run_menu_action "配置 NaiveProxy"   do_conf_naive ;;
+           15) run_menu_action "安装/配置 mosdns-x" do_inst_mosdns ;;
           n|N) run_menu_action "重新配置 Nginx"      do_reconf_nginx ;;
           x|X) run_menu_action "重新配置 Xray"       do_reconf_xray ;;
           g|G) run_menu_action "重新配置 Sing-Box"   do_reconf_singbox ;;

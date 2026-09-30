@@ -2,10 +2,10 @@ server-audit/
 *.bak
 .claude/
 .understand-anything/
+__pycache__/
 
 # edit_nodes.py 导出的域名配置表（含 Cloudflare API 令牌明文）。
 # 默认写在 /root，本就在仓库外；这里兜底，防止有人把数据目录
 # （EDIT_NODES_DATA_DIR / argv[1]）指进仓库时令牌被误 add 进去。
 config.txt
 .config.tsv
-
