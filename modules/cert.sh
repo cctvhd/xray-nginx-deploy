@@ -2629,11 +2629,17 @@ migrate_cf_account_files() {
 # ════════════════════════════════════════════════════════════
 
 # edit_nodes.py 的数据文件（config.txt / .config.tsv）落地目录。
-# 【不读机器默认路径（原来是 /root）】：目录固定跟随 edit_nodes.py 脚本所在目录，
-# 脚本在哪数据就在哪 —— git 模式是仓库根、curl 模式是 /etc/xray-deploy。这样换一台
-# 机器测试时，「刚才按 S 存下去的表」总在同一个可预期的位置，不会因为 $HOME 不同而
-# 报「找不到配置文件」。仓库 .gitignore 已兜底这两个文件名，故脚本落进仓库也不怕。
-# 逃生口：显式 export EDIT_NODES_DATA_DIR 仍以其为准，留空即跟随脚本。
+# 【不读机器默认路径（原来是 /root）】：固定落在 STATE_DIR，即部署自己的目录，
+# 也就是 /etc/xray-deploy。
+#
+# ⚠️ 为什么不是「跟随 edit_nodes.py 脚本所在目录」（5d5afdd 曾这么改，已废弃）：
+# 同一台机器上脚本位置有两个答案 —— git 模式解析到仓库根那份，curl 模式
+# （bash <(curl ...)）MODULES_DIR 不是真实目录，只能落到缓存
+# ${STATE_DIR}/edit_nodes.py。于是两种启动方式各看各的表、互相看不见：在 curl
+# 模式里按 S 存下去，回 ./install.sh 就「没这回事」。固定到 STATE_DIR 后两种模式
+# 同一处，且令牌完全不进 git 工作区（仓库根曾是候选落点，靠 .gitignore 兜底）。
+# 副作用：手动在仓库里跑 ./install.sh 时，表不再躺在仓库根 —— 这是刻意的。
+# 逃生口：显式 export EDIT_NODES_DATA_DIR 仍以其为准。
 : "${EDIT_NODES_DATA_DIR:=}"
 _EDIT_NODES_CACHE="${STATE_DIR:-/etc/xray-deploy}/edit_nodes.py"
 
@@ -2838,9 +2844,9 @@ run_cert() {
         log_error "未找到 edit_nodes.py（git 模式应位于仓库根目录；curl 模式需能访问 ${BASE_URL}）"
         return 1
     fi
-    # 数据目录固定跟随脚本所在目录（理由见 EDIT_NODES_DATA_DIR 定义处），
-    # 写与读用同一个值，不依赖机器默认路径。
-    local edit_nodes_dir="${EDIT_NODES_DATA_DIR:-$(dirname "$edit_nodes_script")}"
+    # 数据目录固定为 STATE_DIR（理由见 EDIT_NODES_DATA_DIR 定义处）：git / curl
+    # 两种启动方式算出同一个值，不会各看各的表；写与读共用这个局部变量。
+    local edit_nodes_dir="${EDIT_NODES_DATA_DIR:-${STATE_DIR:-/etc/xray-deploy}}"
     log_info "配置表目录: $edit_nodes_dir"
 
     # 快照「进入本流程前」的域名集合，供第 3b 步清理已从配置表移除的陈旧域名。

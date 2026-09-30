@@ -6,13 +6,14 @@ import unicodedata
 
 locale.setlocale(locale.LC_ALL, '')
 
-# 数据目录 = 本脚本所在目录（cert.sh 会显式把该目录作为 argv[1] 传入，两者一致）。
-# 刻意【不用 /root 这类机器默认路径】：换一台机器、换个 $HOME 就会出现「刚按 S 存
-# 下去的文件找不到」，而这个目录只由脚本部署位置决定 —— git 模式是仓库根、curl
-# 模式是 /etc/xray-deploy，到哪台机器都是同一个可预期的位置。
-# config.txt / .config.tsv 含 Cloudflare API 令牌明文，仓库 .gitignore 已兜底这两个
-# 文件名，脚本被放进仓库时令牌不会被误 add。
-BASE_DIR = sys.argv[1] if len(sys.argv) > 1 else os.path.dirname(os.path.abspath(__file__))
+# 数据目录 = 部署自己的目录 /etc/xray-deploy（cert.sh 总是显式把该目录作为 argv[1]
+# 传入，两者一致）。
+# 刻意【不用 /root 这类机器默认路径】，也刻意【不用脚本所在目录】：前者换台机器、
+# 换个 $HOME 就报「找不到刚存下去的表」；后者在同一台机器上有两个答案 —— git 模式
+# 是仓库根、curl 模式是 /etc/xray-deploy，两种启动方式会各看各的表。固定成
+# /etc/xray-deploy 后两种模式同一处，且 config.txt / .config.tsv 里的 Cloudflare
+# API 令牌明文完全不进 git 工作区（无 argv 直跑时尤其重要：旧兜底会把令牌写在仓库根）。
+BASE_DIR = sys.argv[1] if len(sys.argv) > 1 else "/etc/xray-deploy"
 os.makedirs(BASE_DIR, exist_ok=True)
 SAVE_FILE = os.path.join(BASE_DIR, "config.txt")     # 对齐版,给人看
 DATA_FILE = os.path.join(BASE_DIR, ".config.tsv")    # Tab 分隔,程序读取
