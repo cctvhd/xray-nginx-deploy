@@ -2367,39 +2367,27 @@ refresh_domain_assignments() {
     fi
 
     if [[ -z "${HYSTERIA2_DOMAIN:-}" ]]; then
-        local registry
-        registry=$(get_state "DOMAIN_REGISTRY")
-        if [[ -n "$registry" ]]; then
-            echo ""
-            log_warn "HYSTERIA2_DOMAIN 仍为空，可从已有域名追加 hysteria2 协议"
-            for domain in $registry; do
-                local suffix mode protos
-                suffix=$(echo "$domain" | tr '.' '_')
-                mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
-                protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
-                printf "  %-30s [%s / %s]\n" "$domain" "$mode" "$protos"
-            done
-            echo ""
-            local hy_domain
-            read -rp "输入要分配给 Hysteria2 的已有域名（留空跳过）: " hy_domain
-            hy_domain="${hy_domain,,}"
-            if [[ -n "$hy_domain" ]]; then
-                if domain_is_registered "$hy_domain"; then
-                    local hy_suffix hy_mode
-                    hy_suffix=$(echo "$hy_domain" | tr '.' '_')
-                    hy_mode=$(get_state "DOMAIN_MODE_${hy_suffix}" "direct")
-                    if register_domain "$hy_domain" "$hy_mode" "hysteria2"; then
-                        rebuild_protocol_domains
-                        load_domain_state
-                        log_info "已将 ${hy_domain} 分配给 Hysteria2"
-                    else
-                        log_error "Hysteria2 域名分配失败，请检查 ${STATE_FILE}"
-                        return 1
-                    fi
-                else
-                    log_error "域名 ${hy_domain} 不在 DOMAIN_REGISTRY 中，请先添加域名"
-                fi
+        # 域名一律取自配置表，不在这里再问一遍（2026-09-30 用户点名的手输点）。
+        # 表里 Hysteria2 行（第 6 行）填了什么就用什么；留空 = 该协议本次不配。
+        # 以前这里罗列全部 registry 域名让用户挑，与表平行、且能把表里的决定改掉。
+        local hy_domain
+        hy_domain="$(config_table_domain_for_slot hysteria2)" || hy_domain=""
+        if [[ -z "$hy_domain" ]]; then
+            log_warn "配置表 Hysteria2 行未填域名 → 本次不分配（到主菜单 5→1 在该行填域名后重跑本项）"
+        elif domain_is_registered "$hy_domain"; then
+            local hy_suffix hy_mode
+            hy_suffix=$(echo "$hy_domain" | tr '.' '_')
+            hy_mode=$(get_state "DOMAIN_MODE_${hy_suffix}" "direct")
+            if register_domain "$hy_domain" "$hy_mode" "hysteria2"; then
+                rebuild_protocol_domains
+                load_domain_state
+                log_info "已将 ${hy_domain} 分配给 Hysteria2（配置表第 6 行）"
+            else
+                log_error "Hysteria2 域名分配失败，请检查 ${STATE_FILE}"
+                return 1
             fi
+        else
+            log_error "配置表 Hysteria2 行填的 ${hy_domain} 不在 DOMAIN_REGISTRY 中；请到主菜单 5→1 确认该域已在表里且已签发证书"
         fi
     fi
 
@@ -2688,6 +2676,68 @@ _tsv_split() {
     IFS=$'\x01' read -r "$@" <<< "$_line"
 }
 
+# ════════════════════════════════════════════════════════════
+# 配置表读表工具（「域名一律取自配置表」的统一入口）
+# ════════════════════════════════════════════════════════════
+# ⚠️ 映射表**必须 declare 在函数内部**，不能提到文件作用域：模块是被
+# install.sh 的 load_module() 里的 `source` 加载的，而 source 发生在函数体内
+# ——文件作用域的 `declare -A` 会变成 load_module 的**局部**变量，函数一返回
+# 就没了。届时 `${protocol_map[$protocol]:-}` 面对一个未声明的数组会按算术
+# 下标求值（`vless-xhttp` → `vless` 未定义）报 unbound variable 而中止。
+# 需要跨函数共享的变量只能靠 `declare -g` 或直接赋值（不带 declare）。
+#
+# 配置表数据文件路径。优先用 run_cert 已经算好的全局 TSV_FILE（它含「历史落点
+# 回退」的结果，与用户刚在 TUI 里看到的是同一份）；没有则按同一套兜底链自行解析
+# ——5→3 等路径不经过 run_cert，那时 TSV_FILE 可能是空的。
+# stdout 回传路径：本函数内不得调 log_*（全是裸 echo，会被调用方的 $(...) 捕获）。
+_config_table_file() {
+    if [[ -n "${TSV_FILE:-}" ]]; then
+        printf '%s\n' "$TSV_FILE"
+    else
+        printf '%s\n' "${EDIT_NODES_DATA_DIR:-${STATE_DIR:-/etc/xray-deploy}}/.config.tsv"
+    fi
+}
+
+# 读表：stdout 每行 "<协议槽位标签>\t<域名>"，只输出 7 个固定行中域名非空的。
+# 解析口径与 run_cert 步骤 6/7 保持一致（去首尾空白 + 转小写），否则同一份表在
+# 两处会算出不同的域。
+# ⚠️ stdout 回传数据，函数内不得调 log_*（见上方 _config_table_file 的说明）。
+config_table_slot_domains() {
+    local _f
+    _f="$(_config_table_file)"
+    [[ -f "$_f" ]] || return 0
+
+    # 行号（0-based）→ 协议槽位标签。顺序即 edit_nodes.py 里 data 常量的固定 7 行：
+    # xhttp / grpc / xhttp-reality / reality / AnyTLS / Hysteria2 / Naiveproxy
+    local -a _row_slot=(
+        "xray-xhttp" "xray-grpc" "xhttp-reality" "xray-reality"
+        "singbox" "hysteria2" "naiveproxy"
+    )
+
+    local _row=0 _line _tok _proto _dom _mode
+    while IFS= read -r _line; do
+        (( _row >= 7 )) && break
+        _tsv_split "$_line" _tok _proto _dom _mode
+        _dom="$(echo "$_dom" | xargs | tr '[:upper:]' '[:lower:]')"
+        [[ -n "$_dom" ]] && printf '%s\t%s\n' "${_row_slot[$_row]}" "$_dom"
+        _row=$(( _row + 1 ))
+    done < "$_f"
+    return 0
+}
+
+# 查表：$1 = 协议槽位标签 → stdout 回显该槽在表里的域名；表里没有/该行为空 → 返回 1。
+# ⚠️ 同样用 stdout 回传值，函数内不得调 log_*。
+config_table_domain_for_slot() {
+    local _want="$1" _slot _dom
+    while IFS=$'\t' read -r _slot _dom; do
+        if [[ "$_slot" == "$_want" ]]; then
+            printf '%s\n' "$_dom"
+            return 0
+        fi
+    done < <(config_table_slot_domains)
+    return 1
+}
+
 # ── 清理已从配置表移除的陈旧域名 ─────────────────────────────
 # 配置表是七个协议槽位的唯一事实来源：相对进入本流程前的快照 OLD_DOMAINS，
 # 不在表内的域视为已废弃 → 摘出 DOMAIN_REGISTRY、清 DOMAIN_MODE_*/PROTO_*，
@@ -2942,24 +2992,18 @@ run_cert() {
     declare -A token_to_account   # key: API token, value: account index (same as above)
     declare -A domain_to_token    # key: domain, value: API token
     declare -A primary_domains    # key: protocol slot (xray-xhttp, etc.), value: domain
-    declare -A protocol_map       # 从 edit_nodes.py 的协议名映射到系统协议标签
-    protocol_map["vless-xhttp"]="xray-xhttp"
-    protocol_map["vless-grpc"]="xray-grpc"
-    protocol_map["vless-xhttp-reality"]="xhttp-reality"
-    protocol_map["vless-reality"]="xray-reality"
-    protocol_map["Sing-Box AnyTLS"]="singbox"
-    protocol_map["Hysteria2"]="hysteria2"
-    protocol_map["Naiveproxy"]="naiveproxy"
-
-    # 固定行对应的协议槽位索引（0-based）
-    declare -A fixed_row_to_slot
-    fixed_row_to_slot[0]="xray-xhttp"
-    fixed_row_to_slot[1]="xray-grpc"
-    fixed_row_to_slot[2]="xhttp-reality"
-    fixed_row_to_slot[3]="xray-reality"
-    fixed_row_to_slot[4]="singbox"
-    fixed_row_to_slot[5]="hysteria2"
-    fixed_row_to_slot[6]="naiveproxy"
+    # 协议名 → 系统槽位标签。只能 declare 在此处（函数内）：模块由 load_module()
+    # 里的 source 加载，文件作用域的 declare 会变成那个函数的局部变量而失效
+    # （详见 _tsv_split 下方 config_table_slot_domains 的说明）。
+    declare -A protocol_map=(
+        ["vless-xhttp"]="xray-xhttp"
+        ["vless-grpc"]="xray-grpc"
+        ["vless-xhttp-reality"]="xhttp-reality"
+        ["vless-reality"]="xray-reality"
+        ["Sing-Box AnyTLS"]="singbox"
+        ["Hysteria2"]="hysteria2"
+        ["Naiveproxy"]="naiveproxy"
+    )
 
     # 读取 TSV 文件
     local _line
@@ -3036,7 +3080,6 @@ run_cert() {
         domain="$(echo "$domain" | xargs | tr '[:upper:]' '[:lower:]')"
         mode="$(echo "$mode" | xargs)"
         if [[ $row -lt 7 ]]; then
-            slot="${fixed_row_to_slot[$row]}"
             if [[ -n "$domain" && -n "${protocol_map[$protocol]:-}" ]]; then
                 sys_proto="${protocol_map[$protocol]:-}"
                 primary_domains[$sys_proto]=$domain
@@ -3146,6 +3189,10 @@ EOF
     done
 
     # 7. 设置主要域名（协议槽位）
+    # ⚠️ 这里写的 7 个键，紧接着的第 8 步 rebuild_protocol_domains 会**无条件按域名
+    # 标签重推覆盖**（install.sh:798-804）。真正的事实来源是每个域上的
+    # DOMAIN_PROTO_<域> 标签，不是这几次 save_state。所以「表里清空某行的域名」
+    # 要真正生效，必须让该域**掉标签** —— 只把键写空没用，rebuild 会把旧域填回来。
     for slot in "${!primary_domains[@]}"; do
         domain="${primary_domains[$slot]}"
         case "$slot" in
@@ -3158,6 +3205,33 @@ EOF
             "naiveproxy") save_state "NAIVE_DOMAIN" "$domain" ;;
         esac
         log_info "设置主要域名 $slot = $domain"
+    done
+
+    # 7b. 表里 Reality 行留空 = 该槽「借公共 SNI」。
+    #     第 6 步注册走 register_domain 的 merge 语义（install.sh:245
+    #     merge_domain_protocols）—— 只加不减，所以「把这个域从 reality 行挪走」
+    #     不会摘掉它身上的 xray-reality/xhttp-reality 标签，rebuild 便继续把它当
+    #     自建域、REALITY_DOMAIN 照旧填回来。结果就是表说「借公共」、state 却说
+    #     「自建」，正是菜单 11/x 与表打架的根因（用户 2026-09-30 点名的那条）。
+    #     故此处对两个 Reality 槽补一次显式摘标签，让表真正说了算。
+    if [[ -z "${primary_domains[xray-reality]:-}" || -z "${primary_domains[xhttp-reality]:-}" ]]; then
+        if ! declare -F reality_untag_self_domain >/dev/null 2>&1; then
+            declare -F load_module >/dev/null 2>&1 && load_module xray >/dev/null 2>&1 || true
+        fi
+    fi
+    local _rz_key _rz_tag _rz_cur
+    for _rz_key in REALITY_DOMAIN XHTTP_REALITY_DOMAIN; do
+        if [[ "$_rz_key" == "REALITY_DOMAIN" ]]; then _rz_tag="xray-reality"; else _rz_tag="xhttp-reality"; fi
+        # 表里该行填了域名（= 要自建该域）→ 不动，交给第 6/8 步
+        [[ -n "${primary_domains[$_rz_tag]:-}" ]] && continue
+        _rz_cur="$(get_state "$_rz_key" "")"
+        [[ -z "$_rz_cur" ]] && continue
+        if declare -F reality_untag_self_domain >/dev/null 2>&1; then
+            log_warn "${_rz_tag} 在配置表里未填域名 → 摘除 ${_rz_cur} 的自建标签（= 切回借公共 SNI）"
+            reality_untag_self_domain "$_rz_cur" "$_rz_tag" || true
+        else
+            log_warn "xray 模块不可用，${_rz_cur} 的 ${_rz_tag} 标签可能残留（请到主菜单 11/x 处理）"
+        fi
     done
 
     # 8. 重建协议域名（更新 state 中的 ALL_DOMAINS、CDN_DOMAINS、DIRECT_DOMAINS 等）
