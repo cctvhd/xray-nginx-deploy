@@ -493,11 +493,12 @@ _preflight_check_internal_ports() {
         [8380]="nginx xhttp ssl"
         [8390]="nginx grpc ssl"
         [8400]="nginx SNI trap"
+        [8410]="nginx DoH 入口"
     )
-    if (( ${#_internal_ports[@]} != 12 )); then
+    if (( ${#_internal_ports[@]} != 13 )); then
         _preflight_fail \
             "Check 4a: 内部端口表数量异常" \
-            "期望 12 个端口，实际 ${#_internal_ports[@]} 个 —— 可能某两个常量被改成同值" \
+            "期望 13 个端口，实际 ${#_internal_ports[@]} 个 —— 可能某两个常量被改成同值" \
             "nginx upstream / proxy_pass 会指向错误后端，整个栈不可用" \
             "检查 modules/{nginx,xray,singbox,naive}.sh 中的端口常量"
     fi
@@ -2100,6 +2101,16 @@ do_conf_nginx() {
     generate_trap_cert
     generate_fallback_conf
     generate_servers_conf
+    # 须在 generate_nginx_conf 之前：SNI map 由后者生成。
+    # declare -F 门控：install.sh 与 modules/nginx.sh 版本错位时（如 bash <(curl ...)
+    # 拉到了新 install.sh 但缓存里仍是旧 nginx.sh），旧模块没这个函数，裸调会
+    # "command not found" —— 结果只是静默少了个 DoH 入口，排查时毫无线索。
+    if declare -F ensure_doh_conf >/dev/null; then
+        ensure_doh_conf
+    else
+        log_warn "modules/nginx.sh 版本过旧（无 ensure_doh_conf），本次已跳过 DoH 入口"
+        log_warn "  模块与 install.sh 需同版本；用仓库里的 ./install.sh 或等模块同步后再重配"
+    fi
     generate_nginx_conf
     reload_nginx
     install_cf_ip_updater
@@ -2434,6 +2445,17 @@ _sync_nginx_after_credential_reset() {
     generate_upstreams_conf
     generate_fallback_conf
     generate_servers_conf || return 1
+    # 静默同步：已配 DoH 时补回 SNI 路由；未配置则完全不打扰（不弹菜单）。
+    # declare -F 门控同上：模块版本错位时旧模块没这个函数，不能裸调，但也不能
+    # 安静跳过 —— 那样 nginx.conf 会丢掉 DoH 的 SNI 路由，入口静默失效。
+    if [[ -n "$(get_state 'DOH_DOMAIN' '')" ]]; then
+        if declare -F ensure_doh_conf >/dev/null; then
+            ensure_doh_conf
+        else
+            log_warn "modules/nginx.sh 版本过旧（无 ensure_doh_conf），DoH 的 SNI 路由未补回"
+            log_warn "  用仓库里的 ./install.sh 重跑「配置 Nginx」可修复"
+        fi
+    fi
     generate_nginx_conf
     if ! nginx -t; then
         log_error "Nginx 配置验证失败，已停止安全重置"
@@ -3706,6 +3728,16 @@ run_full_install_flow() {
     generate_trap_cert
     generate_fallback_conf
     generate_servers_conf
+    # 须在 generate_nginx_conf 之前：SNI map 由后者生成。
+    # declare -F 门控：install.sh 与 modules/nginx.sh 版本错位时（如 bash <(curl ...)
+    # 拉到了新 install.sh 但缓存里仍是旧 nginx.sh），旧模块没这个函数，裸调会
+    # "command not found" —— 结果只是静默少了个 DoH 入口，排查时毫无线索。
+    if declare -F ensure_doh_conf >/dev/null; then
+        ensure_doh_conf
+    else
+        log_warn "modules/nginx.sh 版本过旧（无 ensure_doh_conf），本次已跳过 DoH 入口"
+        log_warn "  模块与 install.sh 需同版本；用仓库里的 ./install.sh 或等模块同步后再重配"
+    fi
     generate_nginx_conf
     reload_nginx
     install_cf_ip_updater

@@ -1099,6 +1099,243 @@ generate_sni_map() {
         echo "        # -- NaiveProxy -> nginx 中间层 -> caddy-naive ------"
         echo "        ${NAIVE_DOMAIN}       127.0.0.1:8370;"
     fi
+
+    # DoH 入口（conf.d/doh.conf 的 server 块）。域名由 ensure_doh_conf 选定，
+    # 候选已排除占用 443 的协议，所以这里的 seen_sni 去重只是防御性的。
+    if [[ -n "${DOH_DOMAIN:-}" && -z "${seen_sni[${DOH_DOMAIN}]:-}" ]]; then
+        [[ $had_output -eq 1 ]] && echo ""
+        echo "        # -- DoH 入口 -> 8410 ---------------------------------"
+        echo "        ${DOH_DOMAIN}       127.0.0.1:8410;"
+        seen_sni["${DOH_DOMAIN}"]=1
+    fi
+}
+
+# ── DoH 入口（独立 include，反代本机 mosdns-x）────────────────
+# 与 generate_servers_conf 分开：servers.conf 每次重配都被重写，
+# 本函数只在 doh.conf 缺失时生成，所以入口能扛过重配。
+# TLS 在 nginx 终结，后端是 127.0.0.1:15353/dns-query（明文 http）。
+# 443 路由由 generate_sni_map 指向 127.0.0.1:8410；端口见
+# install.sh 的 _preflight_check_internal_ports。
+# state: DOH_DOMAIN（空 = 不启用）/ DOH_PATH（随机或手输，生成后保存）。
+#
+# DoH 候选域名 = 已入册 且 TCP/443 SNI 空闲。判定复用 xray.sh 的
+# _reality_domain_usable_fast —— 它的排除表恰好就是占用 443 的协议全集
+# （hysteria2 走 UDP 不在表内），证书路径解析也与 generate_servers_conf 一致。
+
+# 确保 _reality_domain_usable_fast 可用。必须在 ensure_doh_conf 本体里调用：
+# _doh_candidates 走进程替换、跑在子 shell，那里 source 的模块函数父 shell 看不到。
+_doh_load_xray() {
+    declare -F _reality_domain_usable_fast >/dev/null 2>&1 && return 0
+    declare -F load_module >/dev/null 2>&1 || return 1
+    load_module xray >/dev/null 2>&1 || true
+    declare -F _reality_domain_usable_fast >/dev/null 2>&1
+}
+
+# stdout 每行 "域名<TAB>mode<TAB>protos"。纯查询：不加载模块。
+_doh_candidates() {
+    declare -F _reality_domain_usable_fast >/dev/null 2>&1 || return 0
+
+    local registry d suffix
+    registry=$(get_state "DOMAIN_REGISTRY" "")
+    for d in $registry; do
+        [[ -n "$d" ]] || continue
+        _reality_domain_usable_fast "$d" || continue
+        suffix=$(echo "$d" | tr '.' '_')
+        printf '%s\t%s\t%s\n' "$d" \
+            "$(get_state "DOMAIN_MODE_${suffix}" "direct")" \
+            "$(get_state "DOMAIN_PROTO_${suffix}" "")"
+    done
+}
+
+ensure_doh_conf() {
+    local conf="/etc/nginx/conf.d/doh.conf"
+
+    _doh_load_xray || log_warn "无法加载 xray 模块，DoH 域名探测/校验可能不可用"
+
+    DOH_DOMAIN=$(get_state "DOH_DOMAIN" "")
+    DOH_PATH=$(get_state "DOH_PATH" "")
+
+    # ── 日志目录：刻意【不】放 /var/log/nginx/ ──────────────────
+    # CrowdSec 的 /etc/crowdsec/acquis.d/setup.nginx.yaml 采集
+    # /var/log/nginx/*.log 并按 type: nginx 解析。DoH 日志里每条都带
+    # 访问路径（路径本身就是口令），且家里路由器查询量大，落进采集范围
+    # 既泄露口令、又可能被通用 http 场景判成攻击而把路由器封掉（家里 DNS 全灭）。
+    # 放独立目录 + 独立 logrotate，绕开那个通配。注意 logrotate.d/nginx
+    # 只 glob /var/log/nginx/*.log，本目录必须自带轮转配置，否则无限增长。
+    mkdir -p /var/log/nginx-doh
+    chmod 755 /var/log/nginx-doh
+    chown -R nginx:nginx /var/log/nginx-doh 2>/dev/null || \
+    chown -R www-data:www-data /var/log/nginx-doh 2>/dev/null || true
+
+    # 已配置且文件在 → 幂等：不重写、不打扰，只回显 URL
+    if [[ -n "$DOH_DOMAIN" && -f "$conf" ]]; then
+        log_info "DoH 入口: https://${DOH_DOMAIN}${DOH_PATH}"
+        return 0
+    fi
+
+    log_step "配置 DoH 入口（可选）..."
+
+    # ── 选域名（首次或清空 state 后）────────────────────────
+    if [[ -z "$DOH_DOMAIN" ]]; then
+        local -a _direc=() _cdn=()
+        local _d _m _p _item
+        while IFS=$'\t' read -r _d _m _p; do
+            [[ -n "$_d" ]] || continue
+            if [[ "$_m" == "cdn" ]]; then _cdn+=("${_d}|${_p}"); else _direc+=("${_d}|${_p}"); fi
+        done < <(_doh_candidates)
+
+        if [[ ${#_direc[@]} -eq 0 && ${#_cdn[@]} -eq 0 ]]; then
+            log_warn "未找到可用域名：需「证书已签发」且「TCP/443 SNI 未被 xray/sing-box/naive 占用」"
+            log_warn "  新增方法：Cloudflare 加一条灰云 A 记录指向本机 → 菜单里申请证书"
+            log_warn "  已跳过 DoH 入口（不影响其它组件）"
+            return 0
+        fi
+
+        echo ""
+        echo "  DoH 入口域名（占用 443 的域名不能选：一个 SNI 只能有一个后端）"
+        echo "    0) 不启用"
+        local -A _pick=()
+        local _n=0
+        if [[ ${#_direc[@]} -gt 0 ]]; then
+            echo "    ── 直连域名（不走 CF，延迟低）───────────────────"
+            for _item in "${_direc[@]}"; do
+                _n=$((_n+1)); _pick[$_n]="${_item%%|*}"
+                printf "    %d) %-30s [direct / %s]\n" "$_n" "${_item%%|*}" "${_item##*|}"
+            done
+        fi
+        echo "    ── CDN 域名（经 Cloudflare 中转）────────────────"
+        if [[ ${#_cdn[@]} -gt 0 ]]; then
+            for _item in "${_cdn[@]}"; do
+                _n=$((_n+1)); _pick[$_n]="${_item%%|*}"
+                printf "    %d) %-30s [cdn / %s]\n" "$_n" "${_item%%|*}" "${_item##*|}"
+            done
+        else
+            echo "       （无可用 —— CDN 域通常已被 xhttp/gRPC 占用 443）"
+        fi
+        echo ""
+
+        local _sel
+        while true; do
+            read -rp "  请选择（序号 / 直接输入自定义域名，回车 = 0）: " _sel
+            _sel="${_sel// /}"
+            if [[ -z "$_sel" || "$_sel" == "0" ]]; then
+                log_info "未启用 DoH 入口"
+                return 0
+            fi
+            if [[ "$_sel" =~ ^[0-9]+$ ]]; then
+                [[ -n "${_pick[$_sel]:-}" ]] && { DOH_DOMAIN="${_pick[$_sel]}"; break; }
+                log_warn "序号 ${_sel} 无效，请重选"
+                continue
+            fi
+            _sel="${_sel,,}"
+            if _reality_domain_usable_fast "$_sel"; then
+                DOH_DOMAIN="$_sel"
+                break
+            fi
+            log_warn "域名 ${_sel} 不可用：需证书已签发，且 TCP/443 SNI 未被其它协议占用"
+        done
+        save_state "DOH_DOMAIN" "$DOH_DOMAIN"
+    fi
+
+    # ── 路径：随机生成或手输（仓库里不写死默认值）──────────
+    if [[ -z "$DOH_PATH" ]]; then
+        local _in
+        while true; do
+            read -rp "  访问路径（回车 = 随机生成，须以 / 开头）: " _in
+            if [[ -z "$_in" ]]; then
+                DOH_PATH="/dns-$(openssl rand -hex 6)"
+                break
+            fi
+            if [[ "$_in" == /* && "$_in" != *[!A-Za-z0-9/_.-]* ]]; then
+                DOH_PATH="$_in"
+                break
+            fi
+            log_warn "路径须以 / 开头，且只含字母数字与 / _ . - ，请重输"
+        done
+        save_state "DOH_PATH" "$DOH_PATH"
+    fi
+
+    # ── 证书（复用 generate_servers_conf 的解析方式）────────
+    local root cert_path
+    root=$(printf '%s' "$DOH_DOMAIN" | awk -F. '{print $(NF-1)"."$NF}')
+    cert_path=$(get_state "CERT_PATH_${root//./_}" "")
+    [[ -z "$cert_path" ]] && cert_path="/etc/letsencrypt/live/${root}"
+    if [[ ! -f "${cert_path}/fullchain.pem" ]]; then
+        log_error "证书不存在: ${cert_path}/fullchain.pem，跳过 DoH 入口"
+        DOH_DOMAIN=""
+        return 0
+    fi
+
+    # ── 写 conf.d/doh.conf（独立文件，重配 servers.conf 不会碰它）──
+    cat > "$conf" << CONF
+# ===================================================================
+# /etc/nginx/conf.d/doh.conf — DoH 入口（反代本机 mosdns-x）
+# 由 install.sh 生成；重复执行不会改写本文件。
+# 换域名/路径：清空 state 的 DOH_DOMAIN / DOH_PATH 后重跑本步骤。
+# 443 路由在 nginx.conf 的 stream map 里指向 127.0.0.1:8410。
+# ===================================================================
+
+# 限流 key 必须用 \$final_real_ip，不能用 \$remote_addr：请求经 stream 的
+# SNI 分流从 127.0.0.1:8410 进来，\$remote_addr 对所有人都恒为 127.0.0.1，
+# 一个桶装全部客户端，一触发限流就是全员被拒。
+# \$final_real_ip 的 map 在 /etc/nginx/cloudflare_real_ip.conf，由 nginx.conf:26
+# 加载，早于 conf.d（nginx.conf:109），此处 parse 期可解析。
+limit_req_zone \$final_real_ip zone=doh:10m rate=20r/s;
+
+server {
+    listen 127.0.0.1:8410 ssl proxy_protocol;
+    http2  on;
+    server_name ${DOH_DOMAIN};
+
+    ssl_certificate     ${cert_path}/fullchain.pem;
+    ssl_certificate_key ${cert_path}/privkey.pem;
+
+    server_tokens off;
+
+    location = ${DOH_PATH} {
+        # DoH 只需 GET/POST（RFC 8484）
+        limit_except GET POST { deny all; }
+        # 直连域名（无 Cloudflare 一层），防滥用只能靠这里
+        limit_req zone=doh burst=60 nodelay;
+        client_max_body_size 4k;
+        # 独立目录，避开 CrowdSec 的 /var/log/nginx/*.log 采集（见函数头说明）
+        access_log /var/log/nginx-doh/doh.log main;
+
+        proxy_pass         http://127.0.0.1:15353/dns-query;
+        proxy_http_version 1.1;
+        proxy_set_header   X-Real-IP \$final_real_ip;
+        proxy_set_header   X-Forwarded-For \$final_real_ip;
+        proxy_connect_timeout 5s;
+        proxy_send_timeout    10s;
+        proxy_read_timeout    10s;
+        proxy_buffering    off;
+    }
+
+    location / {
+        return 404;
+    }
+}
+CONF
+
+    # 该目录不在 /etc/logrotate.d/nginx 的 /var/log/nginx/*.log 通配内，
+    # 必须自带轮转，否则无限增长。
+    cat > /etc/logrotate.d/nginx-doh << 'CONF'
+/var/log/nginx-doh/*.log {
+    daily
+    rotate 7
+    missingok
+    notifempty
+    compress
+    delaycompress
+    create 0644 nginx nginx
+    sharedscripts
+    postrotate
+        [ -f /run/nginx.pid ] && kill -USR1 $(cat /run/nginx.pid) 2>/dev/null || true
+    endscript
+}
+CONF
+
+    log_info "DoH 入口已生成: https://${DOH_DOMAIN}${DOH_PATH}"
 }
 
 # ── 生成 00-upstreams.conf ───────────────────────────────────
