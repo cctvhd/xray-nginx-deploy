@@ -659,7 +659,7 @@ preflight_config_check() {
     echo "" >&2
     if (( _PREFLIGHT_FAIL_COUNT > 0 )); then
         echo -e "${RED}[PREFLIGHT]${NC} ${_PREFLIGHT_FAIL_COUNT} 项硬失败${context:+（${context} 阶段）}，已阻止配置生成" >&2
-        echo -e "${RED}[PREFLIGHT]${NC} 修复入口：菜单 → 申请 SSL 证书 → 编辑域名" >&2
+        echo -e "${RED}[PREFLIGHT]${NC} 修复入口：菜单 → 申请 SSL 证书 → 配置域名表" >&2
         return 1
     fi
     if (( _PREFLIGHT_WARN_COUNT > 0 )); then

@@ -173,7 +173,8 @@ rebuild_cf_ini_files() {
 # ════════════════════════════════════════════════════════════
 # 配置事务：cert_txn_begin / cert_txn_commit / _cert_txn_rollback
 #
-# 目标：collect_domains / setup_cf_accounts / add_domain_and_cert
+# 目标：collect_domains / setup_cf_accounts（注：两者目前均无调用点，
+# 故本事务机制当前实际不可达；「配置域名表」流程自身有 _purge_* 兜底，未接事务）
 # 中途被打断时，把 /etc/cloudflare/ 和 /etc/xray-deploy/config.env
 # 完整恢复到事务开始前的状态。
 #
@@ -1039,7 +1040,7 @@ _collect_protocols_from_choices() {
 }
 
 # 当同时选择 xray-xhttp 和 xray-grpc 时，询问用户该域名绑定哪个协议
-# 用于 collect_domains 和 add_domain_and_cert 的协议选择后置处理
+# 用于 collect_domains 的协议选择后置处理（add_domain_and_cert 已随菜单合并移除）
 # 调用方式：protocols=$(_resolve_cdn_proto_split "$domain" "$protocols")
 _resolve_cdn_proto_split() {
     local domain="$1" protocols="$2"
@@ -1857,45 +1858,6 @@ _scan_cf_account_files() {
     done
 }
 
-# ── 判断旧格式账号是否有对应的新格式文件（Token 相同则视为重复）──
-_is_old_cf_dup() {
-    local ini="$1"
-    local bname
-    bname=$(basename "$ini" .ini | sed 's/^cf_account_//')
-    # 只检查旧编号格式
-    [[ "$bname" =~ ^[0-9]+$ ]] || return 1
-    local token
-    token=$(grep 'dns_cloudflare_api_token' "$ini" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-    [[ -z "$token" ]] && return 1
-    for other in "${CF_CONFIG_DIR}"/*.ini; do
-        [[ -f "$other" ]] || continue
-        local obname
-        obname=$(basename "$other" .ini | sed 's/^cf_account_//')
-        # 跳过旧格式文件和自身
-        [[ "$obname" =~ ^[0-9]+$ ]] && continue
-        [[ "$other" == "$ini" ]] && continue
-        local otoken
-        otoken=$(grep 'dns_cloudflare_api_token' "$other" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-        [[ "$otoken" == "$token" ]] && return 0
-    done
-    return 1
-}
-
-# ── 过滤旧格式重复文件 ─────────────────────────────────────
-_filter_dup_cf_accounts() {
-    for f in $(_scan_cf_account_files); do
-        _is_old_cf_dup "$f" && continue
-        echo "$f"
-    done
-}
-
-# ── 从 ini 文件提取 token 预览（前8位…后4位）───────────────────
-_cf_account_label() {
-    local token
-    token=$(grep 'dns_cloudflare_api_token' "$1" 2>/dev/null | cut -d= -f2 | tr -d ' ')
-    echo "${token:0:8}...${token: -4}"
-}
-
 _cf_ini_token() {
     grep 'dns_cloudflare_api_token' "$1" 2>/dev/null | cut -d= -f2 | tr -d ' '
 }
@@ -1907,73 +1869,6 @@ _cf_tokens_match() {
     left_token=$(_cf_ini_token "$left")
     right_token=$(_cf_ini_token "$right")
     [[ -n "$left_token" && "$left_token" == "$right_token" ]]
-}
-
-# ── 新增 Cloudflare 账号 ─────────────────────────────────────
-add_cf_account() {
-    log_step "新增 Cloudflare 账号"
-
-    mkdir -p "$CF_CONFIG_DIR"
-    chmod 700 "$CF_CONFIG_DIR"
-
-    # 显示已有账号
-    local existing
-    existing=$(_filter_dup_cf_accounts)
-    if [[ -n "$existing" ]]; then
-        log_info "已有 CF 账号（如需新增请退出后选择选项2）："
-        for f in $existing; do
-            local label base
-            base=$(basename "$f" .ini)
-            label=$(_cf_account_label "$f")
-            echo "  [${base}] $(basename "$f")  |  ${label}"
-        done
-        echo ""
-    fi
-
-    local cf_root cf_token
-    read -rp "该账号管理的根域名（如 zhongning.tk）: " cf_root
-    cf_root="${cf_root,,}"
-    [[ -z "$cf_root" ]] && { log_error "根域名不能为空"; return 1; }
-
-    local filebase
-    filebase=$(domain_to_ini_name "$cf_root")
-    local ini_file="${CF_CONFIG_DIR}/${filebase}.ini"
-
-    # 根域名重复检测
-    local existing_owner ow
-    existing_owner=$(find_root_domain_owner_file "$cf_root" || true)
-    if [[ -n "$existing_owner" ]]; then
-        log_warn "根域名 ${cf_root} 已关联账号 [$(basename "$existing_owner" .ini)]"
-        read -rp "  是否覆盖现有关联？[y/N]: " ow
-        if [[ "${ow,,}" != "y" ]]; then
-            log_info "已取消，未修改任何文件"
-            return 1
-        fi
-    fi
-
-    if ! prompt_cf_token "请输入 CF API Token" "$cf_root" "$ini_file"; then
-        log_error "新增 CF 账号已放弃，未写入任何文件"
-        return 1
-    fi
-    cf_token="$PROMPT_CF_TOKEN_RESULT"
-
-    # 若该 token 已存在于其他 ini，直接复用，避免同内容重复文件
-    local _dup_src
-    _dup_src=$(find_cf_token_owner_file "$cf_token" "$ini_file" || true)
-    if [[ -n "$_dup_src" ]]; then
-        cp "$_dup_src" "$ini_file"
-        log_info "Token 已存在于 $(basename "$_dup_src")，复用为 ${filebase}.ini"
-    else
-        cat > "$ini_file" << INI
-# Cloudflare API Token — ${cf_root}
-dns_cloudflare_api_token = ${cf_token}
-INI
-    fi
-    chmod 600 "$ini_file"
-
-    rebuild_cf_ini_files
-    save_domain_config
-    log_info "新账号已保存为 ${filebase}.ini"
 }
 
 # ── 根据根域名反查 CF 账号 ───────────────────────────────────
@@ -2015,186 +1910,6 @@ get_cf_account_by_domain() {
     done
 
     echo "$matched_file"
-}
-
-# ── 新增域名并申请证书 ───────────────────────────────────────
-add_domain_and_cert() {
-    log_step "新增域名并申请证书"
-
-    cert_txn_begin "add_domain_and_cert"
-
-    load_domain_state
-    load_domain_config >/dev/null 2>&1 || true
-
-    # 显示当前域名
-    echo ""
-    log_info "当前已有域名："
-    local registry
-    registry=$(get_state "DOMAIN_REGISTRY")
-    if [[ -n "$registry" ]]; then
-        for d in $registry; do
-            local suffix mode protos
-            suffix=$(echo "$d" | tr '.' '_')
-            mode=$(get_state "DOMAIN_MODE_${suffix}")
-            protos=$(get_state "DOMAIN_PROTO_${suffix}")
-            echo "  $d  [${mode} / ${protos}]"
-        done
-    else
-        echo "  （暂无）"
-    fi
-
-    # 循环添加域名
-    local new_domains=()
-
-    while true; do
-        echo ""
-        local domain protocols mode root_domain cf_choice
-        local is_existing=false current_mode="" current_protos=""
-
-        read -rp "请输入新域名（留空结束）: " domain
-        domain="${domain,,}"
-        [[ -z "$domain" ]] && break
-
-        if domain_is_registered "$domain"; then
-            local suffix
-            suffix=$(echo "$domain" | tr '.' '_')
-            current_mode=$(get_state "DOMAIN_MODE_${suffix}" "direct")
-            current_protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
-            log_warn "域名 $domain 已存在 [mode=$current_mode, proto=$current_protos]"
-            local edit_confirm
-            read -rp "  是否修改其配置？[y/N]: " edit_confirm
-            if [[ "${edit_confirm,,}" != "y" ]]; then
-                log_info "已跳过 $domain"
-                continue
-            fi
-            is_existing=true
-            log_info "进入编辑模式（协议将追加，mode 可改）"
-        fi
-
-        # ── 多选协议 ──
-        echo ""
-        echo "  请为 $domain 选择协议（多选，空格分隔序号）："
-        _print_protocol_menu
-        local choices
-        read -rp "  输入序号如: 1 4: " choices
-
-        protocols=$(_collect_protocols_from_choices "$choices")
-        [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
-
-        if [[ "$is_existing" == "true" ]]; then
-            protocols=$(merge_domain_protocols "$current_protos" "$protocols")
-        fi
-        protocols=$(_resolve_cdn_proto_split "$domain" "$protocols")
-        [[ -z "$protocols" ]] && { log_warn "未选择协议，跳过"; continue; }
-
-        # ── 连接方式自动推导（编辑场景同样按当前协议列表推导，不再询问）──
-        mode=$(_derive_mode_from_protocols "$protocols")
-        if [[ "$is_existing" == "true" && "$mode" != "$current_mode" ]]; then
-            log_info "连接方式由 ${current_mode} → ${mode}（按协议自动推导）"
-        else
-            log_info "推导连接方式: ${mode}"
-        fi
-
-        if ! _check_protocol_slot_conflict "$domain" "$protocols"; then
-            continue
-        fi
-
-        if [[ "$is_existing" != "true" ]]; then
-            # ── 关联 CF 账号（自动匹域名 → 手动选）─────────────
-            root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-            local _ini_base _ini_file _matched_ini=() _auto_ini
-            _ini_base=$(domain_to_ini_name "$root_domain")
-            _ini_file="${CF_CONFIG_DIR}/${_ini_base}.ini"
-
-            if [[ -f "$_ini_file" ]]; then
-                # 精确匹配成功
-                _auto_ini="$_ini_file"
-                log_info "已自动匹配 CF 账号: $(basename "$_auto_ini")"
-            else
-                # 模糊匹配：扫描所有 ini（排除 domain_ 映射文件），找出包含根域的文件
-                for _f in "${CF_CONFIG_DIR}"/*.ini; do
-                    [[ -f "$_f" ]] || continue
-                    [[ "$(basename "$_f")" == domain_* ]] && continue
-                    [[ "$(basename "$_f")" == *"${_ini_base}"* ]] && _matched_ini+=("$_f")
-                done
-
-                if [[ ${#_matched_ini[@]} -eq 1 ]]; then
-                    _auto_ini="${_matched_ini[0]}"
-                    log_info "已自动匹配 CF 账号: $(basename "$_auto_ini")"
-                else
-                    # 匹配不到或有多于一个候选，展示列表让手动选择
-                    echo ""
-                    log_info "可用 CF 账号："
-                    for _f in "${CF_CONFIG_DIR}"/*.ini; do
-                        [[ -f "$_f" ]] || continue
-                        [[ "$(basename "$_f")" == domain_* ]] && continue
-                        local _lb _b
-                        _b=$(basename "$_f" .ini | sed 's/^cf_account_//')
-                        _lb=$(_cf_account_label "$_f")
-                        echo "  [${_b}] $(basename "$_f")  (token: ${_lb})"
-                    done
-                    local cf_choice _src_ini
-                    read -rp "输入方括号内标识选择 CF 账号: " cf_choice
-                    [[ -z "$cf_choice" ]] && { log_error "未选择账号"; _cert_txn_rollback 0; return 1; }
-
-                    _src_ini="${CF_CONFIG_DIR}/${cf_choice}.ini"
-                    [[ -f "$_src_ini" ]] || _src_ini="${CF_CONFIG_DIR}/cf_account_${cf_choice}.ini"
-
-                    [[ -f "$_src_ini" ]] || {
-                        log_error "CF 账号文件不存在: ${_src_ini}"
-                        _cert_txn_rollback 0
-                        return 1
-                    }
-                    _auto_ini="$_src_ini"
-                fi
-            fi
-
-            # 复制到 domain_ 映射文件以供后续证书申请使用
-            local _dom_ini_base
-            _dom_ini_base=$(domain_to_ini_name "$root_domain")
-            cp "$_auto_ini" "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
-            chmod 600 "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
-            sed -i '/^[[:space:]]*dns_cloudflare_email/d' "${CF_CONFIG_DIR}/domain_${_dom_ini_base}.ini"
-        fi
-
-        # 注册域名
-        register_domain "$domain" "$mode" "$protocols"
-        [[ "$is_existing" == "false" ]] && new_domains+=("$domain")
-        log_info "已更新: $domain [mode=$mode, proto=$protocols]"
-
-        # ── 继续询问 ──
-        local more
-        read -rp "继续添加更多域名？[Y/n]: " more
-        [[ "${more,,}" == "n" ]] && break
-        echo ""
-    done
-
-    # 重建并持久化
-    rebuild_protocol_domains
-    load_domain_state
-    save_domain_config
-
-    # 域名/账号配置已落盘 → 提交事务
-    # 证书申请失败不应回滚已配置的域名（可后续单独重申）
-    cert_txn_commit
-
-    # ── 为所有新域名申请证书（复用 request_certificates，含重试/限流检测/状态跟踪）──
-    if [[ ${#new_domains[@]} -gt 0 ]]; then
-        local _saved_all=("${ALL_DOMAINS[@]}")
-        local _root _seen_roots=()
-        ALL_DOMAINS=()
-        for domain in "${new_domains[@]}"; do
-            _root=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
-            [[ " ${_seen_roots[*]} " != *" ${_root} "* ]] && ALL_DOMAINS+=("$_root") && _seen_roots+=("$_root")
-        done
-        request_certificates
-        ALL_DOMAINS=("${_saved_all[@]}")
-    fi
-
-    # 自动配置续期
-    setup_auto_renew
-
-    log_info "域名添加完成: ${#new_domains[@]} 个"
 }
 
 # ── 本机公网 IPv4（best-effort；全空则跳过"指向本机"标注）───
@@ -3084,79 +2799,34 @@ run_cert() {
     # 自动迁移旧格式 CF 账号文件
     migrate_cf_account_files
 
-    # 子菜单
+    # 子菜单（2026-09-30 由 6 项并为 3 项：新增 CF 账号 / 新增域名 / 补证书
+    # 原本是三条独立的交互式流程，与配置表完全平行；现已全部由「配置域名表」
+    # 按表内容自动判定，且填完表自动级联重建下游。旧序号 2/3/4 的输入会落到
+    # `*`（=配置域名表），对用户仍是"改域名"的语义；唯一歧义是 2 号从
+    # "新增 CF 账号"变成了"更新 Certbot"。）
     echo ""
     echo "  请选择操作："
-    echo "  1. 首次完整配置（CF账号 + 域名 + 申请证书）"
-    echo "  2. 新增 Cloudflare 账号"
-    echo "  3. 新增域名并申请证书（复用已有CF账号）"
-    echo "  4. 仅补申请证书（域名已配置）"
-    echo "  5. 检查/更新 Certbot 及 DNS 插件"
-    echo "  6. 刷新/修复域名协议分配"
+    echo "  1. 配置域名表（填表 → 自动处理新增CF账号/新增域名/补证书，并重建下游）"
+    echo "  2. 检查/更新 Certbot 及 DNS 插件"
+    echo "  3. 刷新/修复域名协议分配"
     echo ""
-    read -rp "  请选择 [1-6，默认1]: " cert_choice
+    read -rp "  请选择 [1-3，默认1]: " cert_choice
     cert_choice="${cert_choice:-1}"
 
     case "$cert_choice" in
         2)
-            install_certbot
-            add_cf_account
-            log_info "新增 CF 账号完成，继续添加域名..."
-            add_domain_and_cert
-            log_info "重新生成 Nginx 配置..."
-            do_conf_nginx 2>/dev/null || {
-                log_warn "Nginx 配置生成失败，请手动执行步骤 9"
-            }
-            return
-            ;;
-        3)
-            install_certbot
-            add_domain_and_cert
-            log_info "========== 新增域名完成 =========="
-            do_conf_nginx 2>/dev/null || {
-                log_warn "Nginx 配置生成失败，请手动执行步骤 9"
-            }
-            return
-            ;;
-        5)
             update_certbot_deps
             return
             ;;
-        6)
+        3)
             refresh_domain_assignments
-            return
-            ;;
-        4)
-            install_certbot
-            # 从 state 恢复域名（domain_map.conf 可能不存在或过期）
-            XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
-            GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
-            REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
-            ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
-            NAIVE_DOMAIN=$(get_state "NAIVE_DOMAIN")
-            HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
-            ALL_DOMAINS=(); CDN_DOMAINS=(); DIRECT_DOMAINS=()
-            local _all _cdn _direct
-            _all=$(get_state "ALL_DOMAINS")
-            _cdn=$(get_state "CDN_DOMAINS")
-            _direct=$(get_state "DIRECT_DOMAINS")
-            [[ -n "$_all"    ]] && read -ra ALL_DOMAINS    <<< "$_all"
-            [[ -n "$_cdn"    ]] && read -ra CDN_DOMAINS    <<< "$_cdn"
-            [[ -n "$_direct" ]] && read -ra DIRECT_DOMAINS <<< "$_direct"
-            if [[ ${#ALL_DOMAINS[@]} -eq 0 ]]; then
-                log_error "未找到域名配置，请先执行首次完整配置"
-                return 1
-            fi
-            request_certificates
-            setup_auto_renew
-            log_info "========== 证书申请完成 =========="
             return
             ;;
         1|*)
             ;;
     esac
 
-    # ── 选项 1（默认）：首次完整配置 ──
+    # ── 选项 1（默认）：配置域名表 ──
 
     # 1. 安装 certbot
     install_certbot
@@ -3178,17 +2848,40 @@ run_cert() {
     load_domain_state
     OLD_DOMAINS=("${ALL_DOMAINS[@]}")
 
+    # 快照各协议槽位域名，供步骤 12 判断是否需要级联重建下游配置。
+    # 与 refresh_domain_assignments 同款范式（读 state 文件而非内存变量）。
+    local -a _slot_names=(XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN XHTTP_REALITY_DOMAIN ANYTLS_DOMAIN HYSTERIA2_DOMAIN NAIVE_DOMAIN)
+    local -A _before_dom=()
+    local _sn
+    for _sn in "${_slot_names[@]}"; do
+        _before_dom[$_sn]=$(get_state "$_sn" "")
+    done
+
+    # 表格前后各取一次指纹，用来区分「按 S 保存了改动」与「按 Q 什么都没写」。
+    # 注意 edit_nodes.py 只在按 S 时写文件，按 Q/^C 一个字节都不写。
+    TSV_FILE="${edit_nodes_dir}/.config.tsv"
+    local _tsv_before=""
+    [[ -f "$TSV_FILE" ]] && _tsv_before=$(md5sum "$TSV_FILE" 2>/dev/null | cut -d' ' -f1)
+
     python3 "$edit_nodes_script" "$edit_nodes_dir"
-    # 编辑后，用户按 S 保存并退出，或按 Q 放弃退出
-    # 我们继续处理已保存的配置（如果用户放弃，则视为无更改）
+    # 编辑后，用户按 S 保存并退出，或按 Q 放弃退出。
 
     # 3. 解析 edit_nodes.py 生成的配置并更新 Cloudflare 账号和域名设置
-    TSV_FILE="${edit_nodes_dir}/.config.tsv"
     if [[ ! -f "$TSV_FILE" ]]; then
         log_error "未找到配置表 $TSV_FILE"
         log_error "  编辑界面里按 S 才会写出该文件；按 Q/^C 退出则不写（属正常）。"
         log_error "  要配置域名请重跑本项，在界面里填好并按 S 保存。"
         return 1
+    fi
+
+    # 表已存在且按 Q 退出（内容与进来时逐字节相同）→ 沿用现有表继续往下走。
+    # 这正是原「仅补申请证书」菜单项的用法：只想补证书、不想改表时按 Q 即可。
+    # 旧代码在这里直接 return 1 报错，把该用法打死了，与下面注释「视为无更改」
+    # 也自相矛盾。按 S 无改动与按 Q 内容相同，两者无法也不必区分。
+    local _tsv_after
+    _tsv_after=$(md5sum "$TSV_FILE" 2>/dev/null | cut -d' ' -f1)
+    if [[ -n "$_tsv_before" && "$_tsv_before" == "$_tsv_after" ]]; then
+        log_info "配置表未改动，沿用现有表继续"
     fi
 
     # 初始化
@@ -3301,6 +2994,16 @@ run_cert() {
         ((row++))
     done < "$TSV_FILE"
 
+    # 3b-0. 空表护栏：_purge_stale_domains 没有空表保护，_keep 为空时会把
+    # OLD_DOMAINS 全部判为陈旧 → 清 DOMAIN_REGISTRY、删 domain_*.ini、
+    # certbot delete 删掉所有证书。合并后「配置域名表」是唯一入口，手滑清空
+    # 域名列的概率大增，所以宁可在此中止（不写任何配置/证书），也不静默自毁。
+    if (( ${#_tsv_domains[@]} == 0 )); then
+        log_error "配置表里一个域名都没有，疑似误清空，已中止（未改动任何配置/证书）"
+        log_error "  确实要停用全部域名请走 主菜单 u（卸载/清理）；只改协议请保留域名列。"
+        return 1
+    fi
+
     # 3b. 清理已从配置表移除的陈旧域名（注册表 + 标签 + domain ini + 证书）
     _purge_stale_domains "${_tsv_domains[@]}"
 
@@ -3409,6 +3112,40 @@ EOF
 
     # 11. 配置自动续期
     setup_auto_renew
+
+    # 12. 级联重建下游配置（照抄 refresh_domain_assignments 的槽位 diff 范式）。
+    # 配置表改了域名/协议/模式后，Nginx(SNI map/servers.conf/伪装 webroot)、Xray、
+    # Sing-Box、Naive、Hysteria2、Unbound 域名清单、客户端订阅都得跟着重生成，
+    # 否则证书换了新域、服务端却还在用旧域。原来只有旧菜单 2/3 末尾调了一次
+    # do_conf_nginx，且不覆盖 Xray 等 —— 现在统一走这个通用入口（它内部已含
+    # do_conf_nginx 全量），不必再单独调。
+    local -a _changed_slots=()
+    for _sn in "${_slot_names[@]}"; do
+        if [[ "${_before_dom[$_sn]:-}" != "$(get_state "$_sn" "")" ]]; then
+            _changed_slots+=("$_sn")
+        fi
+    done
+
+    if (( ${#_changed_slots[@]} == 0 )); then
+        log_info "域名分配无变化，跳过配置级联重建（幂等）"
+    else
+        echo ""
+        log_warn "检测到域名分配变化，触发相关配置级联重建："
+        local -A _slot_tag=( [XHTTP_DOMAIN]=xhttp     [GRPC_DOMAIN]=grpc \
+                             [REALITY_DOMAIN]=reality [XHTTP_REALITY_DOMAIN]=xhttp-reality \
+                             [ANYTLS_DOMAIN]=anytls \
+                             [HYSTERIA2_DOMAIN]=hysteria2 [NAIVE_DOMAIN]=naive )
+        local _ch
+        for _ch in "${_changed_slots[@]}"; do
+            printf "  %-16s %s → %s\n" "${_ch}" "${_before_dom[$_ch]:-<空>}" "$(get_state "$_ch" "")"
+        done
+
+        local -a _changed_tags=()
+        for _ch in "${_changed_slots[@]}"; do
+            _changed_tags+=("${_slot_tag[$_ch]}")
+        done
+        regen_after_domain_change "${_changed_tags[@]}"
+    fi
 
     log_info "========== SSL 证书模块完成 =========="
     echo ""
