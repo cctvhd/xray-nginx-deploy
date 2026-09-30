@@ -581,6 +581,7 @@ _mosdns_menu_installed() {
     echo ""
     echo "  1. 配置 DoH 入口（更换域名 / 访问路径）"
     echo "  2. 重装 mosdns-x 并重启服务（改过 config.yaml 后用它）"
+    echo "  3. 检查更新（比对 GitHub 最新发布版）"
     echo "  0. 返回"
     echo ""
 
@@ -601,9 +602,50 @@ _mosdns_menu_installed() {
             verify_mosdns || log_warn "mosdns-x 自检未通过，请查 journalctl -u mosdns -n 50"
             return 0
             ;;
+        3)
+            _mosdns_check_update
+            return $?
+            ;;
         0) log_info "未做任何改动"; return 0 ;;
         *) log_warn "无效选择，未做任何改动"; return 0 ;;
     esac
+}
+
+# ── 更新：比对 GitHub 最新发布号 ─────────────────────────────
+# ⚠️ 两边都取 tag 的数字部分（本机取 build time），不能拿二进制自报的 v4.6.0
+# 去比 —— 那样永远判「有新版」，而下载回来的其实一模一样。
+# 自己解析而不是调 install.sh 的 upgrade_github_latest：模块不能依赖 install.sh
+# 里后加的函数（两条独立更新通道，缓存里的模块可能比 install.sh 新，见 CLAUDE.md）。
+_mosdns_latest_version() {
+    curl -fsSL --max-time 15 "https://api.github.com/repos/${MOSDNS_REPO}/releases/latest" 2>/dev/null \
+        | grep -oP '"tag_name"\s*:\s*"\K[^"]+' \
+        | head -1 \
+        | grep -oP '[0-9]+(\.[0-9]+)+'
+}
+
+# 更新只换二进制 + 重写 unit + 重启，**绝不碰 config.yaml**（同升级菜单的禁忌）。
+_mosdns_check_update() {
+    local cur latest
+    cur=$(mosdns_build_version)
+    latest=$(_mosdns_latest_version)
+    if [[ -z "$latest" ]]; then
+        log_error "无法获取 ${MOSDNS_REPO} 最新版本号（网络不通或 GitHub API 限速）"
+        return 1
+    fi
+    log_info "mosdns-x: 当前=${cur:-未知} 最新=${latest}"
+    if [[ -n "$cur" && "$cur" == "$latest" ]]; then
+        log_info "已是最新，无需更新"
+        return 0
+    fi
+    local ans
+    read -rp "  更新到 ${latest}？（会重启 mosdns 服务，家里解析瞬断）[y/N]: " ans
+    [[ "${ans,,}" == "y" ]] || { log_info "已取消，未做改动"; return 0; }
+    install_mosdns_binary --force || return 1
+    generate_mosdns_service || return 1
+    start_mosdns || return 1
+    verify_mosdns || log_warn "mosdns-x 自检未通过，请查 journalctl -u mosdns -n 50"
+    log_info "mosdns-x 已更新到 ${latest}"
+    return 0
 }
 
 # ── 模块入口 ─────────────────────────────────────────────────
