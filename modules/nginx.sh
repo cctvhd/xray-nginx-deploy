@@ -1367,6 +1367,83 @@ CONF
     log_info "DoH 入口已生成: https://${DOH_DOMAIN}${DOH_PATH}"
 }
 
+# ── DoH 入口自检（由 reload_nginx 在重启后调用）────────────────
+# 为什么需要：这个入口最危险的故障模式是【静默】的 —— 配置生成成功、
+# nginx 重启成功、脚本一路报成功，而 443 上这个域其实落到了 default
+# 陷阱端口/伪装站（SNI map 缺条目），或打到了没装 mosdns-x 的后端。
+# 用户侧表现为「家里 DNS 全挂」，服务端侧看起来一切正常。
+# 实测过的两种失败外观：
+#   · 路由没生效 → HTTP/1.1 + text/html（落到了伪装站）
+#   · 后端没起   → HTTP/2  + 502
+# 所以判据用 http_version/content_type，不用 HTTP 状态码。
+# 从 127.0.0.1 连 443、不直连 8410：8410 要 proxy_protocol，直连必然失败，
+# 且只有走 443 才真正经过那张会静默出错的 SNI map。
+verify_doh_entry() {
+    local domain path
+    domain=$(get_state 'DOH_DOMAIN' '')
+    path=$(get_state 'DOH_PATH' '')
+
+    # 未启用 DoH → 静默通过（绝大多数机器走这条，不留噪音）
+    [[ -z "$domain" ]] && return 0
+
+    if [[ ! -f /etc/nginx/conf.d/doh.conf ]]; then
+        log_error "DoH 自检失败：state 里有 DOH_DOMAIN='${domain}'，但 /etc/nginx/conf.d/doh.conf 不存在"
+        log_error "  443 上该域没有对应的 server 块。重跑「配置 Nginx」重新生成入口。"
+        return 1
+    fi
+
+    # ① 先确定性地断言 SNI map 里有这条路由。
+    # 放在 curl 之前，因为这是本功能唯一会【静默】出错的环节，而它的判定
+    # 不依赖网络结果 —— 反过来说，路由缺失时 curl 只会给出 000 或「打到了
+    # 别处」这类模糊结果，照着那个报错去查会查错方向（实测踩过：报成
+    # 「443 无响应」，真因是 map 里少了这一行）。
+    if ! awk -v d="$domain" '$1==d && $2=="127.0.0.1:8410;"{f=1} END{exit !f}' \
+         /etc/nginx/nginx.conf; then
+        log_error "DoH 自检失败：nginx.conf 的 stream SNI map 里没有这条路由"
+        log_error "      ${domain}       127.0.0.1:8410;"
+        log_error "  443 上该域会落到 default 陷阱端口 —— DoH 全断，而其它步骤全部正常。"
+        log_error "  修：重跑「配置 Nginx」（generate_sni_map 会从 state 补回该条目并重启）"
+        return 1
+    fi
+
+    if ! command -v curl >/dev/null 2>&1; then
+        log_warn "DoH 自检：SNI 路由已确认存在，但本机无 curl，无法确认端到端是否真的通"
+        return 0
+    fi
+
+    # ② 端到端探一次。走 443 的 SNI 正路，顺带验证证书与后端。
+    local out http_ver ctype code
+    out=$(curl -s -o /dev/null --noproxy '*' --max-time 10 \
+              --resolve "${domain}:443:127.0.0.1" \
+              -H 'accept: application/dns-message' \
+              -w '%{http_version} %{content_type} %{http_code}' \
+              "https://${domain}${path}?dns=AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB" \
+          2>/dev/null) || out=""
+    read -r http_ver ctype code <<<"$out"
+
+    # 健康：HTTP/2 + application/dns-message（实测 RFC 8484 示例查询）
+    if [[ "$ctype" == application/dns-message* ]]; then
+        log_info "DoH 自检通过: https://${domain}${path} → HTTP/${http_ver} + application/dns-message"
+        return 0
+    fi
+
+    # 502/504 → SNI 路由通、TLS 通，只是后端没起。本仓库不含 mosdns-x 安装
+    # （需另装并监听 127.0.0.1:15353），新机器上这是预期状态，故只告警不失败。
+    if [[ "$code" == "502" || "$code" == "504" ]]; then
+        log_warn "DoH 自检：入口已通，但后端 127.0.0.1:15353 无响应（HTTP ${code}）"
+        log_warn "  需另装 mosdns-x 并监听 15353；未装前该入口不可用（新机器上属预期）"
+        return 0
+    fi
+
+    log_error "DoH 自检失败：${domain} 的 443 没有落到 DoH 入口"
+    log_error "  实到 HTTP/${http_ver:-<无响应>} + ${ctype:-<无>}（HTTP ${code:-000}）"
+    log_error "  应为 HTTP/2 + application/dns-message。查："
+    log_error "    ss -lntp | grep -E ':443|:8410'        443/8410 是否在听"
+    log_error "    cscli decisions list                    是否被 CrowdSec 封了"
+    log_error "    nginx -T | grep -A2 'map .*ssl_preread' 该域是否被别的条目先匹配"
+    return 1
+}
+
 # ── 生成 00-upstreams.conf ───────────────────────────────────
 generate_upstreams_conf() {
     log_step "生成 upstream 配置..."
@@ -2065,6 +2142,16 @@ reload_nginx() {
         log_error "Nginx 配置验证失败，请检查配置文件"
         nginx -t
         exit 1
+    fi
+
+    # DoH 入口自检。放在这里是因为本函数是所有会重写 nginx.conf 的路径的
+    # 唯一汇合点（install.sh 的「配置 Nginx」/全量安装、modules/sync.sh 的
+    # 模块热更新、run_nginx），挂这一处就全覆盖，不必逐个调用点补。
+    # 必须在 restart 之后：SNI map 是 nginx.conf 的一部分，重启前跑等于探旧配置。
+    # 注：未启用 DoH 时本函数立即返回 0，不产生任何输出。
+    if declare -F verify_doh_entry >/dev/null; then
+        verify_doh_entry || \
+            log_error "DoH 入口不可用（上面有具体原因）；其余组件不受影响，但家里的 DoH 解析会是断的"
     fi
 }
 
