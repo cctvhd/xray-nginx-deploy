@@ -87,6 +87,35 @@ log_warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 log_error() { echo -e "${RED}[ERROR]${NC} $*"; }
 log_step()  { echo -e "${CYAN}[STEP]${NC} $*"; }
 
+# ── 表格渲染（东亚宽度感知）────────────────────────────────
+# stdin 每行 = \x01 分隔的单元格（$1 = 逗号分隔的各列显示宽度）；
+# 单行内容恰为 __RT_SEP__ 时输出一条 ─ 分隔线（按同样列宽）。
+# ⚠️ 为什么不用 printf "%-20s"：printf 按**字符数**补空格，而中文/全角符号在终端
+#    占 2 列 —— 表头（多为中文）与数据行（多为 ASCII）从第二列起就差几个字符，
+#    分隔线也长短不一，整张表是歪的。表格的全部价值在对齐，歪了等于没排。
+#    本函数按真实显示宽度补空格，中英混排一律对齐（edit_nodes.py 的 cw()/wlen() 同理）。
+# 依赖 python3（配置表编辑器 edit_nodes.py 本就要求它）。
+render_table() {
+    local _spec="$1"
+    python3 -c '
+import sys, unicodedata
+spec = [int(x) for x in sys.argv[1].split(",")]
+def w(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+out = sys.stdout
+for line in sys.stdin:
+    line = line.rstrip("\n")
+    if line == "__RT_SEP__":
+        cells = ["─" * n for n in spec]
+    else:
+        cells = []
+        for i, c in enumerate(line.split("\x01")):
+            n = spec[i] if i < len(spec) else 0
+            cells.append(c + " " * max(0, n - w(c)))
+    out.write("  " + " ".join(cells).rstrip() + "\n")
+' "$_spec"
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         log_error "请使用 root 权限运行此脚本"
@@ -1708,9 +1737,15 @@ show_domain_allocation() {
 
     echo -e "${BLUE}==========================================${NC}"
     echo "  [域名分配]  CDN=走 Cloudflare / 直连=指向服务器 IP"
+    # 走 render_table 而非 printf %-24s：模式列 [CDN] 与 [直连] 宽度不同（3 vs 4 显示列），
+    # printf 会让「承载协议」列错开一格（同 cert.sh 的协议一览，见 render_table 注释）。
+    local -a _dbody=()
+    _dbody+=("$(printf '%s\x01%s\x01%s' "域名" "模式" "承载协议")")
+    _dbody+=("__RT_SEP__")
     for d in "${doms[@]}"; do
-        printf "  %-24s [%s] %s\n" "$d" "${mode[$d]}" "${role[$d]}"
+        _dbody+=("$(printf '%s\x01%s\x01%s' "$d" "[${mode[$d]}]" "${role[$d]}")")
     done
+    printf '%s\n' "${_dbody[@]}" | render_table "26,8,22"
 
     # 公共 SNI 的 xhttp-Reality 不占自有域名，单列说明避免误以为漏配置
     if [[ -n "${xr_sni:-}" && -z "${xr_dom:-}" ]]; then
@@ -1726,13 +1761,17 @@ show_domain_allocation() {
         [[ -n "${root_done[$root]:-}" ]] && continue
         root_done["$root"]=1
         cert="/etc/letsencrypt/live/${root}/fullchain.pem"
+        # 本子表两列都是 ASCII，printf 的字符数=显示列数，本就对齐，故不走 render_table
+        # （第三列含 ANSI 颜色，交给 render_table 反而要把转义序列算进宽度）。
+        # 但「未申请/读取失败」行原先只印两列，状态挤进到期日那一列、与其它行错开 ——
+        # 这里补一个占位列（用 ASCII "-"，em dash 在中英混排里宽度不确定）让它对齐。
         if [[ ! -f "$cert" ]]; then
-            printf "  %-16s  %s\n" "*.${root}" "未申请"
+            printf "  %-16s  %-10s  %s\n" "*.${root}" "-" "未申请"
             continue
         fi
         expiry=$(openssl x509 -enddate -noout -in "$cert" 2>/dev/null | cut -d= -f2)
         if [[ -z "$expiry" ]]; then
-            printf "  %-16s  %s\n" "*.${root}" "读取失败"
+            printf "  %-16s  %-10s  %s\n" "*.${root}" "-" "读取失败"
             continue
         fi
         exp_ep=$(date -d "$expiry" +%s 2>/dev/null || echo 0)

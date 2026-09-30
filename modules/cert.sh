@@ -2082,14 +2082,16 @@ scan_cf_domain_inventory() {
 print_domain_protocol_overview() {
     echo ""
     log_info "协议 ↔ 域名 一览："
-    printf "  %-16s %-30s %s\n" "协议槽位" "域名 / 当前 SNI" "备注"
-    printf "  %-16s %-30s %s\n" "────────────────" "──────────────────────────────" "────────────"
 
+    # 行序**刻意与配置表一致**（edit_nodes.py 的 data 常量：xhttp / grpc /
+    # xhttp-reality / reality / AnyTLS / Hysteria2 / Naiveproxy），下面的「表行」
+    # 列就是那张表 1-7 行的行号 —— 用户看一眼就知道该改哪一行，不用在两张表之间对名字。
+    # （打印序原为 Reality 在前、XHTTP-Reality 在后，与表相反，已按表序调整。）
     local -a _rows=(
         "VLESS-XHTTP|XHTTP_DOMAIN|"
         "gRPC-CDN|GRPC_DOMAIN|"
-        "VLESS-Reality|REALITY_DOMAIN|REALITY_SNI"
         "XHTTP-Reality|XHTTP_REALITY_DOMAIN|XHTTP_REALITY_SNI"
+        "VLESS-Reality|REALITY_DOMAIN|REALITY_SNI"
         "AnyTLS|ANYTLS_DOMAIN|"
         "Hysteria2|HYSTERIA2_DOMAIN|"
         "NaiveProxy|NAIVE_DOMAIN|"
@@ -2104,28 +2106,42 @@ print_domain_protocol_overview() {
     done
 
     local -a _unconf=()
-    local _label _rest _var _snk _sni _note
+    local _label _rest _var _snk _sni _note _row_no
+    # 表格先攒进数组、再一次性交给 render_table：**不能**写成 `{ ... } | render_table`——
+    # 那会让整个生成循环跑在子 shell 里，`_unconf+=()` 出了管道就没了（下面「尚未配置」
+    # 那行提示会永远为空）。同理各 printf 都是命令替换，只影响自身。
+    local -a _body=()
+    _body+=("$(printf '表行\x01%s\x01%s\x01%s' "协议槽位" "域名 / 当前 SNI" "备注")")
+    _body+=("__RT_SEP__")
+    _row_no=0
     for _r in "${_rows[@]}"; do
+        _row_no=$(( _row_no + 1 ))
         _label="${_r%%|*}"; _rest="${_r#*|}"
         _var="${_rest%%|*}"; _snk="${_rest#*|}"
         _d=$(get_state "$_var" "")
         if [[ -n "$_d" ]]; then
             _note="✓"
             (( ${_usage[$_d]:-0} > 1 )) && _note="✓ 共用"
-            printf "  %-16s %-30s %s\n" "$_label" "$_d" "$_note"
+            _body+=("$(printf '%s\x01%s\x01%s\x01%s' "$_row_no" "$_label" "$_d" "$_note")")
         else
             _sni=""
             [[ -n "$_snk" ]] && _sni=$(get_state "$_snk" "")
             if [[ -n "$_sni" ]]; then
-                # Reality 槽借公共大站 SNI = 合法配置态，非缺口；自建与否由菜单 11/x 决策
-                # （5→6 只管预分配）。仅真正「无域无 SNI」的槽才是未配置。
-                printf "  %-16s %-30s %s\n" "$_label" "(借公共 SNI: ${_sni})" "公共伪装"
+                # Reality 槽借公共大站 SNI = 合法配置态，非缺口；自建与否由配置表第 3/4 行
+                # 决定（见 collect_reality_params）。仅真正「无域无 SNI」的槽才是未配置。
+                _body+=("$(printf '%s\x01%s\x01%s\x01%s' "$_row_no" "$_label" "(借公共 SNI: ${_sni})" "公共伪装")")
             else
-                printf "  %-16s %-30s %s\n" "$_label" "(未配置)" "—"
+                _body+=("$(printf '%s\x01%s\x01%s\x01%s' "$_row_no" "$_label" "(未配置)" "—")")
                 _unconf+=("$_label")
             fi
         fi
     done
+    printf '%s\n' "${_body[@]}" | render_table "6,16,34,10"
+
+    echo ""
+    log_info "上表「表行」= 配置表（主菜单 5→1）里同一行的行号，两表行序一致"
+    log_info "  新增/修改域名：主菜单 5→1 直接改对应行；第 8-10 行是备用空行，填了会自动入册"
+    log_info "  Reality 想从「借公共」改「自建」：在表第 3/4 行填一个自有域名（留空 = 借公共）"
 
     # 注册表里已登记却未挂任何协议标签的域
     local _reg _sfx _protos _domain
