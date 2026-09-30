@@ -1862,6 +1862,21 @@ do_sync_modules() {
     echo ""
     log_info "从 GitHub 下载所有模块覆盖本地缓存..."
     sync_modules
+
+    # ⚠️ 本项【只更新 modules/】，而主菜单与各流程的文字都在 install.sh 里 ——
+    # 它是启动时读一次的，本项动不了它。于是会出现「模块缓存 18/18 全绿，菜单里
+    # 却看不到新增那一项」的错觉（2026-09-30 实际发生：mosdns-x 的菜单 15 已进
+    # 仓库，用户同步完模块后菜单里没有 15，看起来像模块没下发）。
+    # 这里把话说透，省得再去猜「是模块没下来还是菜单没更新」。
+    echo ""
+    if [[ -d "$MODULES_DIR" ]]; then
+        log_warn "模块已同步。但主菜单/流程在 install.sh 里（本项不动它）——"
+        log_warn "  若刚 git pull 到新提交，请退出后用仓库里的 ./install.sh 重新启动。"
+    else
+        log_warn "模块已同步。但主菜单/流程在 install.sh 里（本项不动它）——"
+        log_warn "  当前是 curl 模式，退出后用下面这条重新启动才会看到新菜单项："
+        log_warn "    bash <(curl -fsSL ${BASE_URL}/install.sh)"
+    fi
     done_return
 }
 
