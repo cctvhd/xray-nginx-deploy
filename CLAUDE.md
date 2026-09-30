@@ -107,6 +107,23 @@ state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读�
 
   ⚠️ **分发陷阱（本次踩坑的根因，务必记住）**：`install.sh` 加载模块的顺序是 **`/etc/xray-deploy/modules/` 缓存 → 仓库同级 `modules/` → `${BASE_URL}` 远端下载**（`load_module()`，`BASE_URL` 指向 GitHub 的 `cctvhd/xray-nginx-deploy` 分支）。**用 `bash <(curl ...)` 方式运行时 `MODULES_DIR` 不是真实目录，会强制从远端拉取并覆盖缓存**——所以**模块改动没 commit + push 到 `BASE_URL` 指向的分支，就不会生效**：服务端可能已是新版（直接 source 仓库模块应用过），而客户端链接生成却仍走远端旧模块，表现为「服务端有 `ech:` 段、链接里却没有 `&ech=`」。同类隐患：从菜单重配 hysteria2 会拉回不含 ECH 选项的旧模块，可能把已配好的 `ech:` 段和 `HYSTERIA2_ECH` 状态一起清掉。改完模块要么 commit+push，要么就用仓库里的 `./install.sh`（本地模式会用仓库模块并刷新缓存，见 `install.sh:1119-1123`）。
 
+## 活机探索记录：unbound 自带 DoH 当反代上游（2026-09-30，**未进脚本，仅活机手工配置**）
+
+背景：想给家里路由器提供自建 DoH（`https://<域名>/dns-query`）时，除了装 mosdns-x，也可以直接用 unbound 自带的 DoH 服务端（1.12+ 支持；活机 1.24.2 实测全指令可用）。两个**很容易再踩一次、且很难第一时间联想到**的坑：
+
+- ⚠️ **unbound 的 DoH 只支持 HTTP/2，而 nginx `proxy_pass` 默认发 HTTP/1.1**。症状是 **502 + error_log 里 `upstream prematurely closed connection while reading response header from upstream`**——看着像 unbound 挂了，其实握手/协议层不匹配。实测：`curl --http1.1 https://127.0.0.1:8443/dns-query` 直接失败，`curl --http2` 才 200。**解法是 `proxy_http_version 2;`**（写在 `location` 里 `proxy_pass` 之前）。
+- ⚠️ **`proxy_http_version 2` 需要 nginx ≥ 1.30**（活机 1.30.5 实测可用）。**老版本 nginx 上这行不生效** —— 也就是说「nginx 反代 unbound DoH」这条路在 nginx <1.30 的机器上走不通，只能退回复用 mosdns-x 之类说 HTTP/1.1 的组件。
+
+其余实测要点：**DoH 监听在 `interface:` 后面的端口上，`https-port` 只是筛选条件**（`interface: 127.0.0.1@15354` + `https-port: 8443` → 8443 完全不监听）；**同一端口同时还会提供明文 DNS(UDP/TCP)**，所以必须绑回环、由 nginx 对外，**绝不能直接对公网暴露**（ACL 一放开就是开放解析器）；`tls-service-key` 会顺带启用 DoT(tls-port 默认 853) 于各 interface（均回环，无对外影响）；unbound 以 `unbound` 用户运行，读 letsencrypt 私钥需 `usermod -aG certaccess unbound` 并重启（**实测重启后 `/proc/<pid>/status` 的 Groups 保留 certaccess**，续期由既有 `naive-cert.sh` hook 修 640 certaccess 权限，无需新增 hook）。
+
+**权限与持久性**：`/etc/unbound/conf.d/doh.conf` 能扛过「重配」——`modules/unbound.sh` 是完全替换 `unbound.conf`、conf.d 只 `rm -f` 固定的几个文件名（`${UNBOUND_SERVICE_NAME}.conf` / `remote-control.conf` / `example.com.conf` / `unbound-local-root.conf`），自己的文件名不在清单内。但 **nginx 那段 location 仍会随 `servers.conf` 重生成而丢失**（同下方通用提醒）。
+
+**ECS 结论（若要「就近解析」，先看这条；2026-09-30 三条实测，曾误判过一次）**：
+
+1. **CF 中转不拦 ECS**（**曾误判为「CF 不支持 ECS」**）：实测临时把 mosdns-x 上游改直连 `8.8.8.8:53`，走公网 `客户端 → CF → nginx → mosdns-x → 8.8.8.8` 往返，响应里 `CLIENT-SUBNET: 1.2.3.0/24/0` **完整回显**。原因：ECS 在 DoH 的 `application/dns-message` **body** 里，CF 只当中转、根本不解析 DNS 报文。之前测到的「CF 不认 ECS」指的是 **CF 的公共解析器 `1.1.1.1`**，跟「CF 中转你的 DoH」是两码事，别混。
+2. **unbound 无法透传客户端 ECS**（文档 + 实测双证）：unbound 的 ECS 是用 `send-client-subnet` / `client-subnet-zone` 白名单**按查询来源 IP 自己生成**的（文档原文 `Send client source address to this authority`，且明说适用场景是 "resolver and the clients belong to different networks / open resolver"）；**客户端带进来的 ECS 它不转发**。**`client-subnet-always-forward: yes` 不是透传开关**——它只是「客户端查询已带 ECS 时跳过 send-client-subnet 的地址检查，并跳过常规缓存查询」。实测：客户端 `+subnet=1.2.3.0/24` 打进去，中间插的观察者看到上游收到的仍是「无 ECS」（加不加该选项都一样）。**所以「客户端带 ECS + unbound 透传」这条路根本不存在**，不要再照着配。
+3. **mosdns-x 的 `fast_forward` 原样透传客户端 ECS**（观察者实测收到 `family=1 24/0 addr=1.2.3.0`）。**要 ECS 就近解析 = 让 mosdns-x 上游直连 `8.8.8.8:53`，不要经过 unbound**（当前活机 `/dns-query` 上游是 `127.0.0.1:53` = unbound，ECS 到这就断了）。两个前提：① **必须由客户端（家里 mosdns）自己带 ECS**——服务端只能看到回环/CF 边缘，生成不出真实 subnet；② **上游要认 ECS**：`8.8.8.8` 认、`1.1.1.1` 不认，因此若坚持走 unbound 还得把上游顺序改 Google 在前（但按第 2 条，改了也白改，unbound 这跳已经断了）。
+
 **回退通用步骤**：某次变更出问题 → `git revert <sha>`，再重跑 `install.sh` 对应组件菜单（unbound 用菜单 2「重新配置」或 4「仅刷新域名配置」）即重新生成配置。unbound 活机改动前的配置文件已备份在 `/etc/unbound/unbound.conf.bk.*`（活机本机，不进 git）。活机真实域名/IP/服务快照等敏感运维事实见自动记忆 `live-unbound-2026-09`。
 
 ## 媒体/伪装站资产策略（assets/）
