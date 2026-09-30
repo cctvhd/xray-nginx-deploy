@@ -1189,56 +1189,47 @@ ensure_doh_conf() {
     log_step "配置 DoH 入口（可选）..."
 
     # ── 选域名（首次或清空 state 后）────────────────────────
+    # 域名取自配置表派生出的候选（DOMAIN_REGISTRY = 表里已注册的域），不再罗列
+    # 候选让用户挑序号 —— 那是与表平行的手输来源。默认值 = registry 顺序里第一个
+    # 直连域（没有直连才退而取第一个 CDN 域），回车即采用。
+    # ⚠️ 手输入口必须保留：用户可能一个可用域都没有（新机器、证书未签发），
+    # 那时若只报错就彻底卡住，故此处仍允许手输，并照旧走 443 SNI 占用校验。
+    # 想换域名：清空 state 的 DOH_DOMAIN / DOH_PATH 后重跑本步骤。
     if [[ -z "$DOH_DOMAIN" ]]; then
         local -a _direc=() _cdn=()
-        local _d _m _p _item
+        local _d _m _p
         while IFS=$'\t' read -r _d _m _p; do
             [[ -n "$_d" ]] || continue
-            if [[ "$_m" == "cdn" ]]; then _cdn+=("${_d}|${_p}"); else _direc+=("${_d}|${_p}"); fi
+            if [[ "$_m" == "cdn" ]]; then _cdn+=("$_d"); else _direc+=("$_d"); fi
         done < <(_doh_candidates)
 
-        if [[ ${#_direc[@]} -eq 0 && ${#_cdn[@]} -eq 0 ]]; then
+        local _default="${_direc[0]:-${_cdn[0]:-}}"
+        if [[ -n "$_default" ]]; then
+            if [[ ${#_direc[@]} -gt 0 ]]; then
+                log_info "DoH 入口域名自动取自配置表: ${_default}（已注册域名里第一个直连域）"
+            else
+                log_info "DoH 入口域名自动取自配置表: ${_default}（无可用直连域，取第一个 CDN 域）"
+            fi
+        else
             log_warn "未找到可用域名：需「证书已签发」且「TCP/443 SNI 未被 xray/sing-box/naive 占用」"
             log_warn "  新增方法：Cloudflare 加一条灰云 A 记录指向本机 → 菜单里申请证书"
-            log_warn "  已跳过 DoH 入口（不影响其它组件）"
-            return 0
         fi
-
-        echo ""
-        echo "  DoH 入口域名（占用 443 的域名不能选：一个 SNI 只能有一个后端）"
-        echo "    0) 不启用"
-        local -A _pick=()
-        local _n=0
-        if [[ ${#_direc[@]} -gt 0 ]]; then
-            echo "    ── 直连域名（不走 CF，延迟低）───────────────────"
-            for _item in "${_direc[@]}"; do
-                _n=$((_n+1)); _pick[$_n]="${_item%%|*}"
-                printf "    %d) %-30s [direct / %s]\n" "$_n" "${_item%%|*}" "${_item##*|}"
-            done
-        fi
-        echo "    ── CDN 域名（经 Cloudflare 中转）────────────────"
-        if [[ ${#_cdn[@]} -gt 0 ]]; then
-            for _item in "${_cdn[@]}"; do
-                _n=$((_n+1)); _pick[$_n]="${_item%%|*}"
-                printf "    %d) %-30s [cdn / %s]\n" "$_n" "${_item%%|*}" "${_item##*|}"
-            done
-        else
-            echo "       （无可用 —— CDN 域通常已被 xhttp/gRPC 占用 443）"
-        fi
-        echo ""
 
         local _sel
         while true; do
-            read -rp "  请选择（序号 / 直接输入自定义域名，回车 = 0）: " _sel
+            read -rp "  回车 = ${_default:-不启用}，可输入自定义域名，或输入 0 不启用: " _sel
             _sel="${_sel// /}"
-            if [[ -z "$_sel" || "$_sel" == "0" ]]; then
+            if [[ -z "$_sel" ]]; then
+                if [[ -z "$_default" ]]; then
+                    log_info "未启用 DoH 入口（不影响其它组件）"
+                    return 0
+                fi
+                DOH_DOMAIN="$_default"
+                break
+            fi
+            if [[ "$_sel" == "0" ]]; then
                 log_info "未启用 DoH 入口"
                 return 0
-            fi
-            if [[ "$_sel" =~ ^[0-9]+$ ]]; then
-                [[ -n "${_pick[$_sel]:-}" ]] && { DOH_DOMAIN="${_pick[$_sel]}"; break; }
-                log_warn "序号 ${_sel} 无效，请重选"
-                continue
             fi
             _sel="${_sel,,}"
             if _reality_domain_usable_fast "$_sel"; then
