@@ -2858,6 +2858,25 @@ run_cert() {
     # 数据目录固定为 STATE_DIR（理由见 EDIT_NODES_DATA_DIR 定义处）：git / curl
     # 两种启动方式算出同一个值，不会各看各的表；写与读共用这个局部变量。
     local edit_nodes_dir="${EDIT_NODES_DATA_DIR:-${STATE_DIR:-/etc/xray-deploy}}"
+
+    # 兼容历史落点：7db1482~5d5afdd 之间那几版的默认目录是 /root（更早是硬编码
+    # /root 兜底），5d5afdd 那一版又算成仓库根。表是**用户资产**，不该因为脚本
+    # 换了个算法就「找不到自己的配置」——主目录里没有表时，依次回退到历史落点。
+    # 只有「确实存在表」才回退：空目录回退没有意义，还会掩盖真正的首次安装。
+    # 回退后读与写都用这个目录（保持单点，不制造第二个分叉）。
+    if [[ ! -f "${edit_nodes_dir}/.config.tsv" ]]; then
+        local _legacy
+        for _legacy in "/root" "$(dirname "$edit_nodes_script")"; do
+            [[ "$_legacy" == "$edit_nodes_dir" ]] && continue
+            if [[ -f "${_legacy}/.config.tsv" ]]; then
+                log_warn "配置表不在 ${edit_nodes_dir}，改用历史落点：${_legacy}/.config.tsv"
+                log_warn "  建议迁移（迁完就不再走回退）："
+                log_warn "    mkdir -p '${edit_nodes_dir}' && /usr/bin/cp -p '${_legacy}/.config.tsv' '${_legacy}/config.txt' '${edit_nodes_dir}/'"
+                edit_nodes_dir="$_legacy"
+                break
+            fi
+        done
+    fi
     log_info "配置表目录: $edit_nodes_dir"
 
     # 快照「进入本流程前」的域名集合，供第 3b 步清理已从配置表移除的陈旧域名。
