@@ -1100,8 +1100,9 @@ generate_sni_map() {
         echo "        ${NAIVE_DOMAIN}       127.0.0.1:8370;"
     fi
 
-    # DoH 入口（conf.d/doh.conf 的 server 块）。域名由 ensure_doh_conf 选定，
-    # 候选已排除占用 443 的协议，所以这里的 seen_sni 去重只是防御性的。
+    # DoH 入口（conf.d/doh.conf 的 server 块）。域名在 modules/mosdns.sh 的
+    # configure_doh_entry 里选定，候选已排除占用 443 的协议，所以这里的
+    # seen_sni 去重只是防御性的。
     #
     # ⚠️ 域名【必须】从 state 读，不能只用内存里的 $DOH_DOMAIN。
     # $DOH_DOMAIN 只是 ensure_doh_conf 顺手赋的全局，而下面这两条路径都
@@ -1129,13 +1130,17 @@ generate_sni_map() {
 # TLS 在 nginx 终结，后端是 127.0.0.1:15353/dns-query（明文 http）。
 # 443 路由由 generate_sni_map 指向 127.0.0.1:8410；端口见
 # install.sh 的 _preflight_check_internal_ports。
-# state: DOH_DOMAIN（空 = 不启用）/ DOH_PATH（随机或手输，生成后保存）。
+# state: DOH_DOMAIN（空 = 不启用）/ DOH_PATH（生成后保存）。
+# ⚠️ 本函数【只认 state，不提问】：域名/路径的问答在 modules/mosdns.sh 的
+# configure_doh_entry（主菜单 15「安装/配置 mosdns-x」）—— DoH 入口的后端就是
+# mosdns-x，配入口属于装 mosdns-x 的一部分，不该长在「配置 Nginx」中间。
 #
 # DoH 候选域名 = 已入册 且 TCP/443 SNI 空闲。判定复用 xray.sh 的
 # _reality_domain_usable_fast —— 它的排除表恰好就是占用 443 的协议全集
 # （hysteria2 走 UDP 不在表内），证书路径解析也与 generate_servers_conf 一致。
+# _doh_candidates 现在只被 modules/mosdns.sh 调用（本文件内已无读者），保留。
 
-# 确保 _reality_domain_usable_fast 可用。必须在 ensure_doh_conf 本体里调用：
+# 确保 _reality_domain_usable_fast 可用。必须在调用 _doh_candidates 之前调用：
 # _doh_candidates 走进程替换、跑在子 shell，那里 source 的模块函数父 shell 看不到。
 _doh_load_xray() {
     declare -F _reality_domain_usable_fast >/dev/null 2>&1 && return 0
@@ -1186,76 +1191,24 @@ ensure_doh_conf() {
         return 0
     fi
 
-    log_step "配置 DoH 入口（可选）..."
-
-    # ── 选域名（首次或清空 state 后）────────────────────────
-    # 域名取自配置表派生出的候选（DOMAIN_REGISTRY = 表里已注册的域），不再罗列
-    # 候选让用户挑序号 —— 那是与表平行的手输来源。默认值 = registry 顺序里第一个
-    # 直连域（没有直连才退而取第一个 CDN 域），回车即采用。
-    # ⚠️ 手输入口必须保留：用户可能一个可用域都没有（新机器、证书未签发），
-    # 那时若只报错就彻底卡住，故此处仍允许手输，并照旧走 443 SNI 占用校验。
-    # 想换域名：清空 state 的 DOH_DOMAIN / DOH_PATH 后重跑本步骤。
+    # ── 未启用则【静默跳过】，本函数不再提问 ─────────────────
+    # 域名/路径的问答属于「安装/配置 mosdns-x」那条菜单（modules/mosdns.sh 的
+    # configure_doh_entry）—— DoH 入口的后端是 mosdns-x，配它属于装 mosdns-x
+    # 的一部分。长在「配置 Nginx」流程中间时，重配一次 Nginx 就被问一次，而
+    # 这件事跟 Nginx 关系不大（用户原话：「这个设置不合理,应该列一个单独的选项」）。
+    # 现在本函数只认 state：DOH_DOMAIN 为空 = 未启用，直接返回，不阻塞、不重写。
     if [[ -z "$DOH_DOMAIN" ]]; then
-        local -a _direc=() _cdn=()
-        local _d _m _p
-        while IFS=$'\t' read -r _d _m _p; do
-            [[ -n "$_d" ]] || continue
-            if [[ "$_m" == "cdn" ]]; then _cdn+=("$_d"); else _direc+=("$_d"); fi
-        done < <(_doh_candidates)
-
-        local _default="${_direc[0]:-${_cdn[0]:-}}"
-        if [[ -n "$_default" ]]; then
-            if [[ ${#_direc[@]} -gt 0 ]]; then
-                log_info "DoH 入口域名自动取自配置表: ${_default}（已注册域名里第一个直连域）"
-            else
-                log_info "DoH 入口域名自动取自配置表: ${_default}（无可用直连域，取第一个 CDN 域）"
-            fi
-        else
-            log_warn "未找到可用域名：需「证书已签发」且「TCP/443 SNI 未被 xray/sing-box/naive 占用」"
-            log_warn "  新增方法：Cloudflare 加一条灰云 A 记录指向本机 → 菜单里申请证书"
-        fi
-
-        local _sel
-        while true; do
-            read -rp "  回车 = ${_default:-不启用}，可输入自定义域名，或输入 0 不启用: " _sel
-            _sel="${_sel// /}"
-            if [[ -z "$_sel" ]]; then
-                if [[ -z "$_default" ]]; then
-                    log_info "未启用 DoH 入口（不影响其它组件）"
-                    return 0
-                fi
-                DOH_DOMAIN="$_default"
-                break
-            fi
-            if [[ "$_sel" == "0" ]]; then
-                log_info "未启用 DoH 入口"
-                return 0
-            fi
-            _sel="${_sel,,}"
-            if _reality_domain_usable_fast "$_sel"; then
-                DOH_DOMAIN="$_sel"
-                break
-            fi
-            log_warn "域名 ${_sel} 不可用：需证书已签发，且 TCP/443 SNI 未被其它协议占用"
-        done
-        save_state "DOH_DOMAIN" "$DOH_DOMAIN"
+        log_info "未启用 DoH 入口（启用/修改：主菜单 15「安装/配置 mosdns-x」）"
+        return 0
     fi
 
-    # ── 路径：随机生成或手输（仓库里不写死默认值）──────────
+    log_step "配置 DoH 入口..."
+
+    # ── 路径：state 里有就用，没有则随机生成（仓库里不写死默认值）──
+    # 同样不提问：正常路径下 DOH_PATH 由 mosdns.sh 落 state，这里只是兜底
+    # （例如用户手工把 DOH_DOMAIN 写进 state 的情况）。
     if [[ -z "$DOH_PATH" ]]; then
-        local _in
-        while true; do
-            read -rp "  访问路径（回车 = 随机生成，须以 / 开头）: " _in
-            if [[ -z "$_in" ]]; then
-                DOH_PATH="/dns-$(openssl rand -hex 6)"
-                break
-            fi
-            if [[ "$_in" == /* && "$_in" != *[!A-Za-z0-9/_.-]* ]]; then
-                DOH_PATH="$_in"
-                break
-            fi
-            log_warn "路径须以 / 开头，且只含字母数字与 / _ . - ，请重输"
-        done
+        DOH_PATH="/dns-$(openssl rand -hex 6)"
         save_state "DOH_PATH" "$DOH_PATH"
     fi
 
@@ -1274,8 +1227,8 @@ ensure_doh_conf() {
     cat > "$conf" << CONF
 # ===================================================================
 # /etc/nginx/conf.d/doh.conf — DoH 入口（反代本机 mosdns-x）
-# 由 install.sh 生成；重复执行不会改写本文件。
-# 换域名/路径：清空 state 的 DOH_DOMAIN / DOH_PATH 后重跑本步骤。
+# 由 install.sh 生成；无变更时重复执行不会改写本文件。
+# 换域名/路径：主菜单 15「安装/配置 mosdns-x」（它会先删本文件再重生成）。
 # 443 路由在 nginx.conf 的 stream map 里指向 127.0.0.1:8410。
 # ===================================================================
 
@@ -1418,11 +1371,13 @@ verify_doh_entry() {
         return 0
     fi
 
-    # 502/504 → SNI 路由通、TLS 通，只是后端没起。本仓库不含 mosdns-x 安装
-    # （需另装并监听 127.0.0.1:15353），新机器上这是预期状态，故只告警不失败。
+    # 502/504 → SNI 路由通、TLS 通，只是后端没起。后端是 mosdns-x，由
+    # modules/mosdns.sh 安装（主菜单 15）。老机器上若 DoH 入口是手工配的、
+    # 后端从未装过，这里也是同一副样子——故只告警不失败。
     if [[ "$code" == "502" || "$code" == "504" ]]; then
         log_warn "DoH 自检：入口已通，但后端 127.0.0.1:15353 无响应（HTTP ${code}）"
-        log_warn "  需另装 mosdns-x 并监听 15353；未装前该入口不可用（新机器上属预期）"
+        log_warn "  后端是 mosdns-x：systemctl status mosdns 看是否在跑"
+        log_warn "  未安装/未运行 → 主菜单 15「安装/配置 mosdns-x」"
         return 0
     fi
 
