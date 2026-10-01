@@ -1051,22 +1051,34 @@ generate_sni_map() {
     local sn
     local -A seen_sni=()
 
-    # Reality 自有域名 → 8320
-    # ⚠️ 只要**分配了**域名就一直给路由：域名是客户端连接地址，与 SNI 来源解耦
-    #    （借公共 SNI 时该域不会被当 SNI 用，这条路由等于空闲；留着可让该域继续
-    #    持有证书与伪装站，也让 nginx -t / 证书链保持自洽）。
+    # Reality 自有域名 → 8322 落地站（借公共 SNI）/ 8320（自建）
+    # ⚠️ 只要**分配了**域名就一直给路由：域名是客户端连接地址，与 SNI 来源解耦。
+    #    但**落点**随 SNI 来源变——借公共 SNI 时该域不再是客户端 SNI，送进 reality
+    #    入站会被 dokodemo 的 block 规则断掉（实测：PROXY 头带该 SNI → EOF 无证书），
+    #    所以改送 8322 落地站：那是唯一能对该域出正规证书的地方。
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality 自有域名 → 8320 --------------------------"
-        echo "        ${REALITY_DOMAIN}     127.0.0.1:8320;"
+        if _reality_slot_borrows_public xray-reality; then
+            [[ $had_output -eq 0 ]] && echo "        # -- Reality 自有域落地站 → 8322 ----------------------"
+            echo "        ${REALITY_DOMAIN}     127.0.0.1:8322;"
+        else
+            [[ $had_output -eq 0 ]] && echo "        # -- Reality 自有域名 → 8320 --------------------------"
+            echo "        ${REALITY_DOMAIN}     127.0.0.1:8320;"
+        fi
         seen_sni["${REALITY_DOMAIN}"]=1
         had_output=1
     fi
 
-    # XHTTP-Reality 自有域名 → 8325（xhttp-reality inbound）
+    # XHTTP-Reality 自有域名 → 8322 落地站（借公共 SNI）/ 8325（自建，xhttp-reality inbound）
     if [[ -n "${XHTTP_REALITY_DOMAIN:-}" && -z "${seen_sni[${XHTTP_REALITY_DOMAIN}]:-}" ]]; then
-        [[ $had_output -eq 1 ]] && echo ""
-        echo "        # -- xhttp-reality 自有域名 → 8325 -------------------"
-        echo "        ${XHTTP_REALITY_DOMAIN}     127.0.0.1:8325;"
+        if _reality_slot_borrows_public xhttp-reality; then
+            [[ $had_output -eq 1 ]] && echo ""
+            echo "        # -- xhttp-reality 自有域落地站 → 8322 ----------------"
+            echo "        ${XHTTP_REALITY_DOMAIN}     127.0.0.1:8322;"
+        else
+            [[ $had_output -eq 1 ]] && echo ""
+            echo "        # -- xhttp-reality 自有域名 → 8325 -------------------"
+            echo "        ${XHTTP_REALITY_DOMAIN}     127.0.0.1:8325;"
+        fi
         seen_sni["${XHTTP_REALITY_DOMAIN}"]=1
         had_output=1
     fi
@@ -1774,6 +1786,39 @@ _purge_orphan_webroots() {
     done
 }
 
+# ── 解析并预检某域的证书目录 ────────────────────────────────────
+# 复用 8321/8326 块原有的证书解析逻辑（根域键 CERT_PATH_<root> → /etc/letsencrypt/live/<root>），
+# 并在其前面加一档「域专属」候选，以支持将来给单个域名签独立证书：
+#     1. CERT_PATH_<domain>   2. CERT_PATH_<root>   3. live/<domain>   4. live/<root>
+# 取第一个 fullchain.pem 存在、且 SAN/CN 覆盖该域的。存在但不覆盖 → 直接报错（不继续
+# 回落），任一候选都没有文件 → 报错。**绝不回落自签、绝不静默跳过。**
+# 成功：stdout 输出证书目录，rc=0；失败：log_error（走 stdout，调用方需转回 stderr），rc=1。
+#
+# ⚠️ 依赖 get_root_domain —— 那是 generate_servers_conf() 内部的**嵌套函数**，只在
+#    该函数体执行期间存在。所以本函数**只能在 generate_servers_conf 内部调用**
+#    （当前唯一调用方），挪到别处会 get_root_domain: command not found。
+#    本次不重构 get_root_domain，也不动它在 nginx.sh/xray.sh 里的另外 5 份拷贝。
+_resolve_cert_dir_checked() {
+    local domain="$1" root d p
+    local -a cand=()
+    root=$(get_root_domain "$domain")
+    d=$(get_state "CERT_PATH_${domain//./_}" ""); [[ -n "$d" ]] && cand+=("$d")
+    d=$(get_state "CERT_PATH_${root//./_}" "");   [[ -n "$d" ]] && cand+=("$d")
+    cand+=("/etc/letsencrypt/live/${domain}" "/etc/letsencrypt/live/${root}")
+
+    for p in "${cand[@]}"; do
+        [[ -s "${p}/fullchain.pem" ]] || continue
+        if openssl x509 -in "${p}/fullchain.pem" -noout -checkhost "$domain" >/dev/null 2>&1; then
+            echo "$p"; return 0
+        fi
+        log_error "证书 ${p}/fullchain.pem 存在但不覆盖 ${domain}（SAN/CN 不匹配）"
+        return 1
+    done
+    log_error "找不到 ${domain} 的可用证书：候选路径均无 fullchain.pem"
+    log_error "  已尝试：${cand[*]}"
+    return 1
+}
+
 # ── 生成 servers.conf ────────────────────────────────────────
 generate_servers_conf() {
     log_step "生成 servers.conf..."
@@ -2148,6 +2193,65 @@ ${_doh_inc_grpc}
     }
 }
 CONF
+    fi
+
+    # ── 自有域 SNI 落地站（8322）：借公共 SNI 时生成 ──────────────────────
+    # 借公共 SNI 时该域不再是客户端 SNI，但仍是配置表分配的「客户端连接地址」：
+    # 浏览器直连该域必须看到正规证书，不接受落进 8400 自签陷阱。每域一块、共用
+    # 127.0.0.1:8322，各自引用自己的证书（通配证书时多块同指一个文件；单独证书时
+    # 各指各的，由 _resolve_cert_dir_checked 解析）。
+    # ⚠️ 与 8321/8326 无关：那两块是**自建模式**下 Reality 的 dest，由 xray 以 xver=0
+    #    直连送入（不带 PROXY 头）；本块来自 443 stream 层（proxy_protocol on），
+    #    所以必须带 proxy_protocol。端口分开，任何 SNI 模式组合都不会撞车。
+    _emit_land_block() {
+        local _dom="$1" _doh="$2" _cert
+        if ! _cert=$(_resolve_cert_dir_checked "$_dom"); then
+            # 函数内 log_error 写的是 stdout、已被 $() 捕获，这里原样还给用户
+            printf '%s\n' "$_cert" 1>&2
+            # 收掉写到一半的临时文件。$_out 是 servers.conf.new（未被 *.conf 通配
+            # include 的中间产物），正式 /etc/nginx/conf.d/servers.conf 只由函数末尾
+            # 的 mv -f "$_out" 才替换 —— 这里 rm 的目标不是正式文件。
+            rm -f "$_out"
+            return 1
+        fi
+
+        cat >> "$_out" << CONF
+
+# ===================================================================
+# 自有域 SNI 落地站 ${_dom}（8322）
+# 借公共 SNI：该域不是客户端 SNI，但仍是客户端「连接地址」，需正规证书落点
+# ===================================================================
+server {
+    listen 127.0.0.1:8322 ssl proxy_protocol;
+    server_name ${_dom};
+
+    ssl_certificate     ${_cert}/fullchain.pem;
+    ssl_certificate_key ${_cert}/privkey.pem;
+    include /etc/nginx/ssl/common.conf;
+
+    root        /var/www/${_dom};
+    index       index.html;
+    server_tokens off;
+    access_log  off;
+${_doh}
+    location / {
+        try_files \$uri \$uri/ /index.html;
+        add_header Cache-Control "public, max-age=3600" always;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Content-Security-Policy "default-src 'self' fonts.googleapis.com fonts.gstatic.com; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' fonts.googleapis.com; font-src 'self' fonts.gstatic.com; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none';" always;
+    }
+}
+CONF
+    }
+
+    if [[ -n "${REALITY_DOMAIN:-}" ]] && _reality_slot_borrows_public xray-reality; then
+        _emit_land_block "${REALITY_DOMAIN}" "${_doh_inc_reality}" || return 1
+    fi
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]] && _reality_slot_borrows_public xhttp-reality; then
+        _emit_land_block "${XHTTP_REALITY_DOMAIN}" "${_doh_inc_xr}" || return 1
     fi
 
     # Reality dest 伪装站（8321）：仅在使用自有域名时生成
