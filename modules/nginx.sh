@@ -1024,6 +1024,26 @@ CONF
     log_info "nginx.conf 生成完成"
 }
 
+# 该 Reality 槽的 SNI 来源是不是「借公共大站」。0 = 借公共，1 = 用自有域自建。
+# 用法: _reality_slot_borrows_public <tag>   tag ∈ {xray-reality, xhttp-reality}
+#
+# ⚠️ 与 modules/xray.sh 的同名函数**逐字同实现**，改要一起改。为什么这里要抄一份：
+#    模块之间不能依赖对方「后加」的函数（见 CLAUDE.md「模块不能依赖 install.sh
+#    后加的函数」——同一个坑的跨模块版本：nginx 模块可能先于 xray 模块被加载）。
+#    判据见 xray.sh 里的长注释：无域 → 借公共；有域 → 看 *_SNI_MODE，缺省 self。
+_reality_slot_borrows_public() {
+    local _own _mode
+    if [[ "${1:-}" == "xhttp-reality" ]]; then
+        _own="${XHTTP_REALITY_DOMAIN:-}"
+        _mode=$(get_state "XHTTP_REALITY_SNI_MODE" "")
+    else
+        _own="${REALITY_DOMAIN:-}"
+        _mode=$(get_state "REALITY_SNI_MODE" "")
+    fi
+    [[ -z "$_own" ]] && return 0
+    [[ "$_mode" == "public" ]]
+}
+
 # ── 生成 SNI 路由映射 ────────────────────────────────────────
 # P4修复：Reality serverNames 里的所有域名都加进 stream map 指向 8320
 generate_sni_map() {
@@ -1031,9 +1051,12 @@ generate_sni_map() {
     local sn
     local -A seen_sni=()
 
-    # Reality 自有域名
+    # Reality 自有域名 → 8320
+    # ⚠️ 只要**分配了**域名就一直给路由：域名是客户端连接地址，与 SNI 来源解耦
+    #    （借公共 SNI 时该域不会被当 SNI 用，这条路由等于空闲；留着可让该域继续
+    #    持有证书与伪装站，也让 nginx -t / 证书链保持自洽）。
     if [[ -n "${REALITY_DOMAIN:-}" ]]; then
-        [[ $had_output -eq 0 ]] && echo "        # -- Reality 自建域名 → 8320 --------------------------"
+        [[ $had_output -eq 0 ]] && echo "        # -- Reality 自有域名 → 8320 --------------------------"
         echo "        ${REALITY_DOMAIN}     127.0.0.1:8320;"
         seen_sni["${REALITY_DOMAIN}"]=1
         had_output=1
@@ -1048,13 +1071,16 @@ generate_sni_map() {
         had_output=1
     fi
 
-    # Reality 公共 serverNames：仅公共 SNI 模式（未分配自有 Reality 域名）才路由到 8320
-    # 自建域名模式：serverNames 已收敛为 REALITY_DOMAIN；即便 state 残留公共名
+    # Reality 公共 serverNames：**借公共 SNI 时**才路由到 8320
+    # ⚠️ 判据是 SNI 来源（_reality_slot_borrows_public），**不是**「有没有分配域名」：
+    #    「地址用自有域 + SNI 借公共」是合法组合（用户明确要求），此时公共名必须路由，
+    #    否则客户端发来的公共 SNI 会落到 default 陷阱端口、节点直接不可达。
+    # 自建 SNI 模式：serverNames 已收敛为 REALITY_DOMAIN；即便 state 残留公共名
     #   （旧版本产物），也绝不写 8320 死路由——公共名此时只可能是 xhttp-reality SNI(8325)。
     # P4修复：Reality serverNames 里的公共域名加进 stream map 指向 8320，
     #         但 XHTTP_REALITY_SNI / XHTTP_REALITY_DOMAIN 必须留给 8325，
     #         否则 seen_sni 去重会把 8325 的 xhttp-reality 路由吞掉（节点不可达）。
-    if [[ -z "${REALITY_DOMAIN:-}" && -n "${REALITY_SERVER_NAMES:-}" ]]; then
+    if _reality_slot_borrows_public xray-reality && [[ -n "${REALITY_SERVER_NAMES:-}" ]]; then
         [[ $had_output -eq 0 ]] && echo "        # -- Reality serverNames 全部路由到 8320 ---------------"
         for sn in "${REALITY_SERVER_NAMES[@]}"; do
             [[ -n "$sn" ]] || continue
@@ -1068,7 +1094,11 @@ generate_sni_map() {
     fi
 
     # XHTTP_REALITY_SNI 单独路由到 8325（可能同时出现在 REALITY_SERVER_NAMES，已在上面跳过）
-    if [[ -n "${XHTTP_REALITY_SNI:-}" && -z "${seen_sni[${XHTTP_REALITY_SNI}]:-}" ]]; then
+    # ⚠️ 同样按 SNI 来源门控（与上面 vless 那条对称）：xhttp 自建时若 state 里残留
+    #    旧公共名，写这条 8325 死路由会让该 SNI 被 xhttp-reality 入站接下并用伪装站
+    #    回落——用户看到的是「自建了但借用站点还能连进来」。
+    if _reality_slot_borrows_public xhttp-reality \
+       && [[ -n "${XHTTP_REALITY_SNI:-}" && -z "${seen_sni[${XHTTP_REALITY_SNI}]:-}" ]]; then
         [[ $had_output -eq 1 ]] && echo ""
         echo "        # -- xhttp-reality 公共 SNI → 8325 --------------------"
         echo "        ${XHTTP_REALITY_SNI}     127.0.0.1:8325;"

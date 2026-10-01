@@ -217,9 +217,35 @@ encryption=${VLESS_ENC_PARAM:-none}\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-grpc-${_hn}'))" 2>/dev/null)"
 }
 
+# 该 Reality 槽的 SNI 来源是不是「借公共大站」。0 = 借公共，1 = 用自有域自建。
+#
+# ⚠️ 与 modules/xray.sh、modules/nginx.sh 的同名函数**逐字同实现**，改要一起改
+#    （模块之间不能依赖对方「后加」的函数——加载顺序不保证）。判据见 xray.sh
+#    的长注释：无域 → 借公共；有域 → 看 *_SNI_MODE，缺省 self。
+_reality_slot_borrows_public() {
+    local _own _mode
+    if [[ "${1:-}" == "xhttp-reality" ]]; then
+        _own="${XHTTP_REALITY_DOMAIN:-}"
+        _mode=$(get_state "XHTTP_REALITY_SNI_MODE" "")
+    else
+        _own="${REALITY_DOMAIN:-}"
+        _mode=$(get_state "REALITY_SNI_MODE" "")
+    fi
+    [[ -z "$_own" ]] && return 0
+    [[ "$_mode" == "public" ]]
+}
+
 # ── 生成 VLESS-XHTTP-REALITY 直连节点链接 ────────────────────
 gen_xhttp_reality_url() {
-    local _xhttp_r_sni="${XHTTP_REALITY_DOMAIN:-${XHTTP_REALITY_SNI:-}}"
+    # 地址与 SNI 解耦：分配了自有域就拿它当**连接地址**（客户端支持域名当地址），
+    # SNI 则由 SNI 来源决定 —— 自建=该自有域，借公共=所选公共大站。
+    # 旧代码把「sni」直接绑在域名上，于是「地址用自有域 + SNI 借公共」没法表达。
+    local _xhttp_r_sni
+    if _reality_slot_borrows_public xhttp-reality; then
+        _xhttp_r_sni="${XHTTP_REALITY_SNI:-}"
+    else
+        _xhttp_r_sni="${XHTTP_REALITY_DOMAIN:-}"
+    fi
     if [[ -z "${_xhttp_r_sni}" ]] || [[ -z "${XRAY_UUID:-}" ]] || [[ -z "${XHTTP_PATH:-}" ]]; then
         return
     fi
@@ -230,12 +256,9 @@ import urllib.parse
 print(urllib.parse.quote('${XHTTP_PATH}'))
 " 2>/dev/null || echo "${XHTTP_PATH}")
 
-    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
-        reality_host="${XHTTP_REALITY_DOMAIN}"
-    else
-        # 公共 SNI 模式：优先用自有直连域名（支持双栈），不使用公共 SNI
-        reality_host="${REALITY_DOMAIN:-${ANYTLS_DOMAIN:-${SERVER_IP}}}"
-    fi
+    # 连接地址：自有直连域（支持双栈）优先，退到直连域/AnyTLS 域/服务器 IP；
+    # 公共 SNI 从不作连接地址（它不属于本机，解析到的是别人家）。
+    reality_host="${XHTTP_REALITY_DOMAIN:-${REALITY_DOMAIN:-${ANYTLS_DOMAIN:-${SERVER_IP}}}}"
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
 path=${path_encoded}\
@@ -252,10 +275,18 @@ path=${path_encoded}\
 
 # ── 生成 Reality 直连节点链接 ────────────────────────────────
 gen_reality_url() {
-    # 自建域名模式：Reality-direct 服务端 serverNames 只含 REALITY_DOMAIN（自助模式），
-    # 链接 sni 必须是 REALITY_DOMAIN 才会被接受；REALITY_SNI 仅公共-SNI 模式兜底。
-    # 直接拼 REALITY_SNI 会因 state 残留旧公共名（如 film.ca.gov）而生成死节点。
-    local reality_sni="${REALITY_DOMAIN:-${REALITY_SNI:-}}"
+    # sni 必须落在服务端 realitySettings.serverNames 里才会被接受，故由**SNI 来源**
+    # 决定，与「域名是否分配」无关：
+    #   自建 → serverNames=[REALITY_DOMAIN] → sni = REALITY_DOMAIN
+    #   借公共 → serverNames=[REALITY_SERVER_NAMES] → sni = REALITY_SNI（=serverNames[0]）
+    # 直接拼 REALITY_SNI 会因 state 残留旧公共名（如 film.ca.gov）而生成死节点；
+    # 反过来在借公共时拼 REALITY_DOMAIN 同样会生成死节点（服务端 serverNames 里没有它）。
+    local reality_sni
+    if _reality_slot_borrows_public xray-reality; then
+        reality_sni="${REALITY_SNI:-}"
+    else
+        reality_sni="${REALITY_DOMAIN:-}"
+    fi
     if [[ -z "${reality_sni}" ]] || [[ -z "${XRAY_UUID:-}" ]]; then
         return
     fi

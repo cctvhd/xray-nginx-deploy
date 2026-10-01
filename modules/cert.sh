@@ -2441,11 +2441,19 @@ _domain_resolves() {
     getent hosts "$_d" >/dev/null 2>&1
 }
 
-# 切换后的产物断言。用法: _sni_switch_verify <slot> <新域|""> <旧域|"">
+# 切换后的产物断言。用法: _sni_switch_verify <slot> <域|""> <旧域|""> [self|public]
 # 返回 0 = 现场与「切换后的期望」一致；1 = 不一致（调用方回滚）。
 # 判据刻意是**磁盘产物**而不是任何函数的返回值 —— regen 那层对 nginx 失败只 warn。
+#
+# ⚠️ mode 与 domain 是**两个正交维度**：domain 管「有没有自有域」（题：server 块、
+#    连接地址），mode 管「SNI 用自有域还是借公共」（题：xray dest 端口）。
+#    「有域 + 借公共」是合法组合 —— 此时域名照样有 server 块，但 xray 必须走
+#    dokodemo 端口。用 `-n "$_domain"` 去推端口在那一组上会判反，把成功的切换
+#    误判成失败并整条回滚（表现为「切了公共，订阅却还是自己的域名」）。
 _sni_switch_verify() {
-    local _slot="$1" _domain="$2" _old="${3:-}" _rc=0
+    local _slot="$1" _domain="$2" _old="${3:-}" _mode="${4:-}" _rc=0
+    # 老调用点不带 mode → 按老规则推（有域 = self，无域 = public）
+    [[ -z "$_mode" ]] && { [[ -n "$_domain" ]] && _mode="self" || _mode="public"; }
 
     # 1) nginx -t 必须真的通过（这是「不留半成品」的底线）
     if command -v nginx >/dev/null 2>&1; then
@@ -2483,16 +2491,18 @@ _sni_switch_verify() {
     #    config.json 与本次切换无关，退回告警。
     if [[ -s /usr/local/etc/xray/config.json ]]; then
         local _want _why
-        case "$_slot" in
-            xray-reality)  if [[ -n "$_domain" ]]; then _want=8321; else _want=4431; fi ;;
-            xhttp-reality) if [[ -n "$_domain" ]]; then _want=8326; else _want=4432; fi ;;
-            *)             _want="" ;;
+        case "$_slot:$_mode" in
+            xray-reality:self)   _want=8321 ;;
+            xray-reality:public) _want=4431 ;;
+            xhttp-reality:self)  _want=8326 ;;
+            xhttp-reality:public) _want=4432 ;;
+            *)                   _want="" ;;
         esac
         if [[ -n "$_want" ]] && ! grep -q "127\.0\.0\.1:${_want}" /usr/local/etc/xray/config.json; then
-            if [[ -n "$_domain" ]]; then
+            if [[ "$_mode" == "self" ]]; then
                 _why="自建模式应 dest→127.0.0.1:${_want} 且 serverNames 含 ${_domain}"
             else
-                _why="公共模式应 dest→127.0.0.1:${_want}（dokodemo 转发借用站点）"
+                _why="公共模式应 dest→127.0.0.1:${_want}（dokodemo 转发借用站点）${_domain:+；域名 ${_domain} 只作连接地址}"
             fi
             if [[ "$(get_step CONF_XRAY)" == "1" ]]; then
                 log_error "断言失败：xray config.json 未反映本次切换（${_why}）"
@@ -2507,13 +2517,28 @@ _sni_switch_verify() {
 }
 
 apply_reality_sni_switch() {
-    local _slot="${1:-}" _domain="${2:-}"
+    local _slot="${1:-}" _domain="${2:-}" _mode="${3:-}"
 
-    local _key _tag _peer_key _peer_label _row
+    # mode 省略时按老规则推（有域 = self，无域 = public）—— 老调用点行为不变。
+    [[ -z "$_mode" ]] && { [[ -n "$_domain" ]] && _mode="self" || _mode="public"; }
+    if [[ "$_mode" != "self" && "$_mode" != "public" ]]; then
+        log_error "apply_reality_sni_switch: 未知 SNI 来源 '${_mode}'（应为 self / public）"
+        return 1
+    fi
+
+    # ⚠️ _mode_key **不能**用 "${_key}_SNI_MODE" 拼：那会得到
+    #    REALITY_DOMAIN_SNI_MODE（域名键 + 后缀），而三份谓词读的是
+    #    REALITY_SNI_MODE / XHTTP_REALITY_SNI_MODE（去掉了 DOMAIN）。
+    #    拼错的后果是**静默**的：mode 写进一个没人读的键 → 有域名的槽恒判「自建」
+    #    → 切公共后 dest 仍是 8321、断言失败、整条事务回滚，用户看到「切了等于没切」。
+    #    （2026-10-01 沙箱测试正是这样抓到的。）
+    local _key _mode_key _tag _peer_key _peer_label _row
     case "$_slot" in
-        xray-reality)  _key="REALITY_DOMAIN";        _tag="xray-reality";  _peer_key="XHTTP_REALITY_DOMAIN"
+        xray-reality)  _key="REALITY_DOMAIN";        _mode_key="REALITY_SNI_MODE"
+                       _tag="xray-reality";  _peer_key="XHTTP_REALITY_DOMAIN"
                        _peer_label="vless-xhttp-reality"; _row=4 ;;
-        xhttp-reality) _key="XHTTP_REALITY_DOMAIN";  _tag="xhttp-reality"; _peer_key="REALITY_DOMAIN"
+        xhttp-reality) _key="XHTTP_REALITY_DOMAIN";  _mode_key="XHTTP_REALITY_SNI_MODE"
+                       _tag="xhttp-reality"; _peer_key="REALITY_DOMAIN"
                        _peer_label="vless-reality";       _row=3 ;;
         *) log_error "apply_reality_sni_switch: 未知槽位 '${_slot}'"; return 1 ;;
     esac
@@ -2613,6 +2638,12 @@ apply_reality_sni_switch() {
         return 1
     fi
 
+    # ── 3b) 落 SNI 来源。**与域名分配正交**：域名照样留在配置表里当客户端连接
+    #        地址，本键只决定「SNI 用自有域还是借公共大站」。
+    #        ⚠️ 必须在事务内（失败由快照回滚），否则会出现「域名已改、SNI 来源
+    #        还是旧的」这种半成品 —— 表现为「切了公共，订阅 sni 仍是自己的域名」。
+    save_state "${_mode_key}" "$_mode"
+
     # ── 4) 级联重建：xray（dest/serverNames 随 state 重算）+ nginx 全量
     #        （server 块 / SNI map / 伪装 webroot）+ unbound + 客户端订阅。
     #  ⚠️ 槽位词汇必须翻译：regen_after_domain_change 认的是 `reality`，
@@ -2635,17 +2666,21 @@ apply_reality_sni_switch() {
     #  regen_after_domain_change 对 nginx 段是 `do_conf_nginx && info || warn` ——
     #  **失败也返回 0**（它刻意设计成「失败不中断整个级联」）。所以这里必须自己
     #  验一遍产物，否则会出现「报成功、配置没换」的半成品状态，正是本函数要消灭的。
-    if ! _sni_switch_verify "$_slot" "$_domain" "$_old"; then
+    if ! _sni_switch_verify "$_slot" "$_domain" "$_old" "$_mode"; then
         _sni_switch_rollback
         rm -rf "$_snap_root"
         return 1
     fi
 
     rm -rf "$_snap_root"
-    if [[ -n "$_domain" ]]; then
-        log_info "${_slot} 已切换为「用自有域自建」：SNI=${_domain}（配置表第 ${_row} 行已同步）"
+    if [[ "$_mode" == "public" ]]; then
+        if [[ -n "$_domain" ]]; then
+            log_info "已切换为「借公共大站 SNI」；连接地址仍用 ${_domain}（配置表第 ${_row} 行保留）"
+        else
+            log_info "已切换为「借公共大站 SNI」；未分配自有域，连接地址用服务器 IP（配置表第 ${_row} 行已清空）"
+        fi
     else
-        log_info "${_slot} 已切换为「借公共大站 SNI」（配置表第 ${_row} 行已清空）"
+        log_info "已切换为「用自有域自建」：SNI=${_domain}（配置表第 ${_row} 行已同步）"
     fi
     return 0
 }
