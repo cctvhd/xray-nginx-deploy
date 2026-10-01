@@ -251,6 +251,31 @@ state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读�
 
   **两条已知代价（要真实 IP 就别选 Reality 落点）**：落点若选 Reality 域（`reality` / `xhttp-reality`），请求是 xray 的 fallback 转给 nginx 的，**转过去时不带真实源地址**（reality inbound 是 `xver=0`、不发 PROXY protocol，8321/8326 的 `listen` 也没开 `proxy_protocol`）→ `$final_real_ip` 退化成 `127.0.0.1`：限流变成**一个桶装所有客户端**、access log 记不到真实 IP。当选这类落点时脚本会打 5 行 WARN 明说（实测确认，不是推断）。另一条：**CDN 落点只对「经 CF 进来」的请求生效**（见上条 `$redirect_to_fake`）—— 家里必须走 `https://<域><路径>` 经 CF，直连源站那条路会被伪装页接走。
 
+- **服务端屏蔽 PT 站域名（2026-10-01，三处同源）**：用户给了 5 个常用 PT 域（`pt.btschool.club` / `t.pthome.org` / `tracker-public.tjupt.org` / `tracker.m-team.cc` / `tracker.nanyangpt.com`）要求「服务端做兜底」屏蔽。三家各按自己的语法加一条**域级拒绝**，都放在 cn 分流规则**之前**：
+
+  | 组件 | 语法 | 位置 |
+  |---|---|---|
+  | `modules/xray.sh` | `"domain": ["domain:<域>", …]` + `outboundTag: "block"`（blackhole 出站已存在） | `geoip:private→block` 与 `geosite:cn/tld-cn→warp` **之间** |
+  | `modules/singbox.sh` | `"domain_suffix": [<域>, …]` + `action: "reject"` | `ip_is_private→reject` 与 `rule_set:["geosite-cn"]→warp` **之间** |
+  | `modules/hysteria2.sh` | `reject(suffix:<域>)` | `reject(geoip:cn)` 与 `direct(all)` **之间** |
+
+  **排序是刻意的**：实测（protobuf 解 `/usr/local/share/xray/geosite.dat`）`btschool.club` / `tjupt.org` / `m-team.cc` / `nanyangpt.com` 落在 **`CATEGORY-PT`**（不是 `cn` 也不是 `tld-cn`），`pthome.org` 哪个分类都没有 —— 所以**现在**排在 cn 之后也拦得住。但 `geosite.dat` 随 xray 升级更新，一旦将来这几个域并进 cn 分类，排在 warp 之后的规则会被静默截走而**永不生效**，故一律前置。
+
+  ⚠️ **三家语法差别是实测出来的，别照抄**：xray 的 `domain:` 前缀 = 该域**及其子域**；sing-box 的 `domain_suffix` 同样是「域 + 子域」但**按标签边界**（`google.com` 不被后缀 `le.com` 匹配）；**hysteria2 只有 `suffix:`，裸写 `btschool.club` 只匹配该主机、不含 `pt.` / `tracker.` 子域** —— 用它就等于漏掉全部实际域名。三家分属**三个不同文件、三份互不相干的语法**，没有共用常量可抽，故在每处都写了「三处同源，改要一起改」的注释。
+
+  ⚠️ **这是兜底，不是改道**：`blackhole` / `reject` 是**断开**连接，**不会**fallback 到直连。前置事实（实机测的）：这 5 个域当时**正被客户端经代理中转**（`/var/log/xray/error.log` 里 `pt.btschool.club` 1666 次 / 最后 `2026-10-01 07:38`、`tracker.m-team.cc` 8380 次 / `07:20`，`pthome.org` 0 次）。所以**一旦生效，客户端若仍把这几个站指向代理，这些站立刻不可用**，必须先把客户端路由改回直连 —— 规则的语义是「指错了就断给你看」，不是「指错了帮你绕直连」。
+
+  ⚠️ **域级规则拦不住 BT 的 P2P 流量**：DHT / peer 之间是 IP:port、既无 SNI 也无 Host，域名规则一概不匹配。本次只解决「客户端把 PT 的 HTTP(S) 流量送进代理」这一条。
+
+  **验证（三层，判据都不是推断）**：
+  1. **语义层**（真实二进制起临时实例走 SOCKS 实测）：`/tmp/blocksem_test.sh` + `/tmp/blocksem_hy2.sh` 证明三家「域 + 子域都拒、无关域放行」，并专门加了 `le.com` 探针确认不是「裸 `HasSuffix`」。⚠️ 写 hysteria 测试时踩到：**它按文件扩展名选解析器**，YAML 内容写进 `.json` 文件名 → `FATAL invalid character 'l' looking for beginning of value`，服务端根本没起，四个探测全返回「blocked」的**假阳性** —— 别用 `.json` 装 YAML。
+  2. **生成层**（`unshare -m` + tmpfs 盖住 `/etc/{xray-deploy,hysteria}` `…`，用**真活机 state** 跑真生成函数）：`/tmp/blockgen_test.sh`（xray 8/8、sing-box 8/8）+ `/tmp/blockhy_test.sh`（hysteria 5/5），断言规则内容/顺序正确、`xray run -test` 与 `sing-box check` 通过、且与活机现有配置 **diff 为纯新增（xray +11/-0、sing-box +10/-0、hysteria +5/-0）** —— 即改动是外科式的、没有顺手改到别处。⚠️ 两个沙箱坑：**(a)** `source` install.sh 前缀会把它的 `set -euo pipefail` 一并带进来，「断言一个预期失败的调用」会让脚本**静默中止**（满屏 ✓ 却没有汇总行），测试里要 `set +e`；**(b)** 二进制要写日志，沙箱里 `/var/log` 是空 tmpfs → 先 `mkdir -p /var/log/xray`，否则 `xray run -test` 报错而非「配置不合法」。
+  4. **决定性 A/B**（`/tmp/blockctrl_test.sh`，专治「是不是 PT 站自己拒了机房 IP」这个替代解释）：起一个**配置与活机 `reality-direct` 完全相同（同 privateKey / 同 serverNames / 同 shortIds）、只把屏蔽规则剥掉**的本地 xray，客户端走它重测 → 5 个域**全部可达且状态码与直连基线逐个吻合**（302/404/302/400/403），对照组自证 `iana → 200`。⚠️ 两个坑：**(i)** 过滤规则时写 `'btschool.club' not in domain` **是错的**（列表里的条目是 `domain:btschool.club`），规则压根没被剥掉，必须 `any('btschool' in x for x in domain)`——**对照组必须先把「规则确实没了」打出来看**；**(ii)** 活机入站开了 `sockopt.acceptProxyProtocol`（nginx stream 用 PROXY protocol 转发），对照组是**直连**，不置 `False` 的话服务端读不到 ClientHello，表现为 `REALITY: processed invalid connection … failed to read client hello` + 客户端 `connection reset`，看着像密钥不对。
+
+  ⚠️ **活机落地时踩到的两件事**：**(a)** `/etc/xray-deploy/install.lock` 被一个**用户自己开着的 `bash <(fd)` 会话**持有（`flock -n` 非阻塞），脚本直接报「另一个实例正在运行」。判断它是不是真在干活看 `/proc/<pid>/`：该进程 **2h24m 只耗 1 秒 CPU、无子进程、`wchan=wait_woken`**（阻塞在 tty 的 `read`）→ 确属陈旧锁。`flock` 锁的是 **inode**，`rm -f` 掉文件后新实例会创建新 inode 并加锁成功，**不会碰到用户那个会话**。**(b)** `start_singbox()` 用的是 `systemctl enable --now`，对**已运行**的 unit 是 **no-op** → 配置文件换了但**服务还跑着旧配置**（实测：config.json mtime 09:09:44，服务 ActiveEnterTimestamp 停在 2026-09-30 04:15:53）。本次是手工 `systemctl restart sing-box` 补的；**这是既有缺陷、不在本次改动范围**，只报告未修（xray 的 `start_xray` 与 hysteria 的启动都是 `systemctl restart`，不受影响）。
+
+  **回退**：`git revert <sha>` 后重跑「配置 Xray」(11) /「配置 Sing-Box」(12) /「配置 Hysteria2」(13)。**回退前先确认客户端已把这几个站改回直连** —— 本次不碰客户端链接生成，**回退不必重新下发订阅**。**改完必须 push 到 `BASE_URL` 分支**（三个模块文件，见上方分发陷阱；CDN 逐文件独立缓存，只有 `cmp` 是可信判据）。
+
 ## 活机探索记录：unbound 自带 DoH 当反代上游（2026-09-30，**未进脚本，仅活机手工配置**）
 
 背景：想给家里路由器提供自建 DoH（`https://<域名>/dns-query`）时，除了装 mosdns-x，也可以直接用 unbound 自带的 DoH 服务端（1.12+ 支持；活机 1.24.2 实测全指令可用）。两个**很容易再踩一次、且很难第一时间联想到**的坑：
