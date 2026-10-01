@@ -9,3 +9,5 @@ __pycache__/
 # （EDIT_NODES_DATA_DIR / argv[1]）指进仓库时令牌被误 add 进去。
 config.txt
 .config.tsv
+config.txt
+.config.tsv
