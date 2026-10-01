@@ -362,6 +362,10 @@ _doh_note_reality_penalty() {
 }
 
 # 打印可用域名列表。$1 = 当前生效的域名（可空），命中的那行标「← 当前」。
+# 其余参数每项形如 "域名|标签"，标签标明该域是【经 Cloudflare（CDN）】还是
+# 【直连本机（直连）】—— 用户 2026-10-01 原话「在备用域名中应该显示那些是 cdn 的
+# 那些是直连」。CDN 域的 $final_real_ip 拿得到真实客户端 IP；直连域只能看到客户端
+# 自己的地址；而 Reality 域连这个也退化（见 _doh_note_reality_penalty），故单独标出。
 # 没有候选时一个字也不打、返回 1 —— 调用方据此决定提示里要不要写「或输入序号」。
 # 列表要打给【两个分支】（已启用 / 未启用）看，序号的含义才有一致性：只在首次
 # 启用时列候选，会让「已启用后想换域名」的人对着一个空提示盲输域名（2026-10-01
@@ -372,13 +376,15 @@ _doh_print_domain_list() {
     local cur="$1"; shift
     (( $# > 0 )) || return 1
     echo "  可用域名（同一个域名可以既跑协议又跑 DoH，共用即可）:"
-    local i=0 d
-    for d in "$@"; do
+    echo "    [CDN] = 经 Cloudflare 回源（客户端真实 IP 最完整）   [直连] = 直连本机"
+    local i=0 entry d tag
+    for entry in "$@"; do
         i=$(( i + 1 ))
+        d="${entry%%|*}"; tag="${entry#*|}"
         if [[ -n "$cur" && "$d" == "$cur" ]]; then
-            echo "    ${i}. ${d}   ← 当前"
+            echo "    ${i}. ${d}   [${tag}]   ← 当前"
         else
-            echo "    ${i}. ${d}"
+            echo "    ${i}. ${d}   [${tag}]"
         fi
     done
     return 0
@@ -434,9 +440,15 @@ configure_doh_entry() {
             _plain+=("$_d")
         fi
     done < <(_doh_candidates 2>/dev/null)
-    # 序号就是按这个顺序（CDN → 直连 → Reality）编的
-    local -a _all=( "${_cdn[@]}" "${_plain[@]}" "${_reality[@]}" )
-    local _default="${_all[0]:-}"
+    # 序号就是按这个顺序（CDN → 直连 → Reality）编的。每项带上给用户看的落点
+    # 标签（[CDN] / [直连] / [直连 (Reality)]）—— 只用于显示和选序号，取域名时
+    # 按 "|" 前那段切回来（见下面两处 %%|*）。
+    local -a _all=()
+    local _x
+    for _x in "${_cdn[@]}";     do _all+=("${_x}|CDN"); done
+    for _x in "${_plain[@]}";   do _all+=("${_x}|直连"); done
+    for _x in "${_reality[@]}"; do _all+=("${_x}|直连 (Reality)"); done
+    local _default="${_all[0]%%|*}"
 
     # ── 已启用：回车保持 / 0 关闭 / p 换路径 / 序号或新域名换域 ──
     if [[ -n "$cur_domain" && -f /etc/nginx/conf.d/doh.conf ]]; then
@@ -480,7 +492,7 @@ configure_doh_entry() {
                 log_warn "序号超出范围（1-${#_all[@]}），请重输或直接输入域名"
                 return 1
             fi
-            ans="${_all[$(( ans - 1 ))]}"
+            ans="${_all[$(( ans - 1 ))]%%|*}"
         else
             ans="${ans,,}"
         fi
@@ -535,7 +547,7 @@ configure_doh_entry() {
                 log_warn "序号超出范围（1-${#_all[@]}），请重输或直接输入域名"
                 continue
             fi
-            _sel="${_all[$(( _sel - 1 ))]}"
+            _sel="${_all[$(( _sel - 1 ))]%%|*}"
         else
             _sel="${_sel,,}"
             if ! _doh_domain_usable "$_sel"; then
