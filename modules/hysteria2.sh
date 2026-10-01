@@ -42,6 +42,20 @@ install_hysteria2() {
     chmod 644 /var/lib/hysteria/*.dat 2>/dev/null || true
 }
 
+# 统一 read 封装：configure_hysteria2 里所有交互式读取都经这里。读不到输入
+# （EOF / 非交互模式，如 `echo "" | ./install.sh`）时不是静默落默认值继续往下
+# 跑——那会一路把所有选项落默认、重写 config.yaml 并重启服务，打挂所有现有
+# 客户端（F5）——而是大声中止：未改任何配置、未重启服务。
+# ⚠️ 必须 exit 而非 return：configure_hysteria2 被 run_hysteria2 直接调用且
+#    不检查返回码，return 会漏到「安装 & 配置完成」的假成功日志。
+_read_hysteria2() {
+    local _prompt="$1" _var="$2"
+    if ! read -rp "$_prompt" "$_var"; then
+        log_error "读取输入失败（EOF / 非交互模式）：已中止，未改动任何配置、未重启服务"
+        exit 1
+    fi
+}
+
 configure_hysteria2() {
     log_step "配置 Hysteria2..."
 
@@ -75,8 +89,8 @@ configure_hysteria2() {
         HY2_CERT="/etc/letsencrypt/live/${root_domain}/fullchain.pem"
         HY2_KEY="/etc/letsencrypt/live/${root_domain}/privkey.pem"
     else
-        read -rp "证书路径 fullchain.pem: " HY2_CERT
-        read -rp "私钥路径 privkey.pem:   " HY2_KEY
+        _read_hysteria2 "证书路径 fullchain.pem: " HY2_CERT
+        _read_hysteria2 "私钥路径 privkey.pem:   " HY2_KEY
     fi
 
     log_info "证书: ${HY2_CERT}"
@@ -86,7 +100,7 @@ configure_hysteria2() {
     local HY2_PORT
     HY2_PORT=$(get_state "HYSTERIA2_PORT")
     if [[ -z "${HY2_PORT}" ]]; then
-        read -rp "Hysteria2 端口 [默认: 443]: " HY2_PORT
+        _read_hysteria2 "Hysteria2 端口 [默认: 443]: " HY2_PORT
         HY2_PORT="${HY2_PORT:-443}"
         save_state "HYSTERIA2_PORT" "${HY2_PORT}"
         log_info "端口: ${HY2_PORT}"
@@ -115,7 +129,7 @@ configure_hysteria2() {
     echo "  1. Brutal (默认，Hysteria2 专属，固定速率，恶劣网络首选)"
     echo "  2. BBR (均衡，兼容性好)"
     echo "  3. Reno (保守，最稳)"
-    read -rp "输入序号 [1-3，默认 1]: " congestion_num
+    _read_hysteria2 "输入序号 [1-3，默认 1]: " congestion_num
     case "${congestion_num}" in
         2)
             congestion_mode="bbr"
@@ -125,7 +139,7 @@ configure_hysteria2() {
             echo "  1. conservative (保守)"
             echo "  2. standard (默认/均衡)"
             echo "  3. aggressive (激进)"
-            read -rp "输入序号 [1-3，默认 2]: " bbr_num
+            _read_hysteria2 "输入序号 [1-3，默认 2]: " bbr_num
             case "${bbr_num}" in
                 1) bbr_profile="conservative" ;;
                 3) bbr_profile="aggressive" ;;
@@ -149,11 +163,11 @@ configure_hysteria2() {
             congestion_mode="brutal"
             congestion_type=""
             ignore_client_bandwidth="false"
-            read -rp "到服务器的平均延迟 (ms) [默认: 200]: " delay
+            _read_hysteria2 "到服务器的平均延迟 (ms) [默认: 200]: " delay
             delay="${delay:-200}"
-            read -rp "期望下行速度 (mbps) [默认: 50]: " download
+            _read_hysteria2 "期望下行速度 (mbps) [默认: 50]: " download
             download="${download:-50}"
-            read -rp "期望上行速度 (mbps) [默认: 10]: " upload
+            _read_hysteria2 "期望上行速度 (mbps) [默认: 10]: " upload
             upload="${upload:-10}"
             log_info "拥塞控制: Brutal / delay=${delay}ms dl=${download}mbps ul=${upload}mbps"
             save_state "HYSTERIA2_CONGESTION" "brutal"
@@ -199,7 +213,7 @@ configure_hysteria2() {
     echo "  2. ECH - 裸连接 + 加密 ClientHello，对中间盒隐藏真实 SNI"
     echo "  3. salamander - 将数据包混淆为无特征随机字节"
     echo "  4. gecko (实验性) - 在 salamander 基础上额外拆分 QUIC 握手包为随机分片，抗 DPI 检测更强"
-    read -rp "输入序号 [1-4，默认 1]: " obfs_num
+    _read_hysteria2 "输入序号 [1-4，默认 1]: " obfs_num
     if [[ "${obfs_num}" == "2" ]]; then
         mkdir -p /etc/hysteria
         ech_public="$(get_state "HYSTERIA2_ECH_PUBLIC")"
@@ -231,7 +245,7 @@ configure_hysteria2() {
             # 每台机器随机取默认值，避免部署出去的机器外层 SNI 全都一样
             local _ech_default="${_ech_names[$(( RANDOM % ${#_ech_names[@]} ))]}"
             local _ech_input
-            read -rp "外层 SNI [回车采用随机候选: ${_ech_default}]: " _ech_input
+            _read_hysteria2 "外层 SNI [回车采用随机候选: ${_ech_default}]: " _ech_input
             ech_public="${_ech_input:-${_ech_default}}"
 
             # 软校验：只告警不拦截。脚本也测不了该域名在目标网络是否可达
@@ -305,13 +319,13 @@ configure_hysteria2() {
     echo "  1. proxy (默认，反代一个网站)"
     echo "  2. string (返回固定字符串)"
     echo "  3. file (静态文件服务器)"
-    read -rp "输入序号 [1-3，默认 1]: " masq_num
+    _read_hysteria2 "输入序号 [1-3，默认 1]: " masq_num
     case "${masq_num}" in
         2)
             masquerade_type="string"
-            read -rp "伪装字符串 [默认: HelloWorld]: " masquerade_string
+            _read_hysteria2 "伪装字符串 [默认: HelloWorld]: " masquerade_string
             masquerade_string="${masquerade_string:-HelloWorld}"
-            read -rp "HTTP 伪装标头 content-stuff [默认: HelloWorld]: " masquerade_stuff
+            _read_hysteria2 "HTTP 伪装标头 content-stuff [默认: HelloWorld]: " masquerade_stuff
             masquerade_stuff="${masquerade_stuff:-HelloWorld}"
             log_info "伪装: string / ${masquerade_string}"
             ;;
@@ -323,12 +337,12 @@ configure_hysteria2() {
             ;;
         *)
             masquerade_type="proxy"
-            read -rp "伪装代理地址 [默认: https://news.ycombinator.com/]: " masquerade_proxy
+            _read_hysteria2 "伪装代理地址 [默认: https://news.ycombinator.com/]: " masquerade_proxy
             masquerade_proxy="${masquerade_proxy:-https://news.ycombinator.com/}"
             echo "是否附加 X-Forwarded-For / Host / Proto 请求头?"
             echo "  1. 启用 (默认)"
             echo "  2. 关闭"
-            read -rp "输入序号 [1-2，默认 1]: " xfwd
+            _read_hysteria2 "输入序号 [1-2，默认 1]: " xfwd
             if [[ "${xfwd}" == "2" ]]; then
                 masquerade_xforwarded="false"
             else
@@ -350,7 +364,7 @@ configure_hysteria2() {
         echo "是否同时监听 tcp/${HY2_PORT} 增强伪装?"
         echo "  1. 启用 (默认，浏览器无 H3 时也能看到伪装内容)"
         echo "  2. 跳过"
-        read -rp "输入序号 [1-2，默认 1]: " masq_tcp
+        _read_hysteria2 "输入序号 [1-2，默认 1]: " masq_tcp
         if [[ -z "${masq_tcp}" ]] || [[ "${masq_tcp}" == "1" ]]; then
             masquerade_tcp="true"
             log_info "TCP 伪装监听: 启用 (端口 ${HY2_PORT})"
@@ -367,7 +381,7 @@ configure_hysteria2() {
     echo "  使 YouTube 等 QUIC 网站不走 Hysteria2 代理，提升体验"
     echo "  1. 启用 (推荐)"
     echo "  2. 跳过 (默认)"
-    read -rp "输入序号 [1-2，默认 2]: " bh3
+    _read_hysteria2 "输入序号 [1-2，默认 2]: " bh3
     if [[ "${bh3}" == "1" ]]; then
         block_http3="true"
         log_info "HTTP/3 屏蔽: 启用"
@@ -387,13 +401,13 @@ configure_hysteria2() {
     echo "  长时间单端口 UDP 容易被 QoS/封锁，端口跳跃可有效缓解"
     echo "  1. 启用 (默认)"
     echo "  2. 跳过"
-    read -rp "输入序号 [1-2，默认 1]: " ph_status
+    _read_hysteria2 "输入序号 [1-2，默认 1]: " ph_status
     if [[ -z "${ph_status}" ]] || [[ "${ph_status}" == "1" ]]; then
         portHoppingStatus="true"
         while true; do
-            read -rp "起始端口 [默认: 47000]: " portHoppingStart
+            _read_hysteria2 "起始端口 [默认: 47000]: " portHoppingStart
             portHoppingStart="${portHoppingStart:-47000}"
-            read -rp "结束端口 [默认: 48000]: " portHoppingEnd
+            _read_hysteria2 "结束端口 [默认: 48000]: " portHoppingEnd
             portHoppingEnd="${portHoppingEnd:-48000}"
             if (( portHoppingStart >= portHoppingEnd )); then
                 log_warn "起始端口必须小于结束端口"
@@ -408,16 +422,16 @@ configure_hysteria2() {
         echo "跳跃时间模式:"
         echo "  1. 固定间隔 (默认)"
         echo "  2. 随机间隔"
-        read -rp "输入序号 [1-2，默认 1]: " ph_mode
+        _read_hysteria2 "输入序号 [1-2，默认 1]: " ph_mode
         if [[ -z "${ph_mode}" ]] || [[ "${ph_mode}" == "1" ]]; then
             portHoppingIntervalMode="fixed"
-            read -rp "固定跳跃间隔 [默认: 30s，最低 5s]: " portHoppingHopInterval
+            _read_hysteria2 "固定跳跃间隔 [默认: 30s，最低 5s]: " portHoppingHopInterval
             portHoppingHopInterval="${portHoppingHopInterval:-30s}"
         else
             portHoppingIntervalMode="random"
-            read -rp "最小跳跃间隔 [默认: 10s，最低 5s]: " portHoppingMinHopInterval
+            _read_hysteria2 "最小跳跃间隔 [默认: 10s，最低 5s]: " portHoppingMinHopInterval
             portHoppingMinHopInterval="${portHoppingMinHopInterval:-10s}"
-            read -rp "最大跳跃间隔 [默认: 30s]: " portHoppingMaxHopInterval
+            _read_hysteria2 "最大跳跃间隔 [默认: 30s]: " portHoppingMaxHopInterval
             portHoppingMaxHopInterval="${portHoppingMaxHopInterval:-30s}"
         fi
         log_info "端口跳跃: ${portHoppingStart}-${portHoppingEnd} (${portHoppingIntervalMode})"
