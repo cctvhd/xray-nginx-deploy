@@ -340,7 +340,8 @@ start_singbox() {
         exit 1
     fi
 
-    systemctl enable --now sing-box
+    systemctl enable sing-box
+    systemctl restart sing-box
 
     sleep 2
     if systemctl is-active --quiet sing-box; then
