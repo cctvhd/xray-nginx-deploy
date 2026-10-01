@@ -361,6 +361,29 @@ _doh_note_reality_penalty() {
     esac
 }
 
+# 打印可用域名列表。$1 = 当前生效的域名（可空），命中的那行标「← 当前」。
+# 没有候选时一个字也不打、返回 1 —— 调用方据此决定提示里要不要写「或输入序号」。
+# 列表要打给【两个分支】（已启用 / 未启用）看，序号的含义才有一致性：只在首次
+# 启用时列候选，会让「已启用后想换域名」的人对着一个空提示盲输域名（2026-10-01
+# 用户实测报「没有显示备选域名」）；而序号若只在一边可用，从第一次配置就记住
+# 「输序号」的人第二次会被当成域名判成「不可用」（用户同日报「好像没有重新设置
+# nginx 相关配置」—— 编号没被接受，入口自然一点没动）。
+_doh_print_domain_list() {
+    local cur="$1"; shift
+    (( $# > 0 )) || return 1
+    echo "  可用域名（同一个域名可以既跑协议又跑 DoH，共用即可）:"
+    local i=0 d
+    for d in "$@"; do
+        i=$(( i + 1 ))
+        if [[ -n "$cur" && "$d" == "$cur" ]]; then
+            echo "    ${i}. ${d}   ← 当前"
+        else
+            echo "    ${i}. ${d}"
+        fi
+    done
+    return 0
+}
+
 # ── DoH 入口（域名 / 路径）───────────────────────────────────
 # 从 nginx.sh 搬过来的问答：候选域名由 _doh_candidates 从配置表派生的
 # DOMAIN_REGISTRY 生成，逐个用 _doh_domain_usable 判「该域的 TLS 是否在
@@ -394,13 +417,40 @@ configure_doh_entry() {
     cur_domain=$(get_state "DOH_DOMAIN" "")
     cur_path=$(get_state "DOH_PATH" "")
 
-    # ── 已启用：回车保持 / 0 关闭 / p 换路径 / 或换一个新域名 ──
+    # ── 候选域名：两个分支共用同一份（列表、排序、序号含义都一致）──
+    # 优先级：CDN 域 > 直连域 > Reality 域。
+    # CDN 域最好：有 CF 那一层在，$final_real_ip 拿到的就是真实客户端 IP。
+    # Reality 域最差：请求是 xray fallback 转过来的，没有真实源地址（见
+    # _doh_note_reality_penalty），限流会退化成单桶、日志也记不到真实 IP。
+    local -a _cdn=() _plain=() _reality=()
+    local _d _m _p
+    while IFS=$'\t' read -r _d _m _p; do
+        [[ -n "$_d" ]] || continue
+        if [[ "$_m" == "cdn" ]]; then
+            _cdn+=("$_d")
+        elif [[ "$_p" == *reality* ]]; then
+            _reality+=("$_d")
+        else
+            _plain+=("$_d")
+        fi
+    done < <(_doh_candidates 2>/dev/null)
+    # 序号就是按这个顺序（CDN → 直连 → Reality）编的
+    local -a _all=( "${_cdn[@]}" "${_plain[@]}" "${_reality[@]}" )
+    local _default="${_all[0]:-}"
+
+    # ── 已启用：回车保持 / 0 关闭 / p 换路径 / 序号或新域名换域 ──
     if [[ -n "$cur_domain" && -f /etc/nginx/conf.d/doh.conf ]]; then
         log_info "当前 DoH 入口: https://${cur_domain}${cur_path}"
+        local _listed=0
+        if _doh_print_domain_list "$cur_domain" "${_all[@]}"; then _listed=1; fi
         echo "        回车 = 保持不变"
         echo "        p    = 只换访问路径（/ 后面那一段）"
         echo "        0    = 关闭该入口"
-        echo "        或直接输入新域名（路径不变）"
+        if (( _listed )); then
+            echo "        或输入序号 / 新域名（换域名，路径不变）"
+        else
+            echo "        或直接输入新域名（路径不变）"
+        fi
         local ans
         read -rp "  请选择: " ans
         ans="${ans// /}"
@@ -421,7 +471,19 @@ configure_doh_entry() {
             _doh_entry_apply "$cur_domain"
             return $?
         fi
-        ans="${ans,,}"
+        # 序号 = 上面那份列表里的第几条（与「未启用」分支的序号含义相同）。
+        # 选到「当前」那一条不算空操作：下面照样走 _doh_entry_apply，会把
+        # doh.conf / servers.conf / SNI map 重新生成一遍 —— 等于给了用户一个
+        # 「不改域名、只重新应用一遍 nginx 路由」的入口。
+        if [[ "$ans" =~ ^[0-9]+$ ]]; then
+            if (( ans < 1 || ans > ${#_all[@]} )); then
+                log_warn "序号超出范围（1-${#_all[@]}），请重输或直接输入域名"
+                return 1
+            fi
+            ans="${_all[$(( ans - 1 ))]}"
+        else
+            ans="${ans,,}"
+        fi
         if ! _doh_domain_usable "$ans"; then
             log_error "域名 ${ans} 不可用：需证书已签发，且该域的 TLS 由 nginx 终结"
             log_error "  AnyTLS / NaiveProxy 的域不行 —— TLS 在 sing-box / Caddy 自己手里，"
@@ -436,33 +498,9 @@ configure_doh_entry() {
     fi
 
     # ── 未启用：默认取配置表派生的可用域 ───────────────────────
-    # 优先级：CDN 域 > 直连域 > Reality 域。
-    # CDN 域最好：有 CF 那一层在，$final_real_ip 拿到的就是真实客户端 IP。
-    # Reality 域最差：请求是 xray fallback 转过来的，没有真实源地址（见
-    # _doh_note_reality_penalty），限流会退化成单桶、日志也记不到真实 IP。
-    local -a _cdn=() _plain=() _reality=()
-    local _d _m _p
-    while IFS=$'\t' read -r _d _m _p; do
-        [[ -n "$_d" ]] || continue
-        if [[ "$_m" == "cdn" ]]; then
-            _cdn+=("$_d")
-        elif [[ "$_p" == *reality* ]]; then
-            _reality+=("$_d")
-        else
-            _plain+=("$_d")
-        fi
-    done < <(_doh_candidates 2>/dev/null)
+    # 候选列表与优先级见函数上方那段（两个分支共用同一份）。
+    _doh_print_domain_list "" "${_all[@]}"
 
-    if [[ $(( ${#_cdn[@]} + ${#_plain[@]} + ${#_reality[@]} )) -gt 0 ]]; then
-        echo "  可用域名（同一个域名可以既跑协议又跑 DoH，共用即可）:"
-        local _i=0
-        for _d in "${_cdn[@]}" "${_plain[@]}" "${_reality[@]}"; do
-            _i=$(( _i + 1 ))
-            echo "    ${_i}. ${_d}"
-        done
-    fi
-
-    local _default="${_cdn[0]:-${_plain[0]:-${_reality[0]:-}}}"
     if [[ -n "$_default" ]]; then
         local _why
         if [[ ${#_cdn[@]} -gt 0 ]]; then
@@ -492,8 +530,7 @@ configure_doh_entry() {
             log_info "未启用 DoH 入口"
             return 0
         elif [[ "$_sel" =~ ^[0-9]+$ ]]; then
-            # 序号选择：列表是 CDN → 直连 → Reality 拼起来的，顺序与上面一致
-            local -a _all=( "${_cdn[@]}" "${_plain[@]}" "${_reality[@]}" )
+            # 序号选择：_all 就是函数开头那份列表（CDN → 直连 → Reality）
             if (( _sel < 1 || _sel > ${#_all[@]} )); then
                 log_warn "序号超出范围（1-${#_all[@]}），请重输或直接输入域名"
                 continue
@@ -589,7 +626,17 @@ _doh_entry_apply() {
     fi
 
     if declare -F sync_refresh_nginx_routes >/dev/null 2>&1; then
-        sync_refresh_nginx_routes "mosdns-x" || return 1
+        # ⚠️ 到这一步 state 与 doh.conf / doh_location.conf 【已经改了】，而
+        # nginx.conf / servers.conf 还没跟上（preflight 拦下、或生成中途失败）。
+        # 不吭声地 return 1，用户看到的现象就是「改了域名但 nginx 相关配置没重新
+        # 设置」—— 磁盘上两套配置已经不一致了，必须把这件事说出来并给出下一步
+        # （2026-10-01 用户报告的二次配置问题里就有这一类）。
+        if ! sync_refresh_nginx_routes "mosdns-x"; then
+            log_error "DoH 入口已写入 state 与 doh.conf，但【nginx 路由没刷新成功】——"
+            log_error "  此刻 443 上跑的还是旧的那一套（本次改动没生效）"
+            log_error "  按上面报错处理后再跑一次「配置 DoH 入口」，或直接跑「配置 Nginx」把路由补上"
+            return 1
+        fi
     else
         log_error "modules/sync.sh 版本过旧（无 sync_refresh_nginx_routes），无法重生成 nginx 路由"
         return 1
