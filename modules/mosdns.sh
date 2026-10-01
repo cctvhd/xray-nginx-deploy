@@ -361,11 +361,34 @@ _doh_note_reality_penalty() {
     esac
 }
 
+# 把 DOMAIN_PROTO_ 标签串（可能多个、逗号分隔）压成给用户看的短名。
+# 空串报「空闲」：能进候选列表说明证书齐备，只是表里没给这个域挂任何协议标签
+# —— 那种域没有 TCP/443 的 vhost，走独立 8410 落点。如实说，不编。
+_doh_proto_label() {
+    local protos="${1:-}"
+    local -a names=()
+    [[ "$protos" == *xray-xhttp*    ]] && names+=("XHTTP")
+    [[ "$protos" == *xhttp-reality* ]] && names+=("XHTTP-Reality")
+    [[ "$protos" == *xray-grpc*     ]] && names+=("gRPC")
+    [[ "$protos" == *xray-reality*  ]] && names+=("Reality")
+    [[ "$protos" == *hysteria2*     ]] && names+=("Hysteria2(UDP)")
+    [[ "$protos" == *singbox*       ]] && names+=("AnyTLS")
+    [[ "$protos" == *naiveproxy*    ]] && names+=("NaiveProxy")
+    if (( ${#names[@]} == 0 )); then
+        echo "空闲"
+    else
+        local IFS='/'
+        echo "${names[*]}"
+    fi
+}
+
 # 打印可用域名列表。$1 = 当前生效的域名（可空），命中的那行标「← 当前」。
-# 其余参数每项形如 "域名|标签"，标签标明该域是【经 Cloudflare（CDN）】还是
-# 【直连本机（直连）】—— 用户 2026-10-01 原话「在备用域名中应该显示那些是 cdn 的
-# 那些是直连」。CDN 域的 $final_real_ip 拿得到真实客户端 IP；直连域只能看到客户端
-# 自己的地址；而 Reality 域连这个也退化（见 _doh_note_reality_penalty），故单独标出。
+# 其余参数每项形如 "域名|标签"，标签 = 落点类型 + 该域跑的协议，例如
+# "CDN · XHTTP" / "直连 · Hysteria2(UDP)"。用户 2026-10-01 两句原话：
+# 「在备用域名中应该显示那些是 cdn 的那些是直连」→ 落点类型；
+# 「不是有一个直连是给 Hysteria2 udp 使用的吗…但你的页面没有显示」→ 协议。
+# 协议这一列有用是因为：Hysteria2 只占 UDP，与 DoH 的 443/TCP 零交集，是「直连」
+# 里最省事的落点；而 Reality 域要付 IP 退化的代价（见 _doh_note_reality_penalty）。
 # 没有候选时一个字也不打、返回 1 —— 调用方据此决定提示里要不要写「或输入序号」。
 # 列表要打给【两个分支】（已启用 / 未启用）看，序号的含义才有一致性：只在首次
 # 启用时列候选，会让「已启用后想换域名」的人对着一个空提示盲输域名（2026-10-01
@@ -377,16 +400,19 @@ _doh_print_domain_list() {
     (( $# > 0 )) || return 1
     echo "  可用域名（同一个域名可以既跑协议又跑 DoH，共用即可）:"
     echo "    [CDN] = 经 Cloudflare 回源（客户端真实 IP 最完整）   [直连] = 直连本机"
-    local i=0 entry d tag
+    local i=0 entry d tag mark has_hy2=0
     for entry in "$@"; do
         i=$(( i + 1 ))
         d="${entry%%|*}"; tag="${entry#*|}"
-        if [[ -n "$cur" && "$d" == "$cur" ]]; then
-            echo "    ${i}. ${d}   [${tag}]   ← 当前"
-        else
-            echo "    ${i}. ${d}   [${tag}]"
-        fi
+        [[ "$tag" == *Hysteria2* ]] && has_hy2=1
+        mark=""
+        [[ -n "$cur" && "$d" == "$cur" ]] && mark="   ← 当前"
+        # 域名补到 12 列，好让每行的 [ 都落在同一列（域名是 ASCII，按字节补无妨）
+        printf '    %d. %-12s [%s]%s\n' "$i" "$d" "$tag" "$mark"
     done
+    if (( has_hy2 )); then
+        echo "    · 直连首选 Hysteria2 的域：只占 UDP，与 DoH 的 443/TCP 零交集"
+    fi
     return 0
 }
 
@@ -428,26 +454,22 @@ configure_doh_entry() {
     # CDN 域最好：有 CF 那一层在，$final_real_ip 拿到的就是真实客户端 IP。
     # Reality 域最差：请求是 xray fallback 转过来的，没有真实源地址（见
     # _doh_note_reality_penalty），限流会退化成单桶、日志也记不到真实 IP。
+    # 每项带上给用户看的标签「落点 · 协议」（见 _doh_print_domain_list 上方那段）。
     local -a _cdn=() _plain=() _reality=()
     local _d _m _p
     while IFS=$'\t' read -r _d _m _p; do
         [[ -n "$_d" ]] || continue
         if [[ "$_m" == "cdn" ]]; then
-            _cdn+=("$_d")
+            _cdn+=("${_d}|CDN · $(_doh_proto_label "$_p")")
         elif [[ "$_p" == *reality* ]]; then
-            _reality+=("$_d")
+            _reality+=("${_d}|直连 · $(_doh_proto_label "$_p")")
         else
-            _plain+=("$_d")
+            _plain+=("${_d}|直连 · $(_doh_proto_label "$_p")")
         fi
     done < <(_doh_candidates 2>/dev/null)
-    # 序号就是按这个顺序（CDN → 直连 → Reality）编的。每项带上给用户看的落点
-    # 标签（[CDN] / [直连] / [直连 (Reality)]）—— 只用于显示和选序号，取域名时
-    # 按 "|" 前那段切回来（见下面两处 %%|*）。
-    local -a _all=()
-    local _x
-    for _x in "${_cdn[@]}";     do _all+=("${_x}|CDN"); done
-    for _x in "${_plain[@]}";   do _all+=("${_x}|直连"); done
-    for _x in "${_reality[@]}"; do _all+=("${_x}|直连 (Reality)"); done
+    # 序号就是按这个顺序（CDN → 直连 → Reality）编的。标签只用于显示和选序号，
+    # 取域名时按 "|" 前那段切回来（见下面两处 %%|*）。
+    local -a _all=( "${_cdn[@]}" "${_plain[@]}" "${_reality[@]}" )
     local _default="${_all[0]%%|*}"
 
     # ── 已启用：回车保持 / 0 关闭 / p 换路径 / 序号或新域名换域 ──
