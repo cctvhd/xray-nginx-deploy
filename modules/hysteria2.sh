@@ -582,6 +582,13 @@ EOF
     acl_entries+=("reject(10.0.0.0/8)" "reject(172.16.0.0/12)" "reject(192.168.0.0/16)")
     acl_entries+=("reject(127.0.0.0/8)" "reject(fc00::/7)" "reject(::1/128)")
     acl_entries+=("reject(geosite:cn)" "reject(geosite:tld-cn)" "reject(geoip:cn)")
+    # 屏蔽域名（PT 站等）— 三处同源：modules/xray.sh / modules/singbox.sh / 本文件，改要一起改。
+    # 服务端兜底：客户端路由指对了它永不触发；指错了这几个站直接被拒（不是改走直连）。
+    # ⚠️ hysteria 的域匹配只有 suffix:（匹配该域及其子域），没有 domain: 前缀——
+    #    裸写 btschool.club 只匹配该主机、不含子域，用它就漏掉 pt./tracker. 这些。
+    acl_entries+=("reject(suffix:btschool.club)" "reject(suffix:pthome.org)")
+    acl_entries+=("reject(suffix:tjupt.org)" "reject(suffix:m-team.cc)")
+    acl_entries+=("reject(suffix:nanyangpt.com)")
     acl_entries+=("direct(all)")
     {
         echo "acl:"

@@ -174,6 +174,22 @@ generate_singbox_config() {
 
     local warp_endpoint dns_strategy
     warp_endpoint=$(_build_warp_endpoint_json_sb)
+
+    # ── 屏蔽域名（PT 站等）──────────────────────────────────────
+    # 三处同源：modules/xray.sh / 本文件 / modules/hysteria2.sh —— 改要一起改。
+    # 服务端兜底：客户端路由指对了它永不触发；指错了这几个站直接被拒（不是改走直连）。
+    # domain_suffix 匹配该域及其子域。排在 geosite-cn 之前，避免将来这几个域
+    # 进 cn 分类后被 warp 规则先截走。
+    local blocked_domains_rule='      {
+        "domain_suffix": [
+          "btschool.club",
+          "pthome.org",
+          "tjupt.org",
+          "m-team.cc",
+          "nanyangpt.com"
+        ],
+        "action": "reject"
+      },'
     if is_ipv6_preferred 2>/dev/null; then
         dns_strategy="prefer_ipv6"
     else
@@ -290,6 +306,7 @@ generate_singbox_config() {
         "ip_is_private": true,
         "action":        "reject"
       },
+${blocked_domains_rule}
       {
         "rule_set": ["geosite-cn"],
         "outbound": "warp"

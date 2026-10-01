@@ -897,6 +897,25 @@ generate_xray_config() {
         xray_query_strategy="UseIPv4v6"
     fi
 
+    # ── 屏蔽域名（PT 站等）──────────────────────────────────────
+    # 三处同源：本文件 / modules/singbox.sh / modules/hysteria2.sh —— 改要一起改。
+    # 意义是「服务端兜底」：客户端路由指对了它永不触发；指错了这几个站会被黑洞，
+    # 而不是改走直连（blackhole 是断，不是改道）。
+    # 必须排在下面 geosite:cn→warp 之前：这些域现在在 geosite 的 CATEGORY-PT 分类里
+    # （实测，非 cn/tld-cn），但 geosite.dat 随 xray 升级更新，一旦将来并进 cn 分类，
+    # 排在 warp 之后的规则就会被静默截走而永不生效。
+    local _blocked_domains_routing='            {
+                "type":        "field",
+                "domain":      [
+                    "domain:btschool.club",
+                    "domain:pthome.org",
+                    "domain:tjupt.org",
+                    "domain:m-team.cc",
+                    "domain:nanyangpt.com"
+                ],
+                "outboundTag": "block"
+            },'
+
     mkdir -p /usr/local/etc/xray
 
     # Fix: grpc initial_windows_size 4194304 (4MB) prevents CDN GOAWAY on high-BDP paths; default 65536 too small
@@ -957,6 +976,7 @@ ${_dokodemo_xhttp_routing}
                 "ip":          ["geoip:private"],
                 "outboundTag": "block"
             },
+${_blocked_domains_routing}
             {
                 "type":        "field",
                 "domain":      ["geosite:cn", "geosite:tld-cn"],
