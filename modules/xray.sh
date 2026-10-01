@@ -1131,8 +1131,21 @@ generate_xray_config() {
         _reality_direct_dest="127.0.0.1:8321"
         _reality_direct_sn="\"${REALITY_DOMAIN}\""
     else
+        # dokodemo 的目标 = 借用的公共站。
+        # ⚠️ REALITY_DEST **不可信**：sync_hydrate_client_state（sync.sh:50）按活机
+        #    config.json 的 realitySettings.dest 回填它，而公共模式下那个字段是
+        #    dokodemo 自己的地址（127.0.0.1:4431）→ 下一轮生成把 dokodemo 的目标也
+        #    写成 127.0.0.1:4431 → **转发给自己**，借公共 SNI 的回落全部挂死。
+        #    2026-10-01 活机实测：`openssl s_client -connect 127.0.0.1:443 -servername
+        #    <借用站>` 一直挂到超时；对照组自建槽同一命令立刻返回伪装站证书。
+        #    故回环/空值一律改用 serverNames[0]（客户端真正会发的 SNI）+ 443，
+        #    与 xhttp 槽那份（直接用 XHTTP_REALITY_SNI）保持同一写法。
         local _rdest_host="${REALITY_DEST%%:*}"
         local _rdest_port="${REALITY_DEST##*:}"
+        if [[ -z "$_rdest_host" || "$_rdest_host" == "127.0.0.1" || "$_rdest_host" == "localhost" ]]; then
+            _rdest_host="${REALITY_SERVER_NAMES[0]:-}"
+            _rdest_port=443
+        fi
         _reality_direct_dest="127.0.0.1:4431"
         # reality-direct 只接受真正路由到 8320 的 SNI：排除 XHTTP_REALITY_SNI/DOMAIN，
         # 它们由 nginx stream 分流到 8325（vless-xhttp-reality），与 generate_sni_map 对齐。
