@@ -206,22 +206,31 @@ def load_file():
         LOAD_NOTE = f"⚠ {DATA_FILE} 解析失败({e}) — 下表是内置默认值，不是本机配置！"
 
 
+def _write_atomic(path, text):
+    """先写同目录 .tmp 再 os.replace：中途失败不会留下半截表。
+
+    表是用户资产（且 --set-slot 会在脚本流程里被调用），截断式写入一旦在中途
+    断掉就等于把表清空。state 文件的写入早已是这个范式（install.sh save_state）。
+    """
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
 def save_file():
     # 1) 对齐版 config.txt(跳过全空的备用行)
     rows = [row for row in data if any(row)]
     ws = [max(len(FILE_HEADERS[c]), *(wlen(row[c]) for row in rows)) if rows
           else len(FILE_HEADERS[c]) for c in range(4)]
-    with open(SAVE_FILE, "w", encoding="utf-8") as f:
-        f.write("  ".join(center(FILE_HEADERS[c], ws[c]) for c in range(4)).rstrip() + "\n")
-        for row in rows:
-            f.write("  ".join(pad(row[c], ws[c]) for c in range(4)).rstrip() + "\n")
-    os.chmod(SAVE_FILE, 0o600)
+    txt = "  ".join(center(FILE_HEADERS[c], ws[c]) for c in range(4)).rstrip() + "\n"
+    for row in rows:
+        txt += "  ".join(pad(row[c], ws[c]) for c in range(4)).rstrip() + "\n"
+    _write_atomic(SAVE_FILE, txt)
 
     # 2) 程序读取用的数据文件(保留所有行,包括空白备用行)
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        for row in data:
-            f.write("\t".join(row) + "\n")
-    os.chmod(DATA_FILE, 0o600)
+    _write_atomic(DATA_FILE, "".join("\t".join(row) + "\n" for row in data))
 
 
 def calc_widths(screen_w):
@@ -297,6 +306,12 @@ def draw_table(stdscr, ri, ci):
     hline(y)
     y += 1
     safe_add(stdscr, y, 1, trunc(f"当前 [{headers[ci]}]: {data[ri][ci]}", sw - 2))
+    y += 1
+    # Reality 两行的「域名」列语义（两个方向都写明，别只写一半）：
+    # 表是这两个槽位 SNI 来源的唯一事实来源 —— 填域名=自有域自建（要证书），
+    # 留空=借公共大站 SNI（不需要证书）。菜单 11 的逐槽提问也是改这一格。
+    safe_add(stdscr, y, 1, trunc(
+        "Reality 两行：填域名=自有域自建 · 留空=借公共大站 SNI", sw - 2), curses.A_DIM)
     stdscr.refresh()
     return y + 1
 
@@ -358,6 +373,54 @@ def edit_cell(stdscr, r, c, input_y):
         data[r][c] = new_val
 
 
+def set_slot_cli(argv):
+    """非交互写表：把某个固定协议行的「域名」列改成给定值（空串 = 留空）。
+
+    用法: edit_nodes.py <数据目录> --set-slot <协议名> <域名|->
+
+    存在意义：菜单 11 的 Reality「SNI 来源」切换必须**同时**改 state 和这张表，
+    否则下一次「5→1 配置域名表」会按表把切换推翻（表是唯一来源）。表格式只有
+    本文件知道，所以写回入口也放在这里，而不是让 shell 侧自己拼 TSV。
+
+    退出码（调用方按码分流，别只看非零）：
+      0 = 已写入
+      4 = 数据文件不存在（这台机器从没保存过表）→ 调用方视为「无表可写」，
+          不是错误：没有表就没有能推翻切换的第二来源
+      1 = 其它错误（参数不对 / 表读不出来 / 没有这个协议行）
+    """
+    i = argv.index("--set-slot")
+    if len(argv) < i + 3:
+        print("[ERROR] 用法: edit_nodes.py <数据目录> --set-slot <协议名> <域名|->",
+              file=sys.stderr)
+        return 1
+    proto, dom = argv[i + 1], argv[i + 2]
+    if dom in ("-", "--", ""):
+        dom = ""
+
+    if not os.path.exists(DATA_FILE):
+        return 4
+    load_file()
+    # LOAD_NOTE 以 ⚠ 开头 = 表没读到/读坏了，此刻 data 里是写死在源码中的
+    # example.com 默认表；照着它写回等于凭空造一张占位符表（f5be08f 那场
+    # 「删光证书」事故的入口）。宁可失败。
+    if LOAD_NOTE.startswith("⚠"):
+        print(f"[ERROR] 配置表不可读：{LOAD_NOTE}", file=sys.stderr)
+        return 1
+
+    for r in range(FIXED_ROWS):
+        if data[r][1] == proto:
+            if data[r][2] == dom:
+                print(f"配置表第 {r + 1} 行（{proto}）域名已是 '{dom or '空'}'，无改动")
+                return 0
+            data[r][2] = dom
+            save_file()
+            print(f"配置表已更新：第 {r + 1} 行 {proto} 域名 → "
+                  f"{dom or '（留空 = 借公共大站 SNI）'}")
+            return 0
+    print(f"[ERROR] 配置表里没有协议行 '{proto}'", file=sys.stderr)
+    return 1
+
+
 def main(stdscr):
     load_file()
     curses.curs_set(0)
@@ -408,4 +471,7 @@ def main(stdscr):
 
 
 if __name__ == "__main__":
+    # --set-slot 走非交互分支，绝不进 curses（脚本流程里调用，没有 tty）
+    if "--set-slot" in sys.argv:
+        sys.exit(set_slot_cli(sys.argv))
     curses.wrapper(main)

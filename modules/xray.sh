@@ -597,6 +597,120 @@ _reality_own_candidates() {
     done
 }
 
+# ── 调 cert.sh 的事务化 SNI 来源切换 ─────────────────────────
+# 用法: _reality_switch_slot <tag> <domain|"">
+# 切换 = 写回配置表 + 签证书 + nginx/xray/订阅级联，失败自动回滚（见 cert.sh）。
+#
+# ⚠️ 降级路径：cert 模块取不到时不静默跳过，而是退回「只改 state」的旧行为并
+#    明说后果（表不会同步 → 下次 5→1 会推翻）。宁可让用户看到告警，也不要
+#    一次「看起来成功、下次配置又变回去」的切换。
+_reality_switch_slot() {
+    local tag="$1" domain="${2:-}"
+    local own_key label
+    if [[ "$tag" == "xray-reality" ]]; then
+        own_key="REALITY_DOMAIN"; label="VLESS-Reality"
+    else
+        own_key="XHTTP_REALITY_DOMAIN"; label="XHTTP-Reality"
+    fi
+
+    if ! declare -F apply_reality_sni_switch >/dev/null 2>&1; then
+        declare -F load_module >/dev/null 2>&1 && load_module cert >/dev/null 2>&1 || true
+    fi
+
+    if declare -F apply_reality_sni_switch >/dev/null 2>&1; then
+        if apply_reality_sni_switch "$tag" "$domain"; then
+            return 0
+        fi
+        log_error "${label} SNI 来源切换失败（已回滚，现场与切换前一致）"
+        return 1
+    fi
+
+    log_warn "cert 模块不可用（apply_reality_sni_switch 未加载）—— 退回旧行为：只改 state"
+    log_warn "⚠️ 配置表**不会**同步，下一次「主菜单 5→1 配置域名表」会把本次选择推翻"
+    local _cur
+    _cur=$(get_state "$own_key" "")
+    if [[ -n "$domain" ]]; then
+        reality_tag_self_domain "$domain" "$tag" || { log_warn "绑定 ${domain} 失败，保持原状"; return 1; }
+    elif [[ -n "$_cur" ]]; then
+        reality_untag_self_domain "$_cur" "$tag" || { log_warn "摘除 ${_cur} 标签失败，保持原状"; return 1; }
+    fi
+    return 0
+}
+
+# ── 单 Reality 槽 SNI 来源决策（Stage A 用）─────────────────
+# 用法: _reality_ask_slot_sni <tag>   tag ∈ {xray-reality, xhttp-reality}
+# 逐槽问「用自有域自建 / 借公共大站 SNI」，**两个方向都给出**：已自建的槽可以
+# 切回公共或换域，借公共的槽可以切自建。选完交给 _reality_switch_slot 落地。
+# 槽为「借公共 且无自建候选」时置 _REALITY_SLOT_GUIDE=1（调用方据此打指路）。
+# 候选来自 _reality_own_candidates（可自建的空闲直连域）。
+_reality_ask_slot_sni() {
+    local tag="$1"
+    local label own_key
+    if [[ "$tag" == "xray-reality" ]]; then
+        label="VLESS-Reality"; own_key="REALITY_DOMAIN"
+    else
+        label="XHTTP-Reality"; own_key="XHTTP_REALITY_DOMAIN"
+    fi
+    local own="${!own_key:-}"
+
+    local -a cands=()
+    local c _d
+    while IFS= read -r _d; do
+        [[ -n "$_d" && "$_d" != "$own" ]] && cands+=("$_d")
+    done < <(_reality_own_candidates "$tag")
+
+    echo ""
+    local _choice _i _target
+    if [[ -n "$own" ]]; then
+        # ── 当前自建：保持 / 切到公共 / 换一个自有域 ──
+        log_info "【${label}】当前用自有域自建: ${own}"
+        echo "  请选择该协议的 SNI 来源："
+        echo "  1) 保持自建 ${own}（默认）"
+        echo "  2) 切到公共大站 SNI（取消自建）"
+        (( ${#cands[@]} > 0 )) && echo "  3) 切到其它自有域自建："
+        local _j=1
+        for c in "${cands[@]}"; do printf "     %d) %s\n" "$_j" "$c"; ((_j++)); done
+        read -rp "  请选择 [默认1]: " _choice
+        case "${_choice:-1}" in
+            2) _reality_switch_slot "$tag" "" ;;
+            3) if (( ${#cands[@]} > 0 )); then
+                   read -rp "  选择要改用哪个自有域 [1-${#cands[@]}]: " _i
+                   _target="${cands[$(( ${_i:-1} - 1 ))]:-}"
+                   if [[ -n "$_target" ]]; then
+                       _reality_switch_slot "$tag" "$_target"
+                   fi
+               fi ;;
+            *) log_info "${label} 保持自建 ${own}" ;;
+        esac
+    else
+        # ── 当前借公共（或未配置）：保持 / 切到自有域自建 ──
+        log_info "【${label}】当前借公共大站 SNI（未用自有域自建）"
+        echo "  请选择该协议的 SNI 来源："
+        echo "  1) 保持借公共大站 SNI（默认）"
+        if (( ${#cands[@]} == 0 )); then
+            log_info "  （无可用的自有域候选：要自建请先到主菜单 5 为该域签发证书）"
+        else
+            echo "  2) 切到自有域自建（自带证书 + 本地伪装站回落）："
+            local _k=1
+            for c in "${cands[@]}"; do printf "     %d) %s\n" "$_k" "$c"; ((_k++)); done
+        fi
+        read -rp "  请选择 [默认1]: " _choice
+        if [[ "${_choice:-1}" == "2" && ${#cands[@]} -gt 0 ]]; then
+            read -rp "  选择要自建的自有域 [1-${#cands[@]}]: " _i
+            _target="${cands[$(( ${_i:-1} - 1 ))]:-}"
+            if [[ -n "$_target" ]]; then
+                _reality_switch_slot "$tag" "$_target"
+            fi
+        fi
+        (( ${#cands[@]} == 0 )) && _REALITY_SLOT_GUIDE=1
+    fi
+
+    # 切换内部经 tag/untag → rebuild_protocol_domains → load_domain_state 刷新了
+    # 全局，这里再同步一次，保证调用方读到的是切换后的值。
+    declare -F load_domain_state >/dev/null 2>&1 && load_domain_state
+    return 0
+}
+
 # ── 收集 Reality 伪装参数 ────────────────────────────────────
 collect_reality_params() {
     echo ""
@@ -615,25 +729,23 @@ collect_reality_params() {
         _xhttp_own="${XHTTP_REALITY_DOMAIN:-}"
     fi
 
-    # ═══ SNI 来源：由配置表决定，本菜单只呈现、不提问 ═══
-    # 表第 3/4 行（vless-xhttp-reality / vless-reality）的「域名」列就是答案：
-    # 填了域名 = 用该自有域自建；留空 = 借公共大站 SNI。菜单 5→1 已把它落进
-    # XHTTP_REALITY_DOMAIN / REALITY_DOMAIN，这里**如实呈现**即可。
-    # ⚠️ 此处曾再问一遍并允许改选，等于给了 state 一个推翻配置表的机会 ——
-    # 「表说借公共、交互却改自建」正是两个来源打架的根源（2026-09-30 用户点名）。
-    # 要改 SNI 来源请改表（主菜单 5→1），不再从此处抄近路。
-    if [[ -n "${_vless_own}" ]]; then
-        log_info "VLESS-Reality：用自有域自建 ${_vless_own}（配置表第 4 行）"
-    else
-        log_info "VLESS-Reality：借公共大站 SNI（配置表第 4 行留空）"
-    fi
-    if [[ -n "${_xhttp_own}" ]]; then
-        log_info "XHTTP-Reality：用自有域自建 ${_xhttp_own}（配置表第 3 行）"
-    else
-        log_info "XHTTP-Reality：借公共大站 SNI（配置表第 3 行留空）"
-    fi
-    if [[ -z "${_vless_own}" || -z "${_xhttp_own}" ]]; then
-        log_info "要让借公共的槽改用自有域：主菜单 5 为该域签发证书 → 5→1 在对应行填域名 → 重跑本菜单"
+    # ═══ Stage A：逐槽 SNI 来源决策 ═══
+    # 每个 Reality 协议独立选「用自有域自建 / 借公共大站 SNI」。
+    # 选完由 apply_reality_sni_switch（cert.sh）事务化落地：写回配置表第 3/4 行
+    # → 自建方向先签证书 → 再级联重建 nginx/xray/订阅，任一步失败全部回滚。
+    # ⚠️ 配置表仍是唯一来源：这里改的**同时**落表，故 5→1 重跑不会推翻本次选择。
+    # ⚠️ tag/untag 内部 rebuild+load_domain_state 刷新了 shell 全局
+    #    REALITY_DOMAIN / XHTTP_REALITY_DOMAIN —— Stage A 后必须重快照。
+    _REALITY_SLOT_GUIDE=0
+    _reality_ask_slot_sni xray-reality
+    _reality_ask_slot_sni xhttp-reality
+    _vless_own="${REALITY_DOMAIN:-}"
+    _xhttp_own="${XHTTP_REALITY_DOMAIN:-}"
+
+    echo ""
+    log_info "约定：配置表第 3/4 行【填域名 = 用该自有域自建】【留空 = 借公共大站 SNI】（本菜单与配置表双向同步）"
+    if (( _REALITY_SLOT_GUIDE )); then
+        log_info "如需让借公共 SNI 的槽改用自有域自建：主菜单 5 为该域签发证书 → 5→1 在对应行填域名 → 重跑本菜单"
     fi
 
     # ========================================================

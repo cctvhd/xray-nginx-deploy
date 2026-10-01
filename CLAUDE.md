@@ -276,6 +276,40 @@ state：`/etc/xray-deploy/config.env`（install.sh `save_state`/`get_state` 读�
 
   **回退**：`git revert <sha>` 后重跑「配置 Xray」(11) /「配置 Sing-Box」(12) /「配置 Hysteria2」(13)。**回退前先确认客户端已把这几个站改回直连** —— 本次不碰客户端链接生成，**回退不必重新下发订阅**。**改完必须 push 到 `BASE_URL` 分支**（三个模块文件，见上方分发陷阱；CDN 逐文件独立缓存，只有 `cmp` 是可信判据）。
 
+- **Reality 两槽恢复「自建 / 借公共 SNI」提问，且切换事务化、写回配置表（2026-10-01，未 commit）**：用户报 **「现在 xray 的配置脚本有个问题 reality 的两个协议把使用第三方的 SNI 域名 选项取消了，我在配置的时候没有这个选项了」**，并给出方向 **「可以参考主线的配置脚本设置」** + **「但是以前的主线就是这样，只是以前没有这么多域名分配」** —— 即：**选项本身是主线就有的能力，不该丢**；冲突只来自本分支新加的「配置表驱动槽位分配」，所以修法必须是「恢复提问 **且** 提问结果同步写回表」。
+
+  **根因**：`ee67e81`（见上文「配置表成为域名的唯一来源」）把 `collect_reality_params` 里的 Stage A 逐槽提问整段删掉，改成「只 log 表的决定、不提问」，理由是「表已是唯一来源」。但用户要的是**在菜单里也能改**，而不是只能退回 5→1 改表。**教训：把「唯一来源」错解成了「唯一入口」** —— 来源可以唯一，入口必须在他配置协议的那条路上（同 [[feedback-table-presentation]]）。
+
+  **改动四个文件（install.sh / modules.list 未动）**：
+  | 文件 | 内容 |
+  |---|---|
+  | `modules/xray.sh` | 新增 `_reality_ask_slot_sni <tag>`（逐槽三选一：保持自建 / 切到公共大站 / 切到其它自有域）+ `_reality_switch_slot`（调 cert.sh 的事务切换，取不到 cert 模块时**大声降级**并明说「表不会同步、下次 5→1 会推翻」）；`collect_reality_params` 里重新调用它们，并打出双向约定 |
+  | `modules/cert.sh` | 新增 `apply_reality_sni_switch <slot> <域|"">`（事务切换主体）、`_sni_switch_verify`（产物断言）、`_issue_cert_single`、`_domain_resolves`、`config_table_set_slot_domain`（写表） |
+  | `modules/nginx.sh` | 新增 `nginx_config_snapshot` / `nginx_config_restore`（`/etc/nginx` 整树快照回滚） |
+  | `edit_nodes.py` | 新增 `set_slot_cli`（`<数据目录> --set-slot <协议名> <域名|->`），退出码 0=已写/无变化、**4=表不存在（不是错）**、1=其它错误 |
+
+  **约定（两个方向都写在界面上）**：配置表**第 3 行 = `vless-xhttp-reality`(XHTTP-Reality)**、**第 4 行 = `vless-reality`(VLESS-Reality)**；**填域名 = 用该自有域自建；留空 = 借公共大站 SNI**。菜单 11/x 与 `edit_nodes.py` 的表都打这行字。
+
+  ⚠️ **两个「静默空操作」是本次实测抓到的，都已修**：
+  1. **级联槽位词汇不匹配**：`cert.sh` 对外用 `xray-reality`，而 `regen_after_domain_change`（install.sh:923）只认 **`reality`**。不翻译的话它打一句「未知的域名分配槽位变化: xray-reality，已忽略」然后**什么都不重建，整条链仍返回 0**。修法是 `apply_reality_sni_switch` 里 `[[ "$_slot" == "xray-reality" ]] && _regen_slot="reality"`。
+  2. **`regen_after_domain_change` 吞掉 nginx 失败**：nginx 段写的是 `do_conf_nginx && log_info || log_warn` —— 失败只告警、**返回 0**（它刻意设计成「失败不中断整个级联」）。所以调用方**不能拿它的退出码当成功判据**。新增 `_sni_switch_verify` 在级联之后**直接验磁盘产物**：`nginx -t` + `servers.conf` 里有该域 server 块（自建）/ 旧域已从 `nginx.conf` 的 443 分流消失（公共，且仅当它已无任何协议角色）+ **xray `config.json` 的 dest 端口**。
+
+  ⚠️ **`_sni_switch_verify` 的 xray 那一条是「硬失败」而不是告警 —— 这是变异测试逼出来的**：最初写成只 `log_warn`，结果拿掉级联槽位翻译（bug 1 复现）整套测试**仍然全绿** —— 因为 nginx 半边照常重建、只有 xray 没换。现在改为：`CONF_XRAY=1` 时 dest 端口不对就 `_rc=1` 触发回滚；`CONF_XRAY≠1` 才退回告警。端口按槽位互斥（xray.sh `generate_xray_config`）：vless 自建 **8321** / vless 公共 **4431**、xhttp 自建 **8326** / xhttp 公共 **4432**。
+
+  **事务与回滚**：进入前快照三份（state 文件、`.config.tsv`、整个 `/etc/nginx`），任一步失败（`reality_tag_self_domain` / `_issue_cert_single` / 写表 / 级联 / 产物断言）全部还原。**级联必须放进子 shell** —— `reload_nginx` 在 `nginx -t` 失败时是裸 `exit 1`，裸调会把整个 install.sh 杀掉、回滚代码永远执行不到（子 shell 里 exit 只结束子 shell，退出码照常回传）。回滚只还原**文件**、不 reload：`nginx -t` 失败 ⇒ 从未 reload ⇒ 运行中的服务仍是旧配置。回滚末尾还要 `save_domain_config` 重派生 `/etc/cloudflare/domain_map.conf`（那是 state 的镜像，只还原 state 的话启动自愈回填会把旧值灌回去）。
+
+  ⚠️ **刻意不做的一件事（已知取舍）**：自建→公共时**不删证书、不删 `domain_<root>.ini`**。通配符证书按根域共享，同一条 lineage 别的协议/域可能在用，删了会连坐；唯一的合法删除路径是有二次确认的 `_purge_stale_domains`。所以 `reality_untag_self_domain` 只摘标签（旧域失去最后一个标签时会被移出 `DOMAIN_REGISTRY` → nginx 路由/ server 块照样随重建消失），并打一行 WARN 说明文件仍在、要彻底清理去主菜单 5。**自建换自有域**则必须显式摘旧域标签 —— `register_domain`/tag 是 **merge 语义（只加不摘）**，不摘的话旧域会一直挂着 `xray-reality` 标签继续分流，表现为「换了域名旧域名还能当 Reality SNI 用」。
+
+  🩸 **测试把活机 `/etc/unbound` 写花过一次（已修复并已加固）**：`/tmp/sni_switch_test.sh` 的 tmpfs 清单原先没盖 `/etc/unbound`，而 `load_domain_state` → `_sync_inst_state`（install.sh:1328）按 `command -v unbound` 把 `INST_UNBOUND` 翻成 1（**沙箱里看得见活机二进制**）→ 级联的 unbound 分支就去刷了活机的 `/etc/unbound/unbound.conf` 与 `conf.d/cctv.conf`。**当时 systemctl 已被 stub，服务没重启过（`ActiveEnterTimestamp` 仍是 09-30），跑着的解析器始终是旧配置**；已用 `/tmp/repair_unbound.sh` 按 state 重生成并核对（5 个直连域 local-zone 齐全、无残留、`unbound-checkconf` 无错、服务仍 active）。**加固两条（缺一不可）**：**(a)** tmpfs 清单补上 `/etc/unbound /usr/local/etc /usr/local/bin /etc/sing-box /etc/hysteria /etc/caddy-naive /etc/wgcf /var/www`；**(b)** source 后立刻 `_sync_inst_state() { :; }` 停用，`INST_*`/`CONF_*` 一律显式设。**通用教训：沙箱里凡是「按 `command -v` / `systemctl is-active` 探测活机」的函数都必须停用或覆盖，否则测试会一边跑一边改生产。**（同 [[project-overview]] 里记的模块加载机制。）
+
+  ⚠️ **沙箱另外三个坑**：**(a)** 真 `xray` 二进制要**在进 ns 前**拷进 `$WORK/bin`（沙箱把 `/usr/local/bin` 盖成 tmpfs，活机那个就看不见了）—— 用真二进制跑 `xray run -test`，config.json 才是**被真内核校验过**的；**(b)** `XRAY_PRIVATE_KEY` 与 `WGCF_*KEY` 必须是**真密钥**（`xray x25519` / `openssl rand -base64 32`），填占位串会让真内核报错、把整条级联（连带被测的回滚）全判失败，测出来的是数据不对而不是功能不对；**(c)** 备用自建域**不要注册进 `DOMAIN_REGISTRY`**（挂空 `DOMAIN_PROTO_` 会触发 PREFLIGHT「Check 5b 域名注册表悬空」硬失败，把后面所有生成都拦掉），改用文档化的 `REALITY_PREALLOC` 通道（`_reality_own_candidates` 对它只要求「443 空闲 + 有证书」，不要求入册）；**(d)** **磁盘将满时这套沙箱会「挂起」而不是报错**（单次运行要 ~150MB：`$WORK` 里 37MB + `/etc/nginx` 整树拷贝；卡在 `基线生成：` 之后一动不动、日志零红项、`timeout` 报 124）。活机根分区当时正好 100%（`/root/.hermes` 2.7G + `go` 1.7G + `.cache` 1.7G 等，`auditd` 已因无空间在 11:20 自动停记日志），排查花了很久才想到是空间 —— **沙箱跑不动时先 `df -h /`**。另外**每次跑完/超时后要清 `/tmp/snisw.*`**，否则累积几次就把盘吃光、后面的运行连带挂起。
+
+  ⚠️ **`nginx_config_restore` 顺带修了一个真 bug**：原实现是 `rm -rf /etc/nginx` 再 `cp -a`。在**挂载点**（容器/沙箱）上 `rm -rf` 报 `EBUSY` 且**一个文件都没删**，紧接着的 `cp -a` 就把快照整棵树当成 `/etc/nginx/nginx` 塞进去 —— 目录错位、`nginx.conf` 消失，**比不回滚更糟**。改为 `find /etc/nginx -mindepth 1 -delete` + `cp -a "$_src/." /etc/nginx/`（清内容、不删目录），对普通目录与挂载点都正确。
+
+  **验证**：`bash -n` 全绿；`python3 -m py_compile edit_nodes.py` 通过。新增 `/tmp/sni_switch_test.sh`（`unshare -m` + tmpfs 十三个目录，真 nginx 二进制 + 真 xray 二进制）**61 项全绿**，覆盖用户点名的四种切换 + 两处菜单路径 + 回滚 + 「5→1 不推翻」：**(1)** 自建→公共（state/表清空、SNI map 路由撤除、server 块消失、**xray dest→4431**、真 `nginx -t` 通过、级联触发了订阅重建）；**(2)** 公共→自建（重新签发路径 + 真 `nginx -t` + **xray dest→8321 且 serverNames 收敛为自有域**）；**(3)** 自建→自建换域（旧域路由消失 + 旧域标签摘除 + 新域路由/ server 块出现 + 真 `nginx -t`）；**(3b)** 两槽同 SNI 被拒且两边都不改；**(4)** 公共→公共换站（经真 `collect_reality_params`，域名与表/ nginx 均不被改动）；**(5)** 菜单路径自建→公共（state 与表同步写回）；**(6)** 回滚（塞坏 `conf.d` 文件使 `nginx -t` 必挂 → 退出码 1、三份快照逐个还原、中途打的标签一并消失）；**(7)** 复刻 cert.sh 第 6/8 步（`register_domain` + `rebuild_protocol_domains`）确认选择不被表推翻。**变异自检**（四次独立的单点突变，各自跑整套，证明断言不是恒真）：`no_table_sync`（写表退化成 no-op）→ **4 项红**（表同步那几条）；`no_slot_translation`（拿掉级联槽位翻译）→ **13 项红**（含两条 xray dest 断言 —— 这正是最初「只告警不失败」会漏掉的那个静默空操作）；`no_tag_untag_on_change`（换域时不摘旧域标签）→ **7 项红**（旧域标签残留 + 连带的下游状态不对）。⚠️ **`no_verify`（停用产物断言）单独跑是 0 项红** —— 别把这当成「断言没用」：它是一层**冗余安全网**，实现正确时本来就不该有可观察差异；它的价值只在**与真 bug 叠加时**显现（`no_slot_translation` 那 13 项红里，有 2 项就是它贡献的 —— 没有它，那两处只会是「报成功」）。**结论：`_sni_switch_verify` 由突变 A 佐证其有效，不由突变 B 佐证；报告时别把 B 说成红。**既有 `/tmp/cert_{table,domainsrc,tablealign,menu3,dirdata}_test.sh`、`cert_menu_test.sh`、`cert_stateclobber_test.sh`、`reality_conflict_test.sh`、`mosdns_test.sh`(105)、`doh_shared_test.sh`(78)、`doh_reconfig_test.sh`(28) 与两套 `ed_nodes_mouse_*.py` 全部 exit 0。
+
+  **回退**：`git revert` 这四个文件（未 commit，直接 `git checkout -- modules/cert.sh modules/nginx.sh modules/xray.sh edit_nodes.py` 即回到改动前；`modules/system.sh` 的 BBR 改动是另一件事、**不要一起 checkout 掉**）。回退后 Reality 槽退回「只呈现表、不提问」，**配置表数据不受影响**（`config_table_set_slot_domain` 只改第 3/4 行域名列）。**本次不碰客户端链接生成**（`client.sh` 的 `gen_reality_url` / `gen_xhttp_reality_url` 一直从 state 读 `REALITY_DOMAIN` / `XHTTP_REALITY_DOMAIN`，切换后订阅自动跟着变），**回退不必重新下发订阅**。**改完必须 commit + push 到 `BASE_URL` 分支**（四个文件，见上方分发陷阱；CDN 逐文件独立缓存，只有 `cmp` 是可信判据）。
+
 ## 活机探索记录：unbound 自带 DoH 当反代上游（2026-09-30，**未进脚本，仅活机手工配置**）
 
 背景：想给家里路由器提供自建 DoH（`https://<域名>/dns-query`）时，除了装 mosdns-x，也可以直接用 unbound 自带的 DoH 服务端（1.12+ 支持；活机 1.24.2 实测全指令可用）。两个**很容易再踩一次、且很难第一时间联想到**的坑：

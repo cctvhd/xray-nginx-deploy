@@ -2303,6 +2303,40 @@ CONF
     log_info "servers.conf 生成完成"
 }
 
+# ── nginx 配置快照 / 还原（「改完 → nginx -t → 失败回滚」的底座）──
+# 为什么需要：reload_nginx 在 nginx -t 失败时只 `exit 1`，什么都不还原 ——
+# 坏配置留在磁盘上、跑着的还是旧 worker，当场看不出问题，但下次任何一次
+# reload 都会把坏配置推上去。切换类改动（如 Reality SNI 来源）必须能回滚。
+# ⚠️ 判据（决定了「还原后要不要 reload」）：nginx -t 失败 ⇒ 从未 reload ⇒
+# **运行中的服务仍是旧配置**，所以还原只需把磁盘文件换回来，不需要 reload；
+# 还原后要复跑 nginx -t，确认旧配置集仍自洽（否则说明坏的不只是新改动）。
+# ⚠️ stdout 回传快照目录，函数内不得调 log_*（同 cert.sh resolve_edit_nodes_script）。
+nginx_config_snapshot() {
+    local _root="${1:-${STATE_DIR:-/etc/xray-deploy}}"
+    local _dir="${_root}/nginx-snap-$$"
+    rm -rf "$_dir"
+    mkdir -p "$_dir" || return 1
+    # /usr/bin/cp：本机 cp 被别名成 -i，覆盖时会等交互（见 env-shell-gotchas）
+    if ! /usr/bin/cp -a /etc/nginx "$_dir/nginx" 2>/dev/null; then
+        rm -rf "$_dir"
+        return 1
+    fi
+    printf '%s\n' "$_dir"
+}
+
+# 还原快照。只在快照里确实有 nginx.conf 时才动手（防止半截快照把整目录清空）。
+nginx_config_restore() {
+    local _dir="$1"
+    [[ -n "$_dir" && -f "${_dir}/nginx/nginx.conf" ]] || return 1
+    # 清**内容**而不是删目录本身：/etc/nginx 在容器/挂载点/沙箱里可能是挂载点，
+    # 那时 `rm -rf /etc/nginx` 报 EBUSY 且**一个文件都没删**，紧接着的 cp -a 会把
+    # 快照整棵树当成 /etc/nginx/nginx 塞进去 —— 目录结构错位、nginx.conf 消失，
+    # 比不回滚更糟（2026-10-01 沙箱实测）。清内容对「普通目录」与「挂载点」都正确。
+    find /etc/nginx -mindepth 1 -delete 2>/dev/null
+    /usr/bin/cp -a "${_dir}/nginx/." /etc/nginx/ || return 1
+    return 0
+}
+
 # ── 验证并重启 Nginx ─────────────────────────────────────────
 reload_nginx() {
     log_step "验证 Nginx 配置..."

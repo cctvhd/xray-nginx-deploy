@@ -2371,6 +2371,285 @@ offer_reality_preassign() {
     return 0
 }
 
+# ════════════════════════════════════════════════════════════
+# Reality 槽位 SNI 来源切换（自建 ↔ 借公共），事务化
+# ════════════════════════════════════════════════════════════
+# 用法: apply_reality_sni_switch <slot> <domain>
+#   <slot>   ∈ xray-reality（配置表第 4 行）| xhttp-reality（第 3 行）
+#   <domain> 非空 → 切到「用该自有域自建」；空串 → 切到「借公共大站 SNI」
+# 返回 0 成功；1 失败（已回滚，现场与调用前逐字节一致）
+#
+# 为什么是「写回表 + 按表重推」而不是「直接改 state」：
+#   配置表第 3/4 行的域名列就是这两个槽位 SNI 来源的**唯一**事实来源
+#   （cert.sh 第 6/8 步会按表无条件重推这两个槽位）。只改 state 的交互，
+#   会在下一次「5→1 配置域名表」时被表静默推翻 —— 实测复现过
+#   （/tmp/reality_conflict_test.sh：菜单选借公共 → 5→1 后 REALITY_DOMAIN
+#   又变回表里那个域）。所以切换必须同时落表。
+#
+# 为什么要事务：切换会同时动 表 / state / 证书 / nginx / xray / 订阅。
+#   中途失败若只停一半，会得到「表说 A、state 说 B、nginx 是 C」，比不改更糟。
+#   故先快照三份（state 文件、配置表、/etc/nginx），任一步失败全部还原。
+#
+# ⚠️ 已知取舍（有意为之，别当缺陷顺手改）：切到「借公共」时**不删**该域的
+#   证书 / domain_<根>.ini / nginx 的旧 server 块 ——
+#     `certbot delete` 会连坐把别人的证书删掉。旧代码里唯一的删除入口
+#     `_purge_stale_domains` 本就有「列清单 + 输 yes」人工确认（f5be08f），
+#     这里**不绕过那道闸**。要彻底清理去主菜单 5 的域名表里停用该域。
+#   · nginx 旧 server 块 / SNI map 条目：由随后的 regen 全量重生成按当前
+#     域名分配重算，不需要在这里手删 —— 手删反而会在重生成时被覆盖回来。
+
+# 只为单个域名签发证书。自建方向必须先签成功再生成 nginx —— nginx 里那个
+# 自建域的 server 块要引用 /etc/letsencrypt/live/<root>/fullchain.pem，
+# 证书不在就会退化成陷阱页（一次静默的「配了但不通」）。
+# 复用 request_certificates 全部重试/限流识别逻辑，只把待办清单临时收窄到这一个域。
+# ⚠️ 判据是**产物是否存在**，不是 request_certificates 的返回码 —— 那是
+#    「一个会静默 return 0 的函数必须由调用方断言产物」的同款纪律。
+_issue_cert_single() {
+    local _domain="$1"
+    local _root
+    _root=$(echo "$_domain" | awk -F. '{print $(NF-1)"."$NF}')
+
+    if [[ -f "/etc/letsencrypt/live/${_root}/fullchain.pem" ]]; then
+        log_info "证书已存在，无需签发: *.${_root}"
+        return 0
+    fi
+
+    local -a _saved_all=("${ALL_DOMAINS[@]:-}")
+    ALL_DOMAINS=("$_domain")
+    request_certificates || true
+    ALL_DOMAINS=("${_saved_all[@]:-}")
+
+    if [[ -f "/etc/letsencrypt/live/${_root}/fullchain.pem" ]]; then
+        log_info "证书签发成功: *.${_root}"
+        return 0
+    fi
+    log_error "证书签发失败: *.${_root}（自建方向必须先有证书，已中止本次切换）"
+    return 1
+}
+
+# 轻量解析检查：只判「这个域在 DNS 里存不存在」，不判「是否指向本机」——
+# 证书走的是 Cloudflare DNS-01 挑战，域名不必指向本机也能签；而 CDN 域的 A
+# 记录本来就落在 CF 边缘。所以这里只用来提前抓「域名没在 CF 建过/打错」，
+# 失败仅告警不拦截（真正的闸门是随后的证书签发）。
+# stdout 回传结论 → 函数内不得调 log_*。
+_domain_resolves() {
+    local _d="$1"
+    if command -v dig >/dev/null 2>&1; then
+        [[ -n "$(dig +short +time=3 +tries=1 A "$_d" 2>/dev/null)" ]] && return 0
+        [[ -n "$(dig +short +time=3 +tries=1 CNAME "$_d" 2>/dev/null)" ]] && return 0
+    fi
+    getent hosts "$_d" >/dev/null 2>&1
+}
+
+# 切换后的产物断言。用法: _sni_switch_verify <slot> <新域|""> <旧域|"">
+# 返回 0 = 现场与「切换后的期望」一致；1 = 不一致（调用方回滚）。
+# 判据刻意是**磁盘产物**而不是任何函数的返回值 —— regen 那层对 nginx 失败只 warn。
+_sni_switch_verify() {
+    local _slot="$1" _domain="$2" _old="${3:-}" _rc=0
+
+    # 1) nginx -t 必须真的通过（这是「不留半成品」的底线）
+    if command -v nginx >/dev/null 2>&1; then
+        if ! nginx -t >/dev/null 2>&1; then
+            log_error "断言失败：nginx -t 未通过"
+            _rc=1
+        fi
+    fi
+
+    # 2) nginx 侧必须反映新分配
+    local _servers="/etc/nginx/conf.d/servers.conf" _ngx="/etc/nginx/nginx.conf"
+    if [[ -n "$_domain" ]]; then
+        # 自建：该域必须有 server 块（携带证书、作为 xray 的回落站）
+        if [[ -f "$_servers" ]] && ! grep -qE "server_name[^;]*(\s|^)${_domain//./\\.}(\s|;)" "$_servers"; then
+            log_error "断言失败：${_servers} 里没有 ${_domain} 的 server 块"
+            _rc=1
+        fi
+    elif [[ -n "$_old" ]]; then
+        # 公共：旧域若已无任何协议角色（被摘出注册表），就不该再出现在 443 分流上；
+        # 若它还有别的角色（例如同时是 hysteria2 域），留着是正确行为，不判失败。
+        if ! domain_is_registered "$_old"; then
+            if grep -qE "(\s|^)${_old//./\\.}(\s|;)" "$_ngx" 2>/dev/null; then
+                log_error "断言失败：${_old} 已无协议角色，但仍在 nginx.conf 的 443 分流里"
+                _rc=1
+            fi
+        fi
+    fi
+
+    # 3) xray 侧：端口按槽位区分（xray.sh generate_xray_config）—— 自建走本地伪装站、
+    #    公共走 dokodemo 转发到借用站点，四个端口互不相同，故能决定性地独占判定。
+    #    ⚠️ 这一条**必须能判失败**：只告警的话，「级联槽位词汇翻错 → do_xray 根本不
+    #    执行 → 配置没换但整条链返回 0」这种静默空操作会一路绿灯通过（2026-10-01
+    #    变异测试实测如此）。本函数存在的全部意义就是拦住它。
+    #    判据是「该槽是不是活的组件」：CONF_XRAY=1 才强制 —— 没配置 xray 的机器上
+    #    config.json 与本次切换无关，退回告警。
+    if [[ -s /usr/local/etc/xray/config.json ]]; then
+        local _want _why
+        case "$_slot" in
+            xray-reality)  if [[ -n "$_domain" ]]; then _want=8321; else _want=4431; fi ;;
+            xhttp-reality) if [[ -n "$_domain" ]]; then _want=8326; else _want=4432; fi ;;
+            *)             _want="" ;;
+        esac
+        if [[ -n "$_want" ]] && ! grep -q "127\.0\.0\.1:${_want}" /usr/local/etc/xray/config.json; then
+            if [[ -n "$_domain" ]]; then
+                _why="自建模式应 dest→127.0.0.1:${_want} 且 serverNames 含 ${_domain}"
+            else
+                _why="公共模式应 dest→127.0.0.1:${_want}（dokodemo 转发借用站点）"
+            fi
+            if [[ "$(get_step CONF_XRAY)" == "1" ]]; then
+                log_error "断言失败：xray config.json 未反映本次切换（${_why}）"
+                log_error "  多半是级联没走到 xray 分支，请先运行主菜单 x 补全 state 后再切换"
+                _rc=1
+            else
+                log_warn "xray config.json 未反映本次切换（${_why}）；本机 Xray 未配置，不影响其它组件"
+            fi
+        fi
+    fi
+    return "$_rc"
+}
+
+apply_reality_sni_switch() {
+    local _slot="${1:-}" _domain="${2:-}"
+
+    local _key _tag _peer_key _peer_label _row
+    case "$_slot" in
+        xray-reality)  _key="REALITY_DOMAIN";        _tag="xray-reality";  _peer_key="XHTTP_REALITY_DOMAIN"
+                       _peer_label="vless-xhttp-reality"; _row=4 ;;
+        xhttp-reality) _key="XHTTP_REALITY_DOMAIN";  _tag="xhttp-reality"; _peer_key="REALITY_DOMAIN"
+                       _peer_label="vless-reality";       _row=3 ;;
+        *) log_error "apply_reality_sni_switch: 未知槽位 '${_slot}'"; return 1 ;;
+    esac
+
+    # ── 0) SNI 互斥：两个 Reality 槽不得用同一个 SNI（generate_sni_map 一 SNI
+    #       一后端，撞了就有一边静默失联）。reality_tag_self_domain 内部也有
+    #       这道检查，但在这里先拦一次能把话说白，且公共方向也要能拦。
+    local _peer
+    _peer=$(get_state "$_peer_key" "")
+    if [[ -n "$_domain" && -n "$_peer" && "$_domain" == "$_peer" ]]; then
+        log_error "拒绝：${_domain} 已是 ${_peer_label} 的自建域名（${_peer_key}）——两个 Reality 节点不能共用一个 SNI"
+        return 1
+    fi
+
+    # 依赖：证书/表工具在本文件；tag/untag 在 xray 模块；级联在 install.sh
+    declare -F reality_tag_self_domain >/dev/null 2>&1 || load_module xray >/dev/null 2>&1 || true
+    declare -F nginx_config_snapshot >/dev/null 2>&1 || load_module nginx >/dev/null 2>&1 || true
+    if ! declare -F reality_tag_self_domain >/dev/null 2>&1 || ! declare -F regen_after_domain_change >/dev/null 2>&1; then
+        log_error "缺少 reality_tag_self_domain / regen_after_domain_change，无法执行切换"
+        return 1
+    fi
+
+    # ── 1) 快照三份：state 文件、配置表、/etc/nginx
+    local _snap_root="${STATE_DIR:-/etc/xray-deploy}/sni-switch.$$"
+    rm -rf "$_snap_root"; mkdir -p "$_snap_root" || { log_error "快照目录创建失败"; return 1; }
+    /usr/bin/cp -a "$STATE_FILE" "$_snap_root/state.env" 2>/dev/null || true
+    local _tsv; _tsv="$(_config_table_file)"
+    [[ -f "$_tsv" ]] && /usr/bin/cp -a "$_tsv" "$_snap_root/config.tsv" 2>/dev/null
+    local _nginx_snap=""
+    if declare -F nginx_config_snapshot >/dev/null 2>&1; then
+        _nginx_snap=$(nginx_config_snapshot "$_snap_root")
+    fi
+    log_info "已快照（state${_tsv:+/表}${_nginx_snap:+/nginx}）→ ${_snap_root}"
+
+    # 还原函数：三份回写 + 按还原后的 state 复验 nginx 仍自洽
+    _sni_switch_rollback() {
+        log_warn "回滚本次切换……"
+        [[ -f "${_snap_root}/state.env" ]] && /usr/bin/cp -a "${_snap_root}/state.env" "$STATE_FILE"
+        [[ -f "${_snap_root}/config.tsv" ]] && /usr/bin/cp -a "${_snap_root}/config.tsv" "$_tsv"
+        if [[ -n "$_nginx_snap" ]] && declare -F nginx_config_restore >/dev/null 2>&1; then
+            nginx_config_restore "$_nginx_snap" || log_error "nginx 快照还原失败（快照在 ${_nginx_snap}）"
+        fi
+        # nginx -t 失败 = 从未 reload，跑着的仍是旧配置 → 还原文件后只需复验
+        if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
+            log_info "已回滚；nginx 配置复验通过，运行中的是改动前那套"
+        else
+            log_error "已回滚，但 nginx -t 仍不通过 —— 请手工检查 /etc/nginx（快照 ${_snap_root}）"
+        fi
+        load_domain_state 2>/dev/null || true
+        # /etc/cloudflare/domain_map.conf 是 state 的镜像，tag/untag 都会写它。
+        # 只还原 state 的话镜像仍是「切换后」的旧值，下次启动的自愈回填会把它
+        # 又灌回 state（untag 里那句「防旧值残留导致下次启动自愈回填」的反面）。
+        # 状态已还原 → 按还原后的 state 重新派生镜像即可，无需单独快照该文件。
+        if declare -F save_domain_config >/dev/null 2>&1; then
+            save_domain_config >/dev/null 2>&1 || log_warn "domain_map.conf 重派生失败，请手工核对 /etc/cloudflare/domain_map.conf"
+        fi
+    }
+
+    # ── 2) 破坏性前置（不可回滚：签出来的证书不回删）
+    local _old; _old=$(get_state "$_key" "")
+    if [[ -n "$_domain" ]]; then
+        # 自建方向。换域名时**必须先摘旧域标签**：register_domain/tag 是 merge
+        # 语义（只加不摘），不摘的话旧域会一直挂着 xray-reality 标签，于是
+        # generate_sni_map 继续为它分流、nginx 继续为它出 server 块 —— 表现为
+        # 「换了域名，旧域名还能当 Reality SNI 用」。用户要求正是「旧域名的
+        # server 块/stream 路由要移除」。
+        if [[ -n "$_old" && "$_old" != "$_domain" ]]; then
+            log_info "换域：先摘除原自建域 ${_old} 的 ${_tag} 标签"
+            reality_untag_self_domain "$_old" "$_tag" || log_warn "摘除 ${_old} 标签返回非零，继续"
+        fi
+        if ! _domain_resolves "$_domain"; then
+            log_warn "${_domain} 在 DNS 里解析不到（证书走 CF DNS-01 挑战，仍可签发；若失败请先在 Cloudflare 建记录）"
+        fi
+        # 先入册（tag 内部会补齐 CF 账号映射与 rebuild+load，证书流程才够得着）
+        if ! reality_tag_self_domain "$_domain" "$_tag"; then
+            log_error "登记自建域 ${_domain} 失败（见上方原因），未改动任何东西"
+            rm -rf "$_snap_root"
+            return 1
+        fi
+        if ! _issue_cert_single "$_domain"; then
+            _sni_switch_rollback
+            rm -rf "$_snap_root"
+            return 1
+        fi
+    elif [[ -n "$_old" ]]; then
+        # 公共方向：摘除自建标签。证书与 domain ini **故意保留**（见文末说明）：
+        # 通配符证书按根域共享，别的协议/域可能在用同一条 lineage，删了会连坐。
+        reality_untag_self_domain "$_old" "$_tag" || log_warn "${_slot} 摘标签返回非零，继续"
+        log_warn "${_old} 的证书与 CF 凭证文件保留在磁盘上、未删除；如需彻底清理请到主菜单 5 的域名表里停用该域"
+    fi
+
+    # ── 3) 写回配置表（表是唯一来源；没有表就不是错误 —— 没有第二来源可打架）
+    if ! config_table_set_slot_domain "$_slot" "$_domain"; then
+        log_error "写回配置表失败"
+        _sni_switch_rollback
+        rm -rf "$_snap_root"
+        return 1
+    fi
+
+    # ── 4) 级联重建：xray（dest/serverNames 随 state 重算）+ nginx 全量
+    #        （server 块 / SNI map / 伪装 webroot）+ unbound + 客户端订阅。
+    #  ⚠️ 槽位词汇必须翻译：regen_after_domain_change 认的是 `reality`，
+    #     本文件对外用的是 `xray-reality`。不翻的话它只会打一行
+    #     「未知的域名分配槽位变化: xray-reality，已忽略」，**什么都不重建**，
+    #     而整个调用仍返回 0 —— 一次静默的空操作。
+    #  ⚠️ 必须放进子 shell：reload_nginx 在 nginx -t 失败时是 `exit 1`，
+    #     裸调会把整个 install.sh 杀掉，回滚代码永远执行不到。
+    #      子 shell 里的 exit 只结束子 shell，退出码照常回传。
+    local _regen_slot="$_slot"
+    [[ "$_slot" == "xray-reality" ]] && _regen_slot="reality"
+    if ! ( regen_after_domain_change "$_regen_slot" ); then
+        log_error "级联重建失败（nginx -t 未通过或下游报错）"
+        _sni_switch_rollback
+        rm -rf "$_snap_root"
+        return 1
+    fi
+
+    # ── 5) 断言产物（不能只看 regen 的退出码）
+    #  regen_after_domain_change 对 nginx 段是 `do_conf_nginx && info || warn` ——
+    #  **失败也返回 0**（它刻意设计成「失败不中断整个级联」）。所以这里必须自己
+    #  验一遍产物，否则会出现「报成功、配置没换」的半成品状态，正是本函数要消灭的。
+    if ! _sni_switch_verify "$_slot" "$_domain" "$_old"; then
+        _sni_switch_rollback
+        rm -rf "$_snap_root"
+        return 1
+    fi
+
+    rm -rf "$_snap_root"
+    if [[ -n "$_domain" ]]; then
+        log_info "${_slot} 已切换为「用自有域自建」：SNI=${_domain}（配置表第 ${_row} 行已同步）"
+    else
+        log_info "${_slot} 已切换为「借公共大站 SNI」（配置表第 ${_row} 行已清空）"
+    fi
+    return 0
+}
+
 refresh_domain_assignments() {
     log_step "刷新域名协议分配"
 
@@ -2847,6 +3126,49 @@ config_table_domain_for_slot() {
         fi
     done < <(config_table_slot_domains)
     return 1
+}
+
+# 写表：把某个 Reality 槽在配置表「域名」列改成给定值（空串 = 留空 = 借公共大站）。
+# 用法: config_table_set_slot_domain <slot> <domain>     # slot ∈ xray-reality|xhttp-reality
+# 存在意义：表是这两个槽位 SNI 来源的唯一事实来源，切换来源必须连表一起改，
+# 否则下一次「5→1 配置域名表」会按表把切换推翻（见 apply_reality_sni_switch 顶部注释）。
+#
+# ⚠️ 槽位词汇在本文件里有两套：交互/接口层用 cert.sh 的 `xray-reality` /
+#    `xhttp-reality`，写进表里的协议名却是 `vless-reality` /
+#    `vless-xhttp-reality`。映射**内联成 local**，不提文件作用域（会变成
+#    load_module 的局部变量而失效，见本文件上方那段 ⚠️）。
+# 返回 0 = 已写/无需写/本机无表；1 = 写失败。
+config_table_set_slot_domain() {
+    local _slot="${1:-}" _domain="${2:-}" _proto
+    case "$_slot" in
+        xray-reality)  _proto="vless-reality" ;;
+        xhttp-reality) _proto="vless-xhttp-reality" ;;
+        *) log_error "config_table_set_slot_domain: 未知槽位 '${_slot}'"; return 1 ;;
+    esac
+
+    local _tsv
+    _tsv="$(_config_table_file)"
+    if [[ ! -f "$_tsv" ]]; then
+        # 这台机器从没保存过表 → 没有第二来源会推翻本次切换，不是错误。
+        log_warn "本机没有配置表（${_tsv}），跳过写回：无表即无第二来源，切换不会被打架"
+        return 0
+    fi
+
+    local _script _dir
+    if ! _script=$(resolve_edit_nodes_script); then
+        log_error "取不到 edit_nodes.py，无法写回配置表"
+        return 1
+    fi
+    _dir="$(dirname "$_tsv")"
+
+    local _out _rc
+    _out=$(python3 "$_script" "$_dir" --set-slot "$_proto" "${_domain:--}" 2>&1); _rc=$?
+    case "$_rc" in
+        0) log_info "${_out:-配置表已更新}" ;;
+        4) log_warn "配置表实际不存在（${_dir}/.config.tsv），跳过写回" ;;
+        *) log_error "写回配置表失败：${_out}"; return 1 ;;
+    esac
+    return 0
 }
 
 # ── 清理已从配置表移除的陈旧域名 ─────────────────────────────
