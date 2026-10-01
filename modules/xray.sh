@@ -628,6 +628,34 @@ _reality_own_candidates() {
     done
 }
 
+# ── 降级分支写回配置表（cert.sh 不可用时的最小内联版）────────────────
+# cert.sh 的 config_table_set_slot_domain 不可用时，直接内联 edit_nodes.py
+# --set-slot 把切换同步进配置表，避免下一次「5→1 配置域名表」按表推翻本次切换。
+# 槽位词汇映射与 cert.sh 的 config_table_set_slot_domain 一致
+#   （xray-reality→vless-reality / xhttp-reality→vless-xhttp-reality）。
+# 返回 0 = 已写 / 本机无表（无第二来源，无所谓推翻）；1 = 写失败（只告警、不阻断切换）。
+_reality_table_write_fallback() {
+    local _tag="${1:-}" _domain="${2:-}" _proto _tsv _script _dir _out _rc
+    case "$_tag" in
+        xray-reality)  _proto="vless-reality" ;;
+        xhttp-reality) _proto="vless-xhttp-reality" ;;
+        *) return 1 ;;
+    esac
+    _tsv="${EDIT_NODES_DATA_DIR:-${STATE_DIR:-/etc/xray-deploy}}/.config.tsv"
+    [[ -f "$_tsv" ]] || return 0
+    _script="$(dirname "${MODULES_DIR:-.}")/edit_nodes.py"
+    [[ -f "$_script" ]] || _script="${STATE_DIR:-/etc/xray-deploy}/edit_nodes.py"
+    [[ -f "$_script" ]] || { log_warn "取不到 edit_nodes.py，配置表未同步（下次 5→1 会按表推翻本次切换）"; return 1; }
+    _dir="$(dirname "$_tsv")"
+    _out=$(python3 "$_script" "$_dir" --set-slot "$_proto" "${_domain:--}" 2>&1); _rc=$?
+    case "$_rc" in
+        0) log_info "${_out:-配置表已同步}" ;;
+        4) log_warn "配置表实际不存在（${_dir}/.config.tsv），跳过写回" ;;
+        *) log_warn "写回配置表失败：${_out}"; return 1 ;;
+    esac
+    return 0
+}
+
 # ── 调 cert.sh 的事务化 SNI 来源切换 ─────────────────────────
 # 用法: _reality_switch_slot <tag> <domain|""> [self|public]
 #   domain = 分配给该槽的域（自建时必填；借公共时**可留当前域当地址**，也可留空）
@@ -662,8 +690,7 @@ _reality_switch_slot() {
         return 1
     fi
 
-    log_warn "cert 模块不可用（apply_reality_sni_switch 未加载）—— 退回旧行为：只改 state"
-    log_warn "⚠️ 配置表**不会**同步，下一次「主菜单 5→1 配置域名表」会把本次选择推翻"
+    log_warn "cert 模块不可用（apply_reality_sni_switch 未加载）—— 退回旧行为：只改 state + 内联写表"
     local _cur
     _cur=$(get_state "$own_key" "")
     if [[ -n "$domain" ]]; then
@@ -672,6 +699,7 @@ _reality_switch_slot() {
         reality_untag_self_domain "$_cur" "$tag" || { log_warn "摘除 ${_cur} 标签失败，保持原状"; return 1; }
     fi
     save_state "$mode_key" "$mode"
+    _reality_table_write_fallback "$tag" "${domain:-}"
     return 0
 }
 
@@ -738,6 +766,71 @@ _reality_prepare_public_params() {
     save_state "REALITY_SERVER_NAMES" "${REALITY_SERVER_NAMES[*]:-}"
     save_state "REALITY_SNI"          "${REALITY_SERVER_NAMES[0]:-}"
     save_state "REALITY_SPIDER_X"     "${REALITY_SPIDER_X:-}"
+    return 0
+}
+
+# ── 非交互「重置/补齐公共参数」：事务切换用（无 read）────────
+# 用法: _reality_reset_public_params <tag>   tag ∈ {xray-reality, xhttp-reality}
+# 与 _reality_prepare_public_params 同职责，但**从不读 stdin**：复用判据相同
+# （dest 为空、或指向本地伪装站 127.0.0.1:*、或 serverNames 含被摘掉的自建域
+#  —— 任一命中即视为「已被自建模式的客户端链接同步污染」），不可用时不是现场
+# 问答重选，而是**确定性取 HW_REGION 对应地区的第一个伪装目标**。
+#
+# 供 apply_reality_sni_switch（cert.sh）公共方向在级联前调用。交互菜单的
+# case 2/3 仍走 _reality_prepare_public_params（含复用/换站问答，交互行为不变）；
+# 本函数只兜住「事务直接切公共」的路径（矩阵/R 恢复/降级分支），保证公共参数
+# 一定干净、不含自建残留。⚠️ 若公共参数本就可用（比如菜单 case 2 刚备齐、或
+# R 恢复时 state 里已有干净公共值），本函数是**纯复用**，不会覆盖用户已选站点。
+_reality_reset_public_params() {
+    local tag="$1"
+
+    if [[ "$tag" == "xhttp-reality" ]]; then
+        # xhttp 公共参数只有 XHTTP_REALITY_SNI（dest 恒=该站点:443）。它不会被
+        # sync_hydrate_client_state 覆盖（该函数只在第一个 reality 入站即
+        # reality-direct/vless 上 break），故空即真没选过 → 确定性补默认站点。
+        XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI" "")
+        if [[ -z "${XHTTP_REALITY_SNI:-}" ]]; then
+            case "${HW_REGION%%/*}" in
+                na) XHTTP_REALITY_SNI="solanolibrary.com" ;;
+                as) XHTTP_REALITY_SNI="www.lovelive-anime.jp" ;;
+                *)  XHTTP_REALITY_SNI="ethz.ch" ;;
+            esac
+            save_state "XHTTP_REALITY_SNI" "$XHTTP_REALITY_SNI"
+            log_info "补齐 vless-xhttp-reality 借用站点（默认）: ${XHTTP_REALITY_SNI}"
+        fi
+        return 0
+    fi
+
+    # vless：从 state 读回当前值再判（事务里 globals 未必被 load_domain_state 填过）。
+    REALITY_DEST=$(get_state "REALITY_DEST" "")
+    REALITY_SERVER_NAMES=()
+    local _rsn _selfdom
+    _rsn=$(get_state "REALITY_SERVER_NAMES" "")
+    [[ -n "$_rsn" ]] && read -ra REALITY_SERVER_NAMES <<< "$_rsn"
+    _selfdom=$(get_state "REALITY_DOMAIN" "")
+
+    local _usable=1 _sn
+    [[ -z "${REALITY_DEST:-}" || "${REALITY_DEST}" == 127.0.0.1:* ]] && _usable=0
+    for _sn in "${REALITY_SERVER_NAMES[@]}"; do
+        [[ -n "$_sn" && -n "$_selfdom" && "$_sn" == "$_selfdom" ]] && _usable=0
+    done
+    (( _usable )) && return 0
+
+    case "${HW_REGION%%/*}" in
+        na) REALITY_DEST="solanolibrary.com:443"
+            read -ra REALITY_SERVER_NAMES <<< "solanolibrary.com openclaw.ai www.lapl.org www.siliconvalley.com www.oxy.edu business.ca.gov film.ca.gov" ;;
+        as) REALITY_DEST="www.lovelive-anime.jp:443"
+            read -ra REALITY_SERVER_NAMES <<< "www.lovelive-anime.jp www.nintendo.co.jp" ;;
+        *)  REALITY_DEST="ethz.ch:443"
+            read -ra REALITY_SERVER_NAMES <<< "ethz.ch m.ethz.ch debian.ethz.ch cuni.cz mff.cuni.cz www.mpg.de developer.trumpf.com" ;;
+    esac
+    REALITY_SPIDER_X=$(get_state "REALITY_SPIDER_X" "")
+    [[ -z "${REALITY_SPIDER_X:-}" ]] && REALITY_SPIDER_X="/"
+    save_state "REALITY_DEST"         "${REALITY_DEST}"
+    save_state "REALITY_SERVER_NAMES" "${REALITY_SERVER_NAMES[*]:-}"
+    save_state "REALITY_SNI"          "${REALITY_SERVER_NAMES[0]:-}"
+    save_state "REALITY_SPIDER_X"     "${REALITY_SPIDER_X}"
+    log_info "重置 vless-reality 公共参数（原值已被自建模式的客户端链接同步覆盖）: dest=${REALITY_DEST} serverNames=${REALITY_SERVER_NAMES[*]:-}"
     return 0
 }
 
@@ -939,6 +1032,16 @@ collect_reality_params() {
     # ⚠️ 配置表仍是唯一来源：这里改的**同时**落表，故 5→1 重跑不会推翻本次选择。
     # ⚠️ tag/untag 内部 rebuild+load_domain_state 刷新了 shell 全局
     #    REALITY_DOMAIN / XHTTP_REALITY_DOMAIN —— Stage A 后必须重快照。
+    # 进入 Stage A 前该槽是否已是「借公共」（mode=public）。Stage B 据此跳过对
+    # 「本来就借公共」的槽的第二遍地区/目标问答 —— 那种槽公共参数已在 state；
+    # 只有刚在 Stage A 切换（已备齐并置 _REALITY_*_PUBLIC_READY）或刚被上方
+    # 「同域双标」防御块摘除标签（mode 非 public、公共参数空）的槽才需要 Stage B
+    # 现场重选。⚠️ 不能拿「own 为空」当「已 public」：own 为空也可能是刚被
+    # 摘标签的槽，那种槽公共参数还没备齐，跳过会让它带着空 SNI 进生成器。
+    local _vless_was_pub=0 _xhttp_was_pub=0
+    [[ "$(get_state REALITY_SNI_MODE "")" == "public" ]]       && _vless_was_pub=1
+    [[ "$(get_state XHTTP_REALITY_SNI_MODE "")" == "public" ]] && _xhttp_was_pub=1
+
     _REALITY_SLOT_GUIDE=0
     _reality_ask_slot_sni xray-reality
     _reality_ask_slot_sni xhttp-reality
@@ -966,7 +1069,12 @@ collect_reality_params() {
     #    按 live config.json 覆盖成自建值，切回借公共 SNI 时**不能**直接复用。
     #    切公共前的备齐动作在 _reality_prepare_public_params（Stage A 里调）。
     # ========================================================
-    XHTTP_REALITY_SNI=""
+    # XHTTP_REALITY_SNI 只在 xhttp 自建时需要置空（防残留把自建槽误当公共）；
+    # 借公共时下方会「复用 Stage A 已落 state 的值」或现场重选，先清会把值丢掉
+    # → 复用分支拿到空串 → generate_xray_config 把空值写回 state（F1/F6 根因）。
+    if (( ! _xhttp_pub )); then
+        XHTTP_REALITY_SNI=""
+    fi
     echo ""
 
     # 把 state 里的公共参数（dest/serverNames/spiderX）读回 shell：
@@ -988,17 +1096,17 @@ collect_reality_params() {
 
     # ── vless 槽仍借公共 SNI：选借用站点（含地区 + 目标）──
     if (( _vless_pub )); then
-        if [[ -z "${_REALITY_VLESS_PUBLIC_READY:-}" ]]; then
+        if [[ -z "${_REALITY_VLESS_PUBLIC_READY:-}" ]] && (( ! _vless_was_pub )); then
             _reality_pick_target_list
             _probe_vless_spider_x
         else
-            log_info "复用本菜单刚为 vless-reality 选定的公共伪装参数"
+            log_info "复用 vless-reality 的公共伪装参数（已借公共，不重选）"
         fi
     fi
 
     # ── xhttp 槽仍借公共 SNI：选借用站点 ──
     if (( _xhttp_pub )); then
-        if [[ -z "${_REALITY_XHTTP_PUBLIC_READY:-}" ]]; then
+        if [[ -z "${_REALITY_XHTTP_PUBLIC_READY:-}" ]] && (( ! _xhttp_was_pub )); then
             if (( _vless_pub )) && (( ${#REALITY_SERVER_NAMES[@]} > 1 )); then
                 # 两槽都借公共：xhttp 从 vless 刚选出的 serverNames[1:] 里挑一个
                 # 不撞的（两节点共 SNI 会让 nginx SNI map 只分流到一个后端），
@@ -1026,7 +1134,10 @@ collect_reality_params() {
                 fi
             fi
         else
-            log_info "复用本菜单刚为 vless-xhttp-reality 选定的公共 SNI: ${XHTTP_REALITY_SNI}"
+            # 复用分支不依赖内存里的 XHTTP_REALITY_SNI（上面可能被重置清掉），
+            # 直接从 state 读回 Stage A 已落盘的值。
+            XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI" "")
+            log_info "复用 vless-xhttp-reality 的公共 SNI: ${XHTTP_REALITY_SNI}（已借公共，不重选）"
         fi
     fi
 
@@ -1114,8 +1225,10 @@ generate_xray_config() {
 
     # XHTTP_REALITY_SNI / XHTTP_REALITY_DOMAIN 由 collect_reality_params() 交互式设置并已赋值
     # 此处只做持久化；两者互斥：设了 DOMAIN 则 SNI 不生效
-    save_state "XHTTP_REALITY_SNI"    "${XHTTP_REALITY_SNI:-}"
-    save_state "XHTTP_REALITY_DOMAIN" "${XHTTP_REALITY_DOMAIN:-}"
+    # ⚠️ 非空才写：非交互路径（_regen_xray_from_state）可能没水合这两个变量，
+    #    空值覆盖会把 state 里已有的公共 SNI/连接地址清掉（F1/F6）。
+    [[ -n "${XHTTP_REALITY_SNI:-}" ]]    && save_state "XHTTP_REALITY_SNI"    "${XHTTP_REALITY_SNI}"
+    [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]] && save_state "XHTTP_REALITY_DOMAIN" "${XHTTP_REALITY_DOMAIN}"
 
     # ── 防偷流量：reality-direct ──────────────────────────────────
     # 自建 SNI（_reality_slot_borrows_public 为假）：

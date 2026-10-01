@@ -2465,13 +2465,13 @@ _sni_switch_verify() {
 
     # 2) nginx 侧必须反映新分配
     local _servers="/etc/nginx/conf.d/servers.conf" _ngx="/etc/nginx/nginx.conf"
-    if [[ -n "$_domain" ]]; then
+    if [[ "$_mode" == "self" && -n "$_domain" ]]; then
         # 自建：该域必须有 server 块（携带证书、作为 xray 的回落站）
         if [[ -f "$_servers" ]] && ! grep -qE "server_name[^;]*(\s|^)${_domain//./\\.}(\s|;)" "$_servers"; then
             log_error "断言失败：${_servers} 里没有 ${_domain} 的 server 块"
             _rc=1
         fi
-    elif [[ -n "$_old" ]]; then
+    elif [[ "$_mode" == "public" && -n "$_old" ]]; then
         # 公共：旧域若已无任何协议角色（被摘出注册表），就不该再出现在 443 分流上；
         # 若它还有别的角色（例如同时是 hysteria2 域），留着是正确行为，不判失败。
         if ! domain_is_registered "$_old"; then
@@ -2599,7 +2599,16 @@ apply_reality_sni_switch() {
 
     # ── 2) 破坏性前置（不可回滚：签出来的证书不回删）
     local _old; _old=$(get_state "$_key" "")
-    if [[ -n "$_domain" ]]; then
+    # ⚠️ 分支判据是 **_mode**（SNI 来源），不是「有没有域名」：域名与 SNI 来源解耦，
+    #    「借公共 + 保留域名」（mode=public、域名非空，作连接地址）也是常态，那种槽
+    #    绝不能进自建分支 —— 否则会重新打自建标签 + 签证书，等于「借公共」没切成
+    #    （旧域仍挂着 xray 标签，generate_sni_map 继续把该域当自建 SNI 分流）。
+    if [[ "$_mode" == "self" ]]; then
+        if [[ -z "$_domain" ]]; then
+            log_error "自建模式必须带域名（${_slot}）；无域名应使用 public 模式"
+            rm -rf "$_snap_root"
+            return 1
+        fi
         # 自建方向。换域名时**必须先摘旧域标签**：register_domain/tag 是 merge
         # 语义（只加不摘），不摘的话旧域会一直挂着 xray-reality 标签，于是
         # generate_sni_map 继续为它分流、nginx 继续为它出 server 块 —— 表现为
@@ -2623,8 +2632,21 @@ apply_reality_sni_switch() {
             rm -rf "$_snap_root"
             return 1
         fi
+    elif [[ -n "$_domain" ]]; then
+        # 公共方向 + 保留/换域名：域名仍是客户端连接地址（配置表第 3/4 行保留），
+        # 只是 SNI 借公共大站。换域时先摘旧域标签、再打新域标签；**不签证书**
+        # （借公共 SNI 不需要自己的证书）。
+        if [[ -n "$_old" && "$_old" != "$_domain" ]]; then
+            log_info "换域：先摘除原自建域 ${_old} 的 ${_tag} 标签"
+            reality_untag_self_domain "$_old" "$_tag" || log_warn "摘除 ${_old} 标签返回非零，继续"
+        fi
+        if ! reality_tag_self_domain "$_domain" "$_tag"; then
+            log_error "登记连接地址域 ${_domain} 失败（见上方原因），未改动任何东西"
+            rm -rf "$_snap_root"
+            return 1
+        fi
     elif [[ -n "$_old" ]]; then
-        # 公共方向：摘除自建标签。证书与 domain ini **故意保留**（见文末说明）：
+        # 公共方向 + 清空域名：摘除自建标签。证书与 domain ini **故意保留**（见文末说明）：
         # 通配符证书按根域共享，别的协议/域可能在用同一条 lineage，删了会连坐。
         reality_untag_self_domain "$_old" "$_tag" || log_warn "${_slot} 摘标签返回非零，继续"
         log_warn "${_old} 的证书与 CF 凭证文件保留在磁盘上、未删除；如需彻底清理请到主菜单 5 的域名表里停用该域"
@@ -2643,6 +2665,20 @@ apply_reality_sni_switch() {
     #        ⚠️ 必须在事务内（失败由快照回滚），否则会出现「域名已改、SNI 来源
     #        还是旧的」这种半成品 —— 表现为「切了公共，订阅 sni 仍是自己的域名」。
     save_state "${_mode_key}" "$_mode"
+
+    # ── 3c) 公共方向：级联前先非交互补齐公共伪装参数。交互菜单的 case 2/3 已由
+    #        _reality_prepare_public_params 备齐（此处是纯复用，不覆盖用户已选站点）；
+    #        直接切公共的路径（矩阵 / R 恢复 / 降级）此前没有这一步，会把
+    #        sync_hydrate_client_state 在自建期间回填的自建值（dest=127.0.0.1:8321、
+    #        serverNames=[自建域]）原样带进级联 → 生成自环 config.json、订阅仍用
+    #        自己的域名。必须在这里清掉（非交互、确定性重置）。
+    if [[ "$_mode" == "public" ]]; then
+        if declare -F _reality_reset_public_params >/dev/null 2>&1; then
+            _reality_reset_public_params "$_tag"
+        else
+            log_warn "_reality_reset_public_params 不可用，公共伪装参数可能残留自建值"
+        fi
+    fi
 
     # ── 4) 级联重建：xray（dest/serverNames 随 state 重算）+ nginx 全量
     #        （server 块 / SNI map / 伪装 webroot）+ unbound + 客户端订阅。

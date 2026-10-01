@@ -96,9 +96,21 @@ for inbound in c.get("inbounds", []):
         break
 PY
 )
+        # 防护：vless 槽自建（REALITY_SNI_MODE=self）时，reality-direct 的
+        # realitySettings 是自建态（dest=127.0.0.1:8321、serverNames=[自建域]），
+        # 照常回填会把 REALITY_DEST / REALITY_SNI / REALITY_SERVER_NAMES 污染成
+        # 自建值。这三个键是「借公共大站 SNI」的伪装参数，自建期间应**保留上次
+        # 的公共值**作回滚态（apply_reality_sni_switch 切回公共时复用）；且自建
+        # 生成器不读它们（自建分支固定 dest→8321、serverNames=[REALITY_DOMAIN]，
+        # 见 generate_xray_config），跳过回填不影响自建产物。故 self 下这三个键
+        # 一概不回填。REALITY_SHORT_ID / REALITY_SPIDER_X 与 SNI 来源无关，照常。
+        local _snimode; _snimode=$(get_state "REALITY_SNI_MODE" "")
         while IFS='=' read -r key value; do
             [[ -n "${key:-}" ]] || continue
-            [[ -n "${key:-}" ]] && save_state "$key" "$value"
+            if [[ "$_snimode" == "self" ]]; then
+                case "$key" in REALITY_DEST|REALITY_SNI|REALITY_SERVER_NAMES) continue ;; esac
+            fi
+            save_state "$key" "$value"
         done <<< "$xray_kv"
     fi
 
