@@ -2314,7 +2314,11 @@ do_conf_xray() {
 
     generate_xray_params
     collect_reality_params
-    generate_xray_config
+    generate_xray_config || {
+        log_error "生成 Xray 配置失败（借公共 SNI 但公共参数为空），中止配置，未写 config.json"
+        done_return
+        return
+    }
     start_xray
 
     save_state "XRAY_UUID"             "${XRAY_UUID:-}"

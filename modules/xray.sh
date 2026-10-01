@@ -1100,6 +1100,11 @@ collect_reality_params() {
             _reality_pick_target_list
             _probe_vless_spider_x
         else
+            # 复用前兜底：do_reconf_xray（菜单 x）清空公共参数但保留 mode=public，
+            # 「复用」分支若直接放行会拿到空 dest/serverNames → 空 serverNames 坏配置。
+            # _reality_reset_public_params 非交互：参数完好则纯复用（不动 state），
+            # 空/被污染则确定性补默认站点，绝不放行空参数。
+            _reality_reset_public_params xray-reality
             log_info "复用 vless-reality 的公共伪装参数（已借公共，不重选）"
         fi
     fi
@@ -1134,8 +1139,10 @@ collect_reality_params() {
                 fi
             fi
         else
-            # 复用分支不依赖内存里的 XHTTP_REALITY_SNI（上面可能被重置清掉），
-            # 直接从 state 读回 Stage A 已落盘的值。
+            # 复用前兜底（同 vless 槽）：do_reconf_xray 清空 XHTTP_REALITY_SNI 但
+            # 保留 mode=public，直接读 state 会拿到空值 → 空 serverNames。
+            # _reality_reset_public_params 非交互补齐默认站点（完好则纯复用，不动 state）。
+            _reality_reset_public_params xhttp-reality
             XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI" "")
             log_info "复用 vless-xhttp-reality 的公共 SNI: ${XHTTP_REALITY_SNI}（已借公共，不重选）"
         fi
@@ -1229,6 +1236,18 @@ generate_xray_config() {
     #    空值覆盖会把 state 里已有的公共 SNI/连接地址清掉（F1/F6）。
     [[ -n "${XHTTP_REALITY_SNI:-}" ]]    && save_state "XHTTP_REALITY_SNI"    "${XHTTP_REALITY_SNI}"
     [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]] && save_state "XHTTP_REALITY_DOMAIN" "${XHTTP_REALITY_DOMAIN}"
+
+    # ── 防护：借公共 SNI 但公共参数为空 → 拒绝生成 ──────────────────
+    # do_reconf_xray（菜单 x）清空参数但保留 mode=public 时，若 collect 阶段没兜住，
+    # 这里也要在写 config.json 前报错中止，绝不落盘空 serverNames / 空 dest。
+    if _reality_slot_borrows_public xray-reality && [[ -z "${REALITY_SERVER_NAMES[0]:-}" ]]; then
+        log_error "vless-reality 借公共 SNI 但 REALITY_SERVER_NAMES 为空，拒绝生成 config.json"
+        return 1
+    fi
+    if _reality_slot_borrows_public xhttp-reality && [[ -z "${XHTTP_REALITY_SNI:-}" ]]; then
+        log_error "vless-xhttp-reality 借公共 SNI 但 XHTTP_REALITY_SNI 为空，拒绝生成 config.json"
+        return 1
+    fi
 
     # ── 防偷流量：reality-direct ──────────────────────────────────
     # 自建 SNI（_reality_slot_borrows_public 为假）：
