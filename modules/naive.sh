@@ -347,9 +347,17 @@ configure_naive() {
     fi
 
     # ── 5. probe_resistance 链接 ──────────────────────────────
+    # 与用户名/密码同一套幂等逻辑：state 已有就复用，绝不重生成——否则每次
+    # 重配都会换掉 probe_resistance 路径，打挂所有现有 naive 客户端（F2）。
     local probe_link
-    probe_link=$(openssl rand -hex 8)
-    save_state "NAIVE_PROBE_LINK" "${probe_link}"
+    probe_link=$(get_state "NAIVE_PROBE_LINK")
+    if [[ -z "${probe_link}" ]]; then
+        probe_link=$(openssl rand -hex 8)
+        save_state "NAIVE_PROBE_LINK" "${probe_link}"
+        log_info "已生成 probe_resistance 随机路径"
+    else
+        log_info "复用已有 probe_resistance 随机路径"
+    fi
     log_info "probe_resistance: ${probe_link}.${NAIVE_DOMAIN}"
 
     # ── 6. 本地伪装站（取代原「反代外部站」伪装）──────────────────
