@@ -2393,7 +2393,7 @@ offer_reality_preassign() {
 # ════════════════════════════════════════════════════════════
 # Reality 槽位 SNI 来源切换（自建 ↔ 借公共），事务化
 # ════════════════════════════════════════════════════════════
-# 用法: apply_reality_sni_switch <slot> <domain|""> <self|public>
+# 用法: apply_reality_sni_changes <slot> [<slot>...]   （目标模式见函数内注释）
 #   <slot>   ∈ xray-reality（配置表第 4 行）| xhttp-reality（第 3 行）
 #   <domain> 配置表分配给该槽的域（**只读参数**：本函数不改域名分配）
 #   <mode>   SNI 来源：self = 用该自有域自建；public = SNI/dest 借公共大站
@@ -2537,18 +2537,18 @@ _sni_switch_verify() {
     return "$_rc"
 }
 
-apply_reality_sni_switch() {
-    local _slot="${1:-}" _domain="${2:-}" _mode="${3:-}"
-    [[ -z "$_mode" ]] && { [[ -n "$_domain" ]] && _mode="self" || _mode="public"; }
-
-    local _mode_key _tag _row _label
-    case "$_slot" in
-        xray-reality)  _mode_key="REALITY_SNI_MODE"       _tag="xray-reality"  _row=4 _label="VLESS-Reality" ;;
-        xhttp-reality) _mode_key="XHTTP_REALITY_SNI_MODE" _tag="xhttp-reality" _row=3 _label="XHTTP-Reality" ;;
-        *) log_error "apply_reality_sni_switch: 未知槽位 '${_slot}'"; return 1 ;;
-    esac
-    [[ "$_mode" == "self" || "$_mode" == "public" ]] \
-        || { log_error "apply_reality_sni_switch: 未知 SNI 来源 '${_mode}'（应为 self/public）"; return 1; }
+# ── Reality SNI 来源事务：1..N 个槽一次落地 ──────────────────────────
+# 用法: apply_reality_sni_changes <slot> [<slot>...]   slot ∈ xray-reality|xhttp-reality
+#   目标来源：调用方先设内存变量 _REALITY_TARGET_MODE_<slot> = self|public（未设 = 保持当前）
+#   流程：冲突检测 → 备份(state+nginx) → 写 state(各槽 mode) → 生成 xray/nginx 配置并各重启
+#         一次 + 重建订阅（--sni-only，不碰 Unbound）→ 逐槽产物断言 →
+#         成功删备份 / 失败回滚并打印原因。
+# ⚠️ 正式菜单 11 / x：两个槽都问完后**一次**调用并传两个槽；
+#    测试可逐槽调用同一函数 —— 只有调用方式不同，**不存在第二套逻辑**。
+# ⚠️ 目标与当前一致时：不备份、不重建，直接返回 0（幂等）。
+apply_reality_sni_changes() {
+    local -a _slots=("$@")
+    (( ${#_slots[@]} > 0 )) || { log_error "apply_reality_sni_changes: 至少需要一个槽"; return 1; }
 
     declare -F _reality_sni_conflict_check >/dev/null 2>&1 || load_module xray  >/dev/null 2>&1 || true
     declare -F nginx_config_snapshot      >/dev/null 2>&1 || load_module nginx >/dev/null 2>&1 || true
@@ -2558,13 +2558,33 @@ apply_reality_sni_switch() {
         return 1
     fi
 
-    # ── 0) 规则 3：冲突检测。命中 = 中止当次操作，一个字都不写（不自动修复）
-    if ! _reality_sni_conflict_check "$_slot" "$_mode" "$_domain"; then
-        log_warn "已取消本次「${_label}」SNI 来源切换，现场未作任何改动"
-        return 1
-    fi
+    # ── 0) 冲突检测（只读；命中即中止，一字不写）＋ 变更判定
+    local _slot _tgt _cur _domain
+    local -a _todo=() _regen_slots=()
+    for _slot in "${_slots[@]}"; do
+        case "$_slot" in
+            xray-reality)  _domain="${REALITY_DOMAIN:-}" ;;
+            xhttp-reality) _domain="${XHTTP_REALITY_DOMAIN:-}" ;;
+            *) log_error "apply_reality_sni_changes: 未知槽位 '${_slot}'"; return 1 ;;
+        esac
+        local _tv="_REALITY_TARGET_MODE_${_slot//-/_}"
+        _tgt="${!_tv:-}"
+        [[ -z "$_tgt" ]] && continue
+        [[ "$_tgt" == "self" || "$_tgt" == "public" ]] \
+            || { log_error "apply_reality_sni_changes: ${_slot} 目标模式 '${_tgt}' 非法"; return 1; }
+        if ! _reality_sni_conflict_check "$_slot" "$_tgt" "$_domain"; then
+            log_warn "已取消本次 SNI 来源切换（冲突见上），现场未作任何改动"
+            return 1
+        fi
+        if [[ "$_slot" == "xray-reality" ]]; then _cur=$(get_state "REALITY_SNI_MODE" "")
+        else _cur=$(get_state "XHTTP_REALITY_SNI_MODE" ""); fi
+        [[ "$_cur" == "$_tgt" ]] && continue
+        _todo+=("$_slot")
+        if [[ "$_slot" == "xray-reality" ]]; then _regen_slots+=("reality"); else _regen_slots+=("xhttp-reality"); fi
+    done
+    (( ${#_todo[@]} )) || { log_info "SNI 来源无变化，跳过切换（幂等）"; return 0; }
 
-    # ── 1) 快照：state + nginx（**不快照配置表** —— 本流程不写表）
+    # ── 1) 备份 state + /etc/nginx（在写任何 state 之前）
     local _snap_root="${STATE_DIR:-/etc/xray-deploy}/sni-switch.$$"
     rm -rf "$_snap_root"; mkdir -p "$_snap_root" || { log_error "快照目录创建失败"; return 1; }
     /usr/bin/cp -a "$STATE_FILE" "$_snap_root/state.env" 2>/dev/null || true
@@ -2572,22 +2592,17 @@ apply_reality_sni_switch() {
     declare -F nginx_config_snapshot >/dev/null 2>&1 && _nginx_snap=$(nginx_config_snapshot "$_snap_root")
     log_info "已快照（state${_nginx_snap:+/nginx}）→ ${_snap_root}"
 
-    _sni_switch_rollback() {
-        log_warn "回滚本次切换……"
+    _sni_changes_rollback() {
+        log_warn "回滚本次 SNI 来源切换（失败原因见上）……"
         [[ -f "${_snap_root}/state.env" ]] && /usr/bin/cp -a "${_snap_root}/state.env" "$STATE_FILE"
         if [[ -n "$_nginx_snap" ]] && declare -F nginx_config_restore >/dev/null 2>&1; then
             nginx_config_restore "$_nginx_snap" || log_error "nginx 快照还原失败（快照在 ${_nginx_snap}）"
         fi
-        # ⚠️ xray 也必须还原：级联里的 _regen_xray_from_state 会**重写 config.json 并
-        #    调 start_xray（restart）**。只还原 state+nginx 会留下「state/nginx 是旧的、
-        #    跑着的 xray 是新的」。按还原后的 state 重生成 + 重启即可。
-        #    ⚠️ 必须放子 shell：start_xray 失败是 `exit 1`，裸调会把回滚本身杀掉。
         if [[ -s /usr/local/etc/xray/config.json ]] && declare -F _regen_xray_from_state >/dev/null 2>&1; then
             if ( _regen_xray_from_state ) >/dev/null 2>&1; then
                 log_info "已按还原后的 state 重建 xray config.json 并重启"
             else
-                log_error "xray 配置还原失败：state 已还原，但 config.json 可能仍是切换后的内容"
-                log_error "  请手动运行主菜单 x（重新配置 Xray）对齐（快照 ${_snap_root}）"
+                log_error "xray 配置还原失败：请手动运行主菜单 x 对齐（快照 ${_snap_root}）"
             fi
         fi
         if command -v nginx >/dev/null 2>&1 && nginx -t >/dev/null 2>&1; then
@@ -2600,41 +2615,49 @@ apply_reality_sni_switch() {
             && { save_domain_config >/dev/null 2>&1 || log_warn "domain_map.conf 重派生失败，请手工核对"; }
     }
 
-    # ── 2) 公共方向：级联前先非交互备齐公共伪装参数（SNI 参数，不属域名分配）。
-    #        必须排在写 mode 键**之前**：取不到干净参数（例如本地区候选已被另一槽
-    #        占满）就在这里中止，state 一个字节都不动 —— 即「不改动该槽」。
-    if [[ "$_mode" == "public" ]]; then
-        if declare -F _reality_reset_public_params >/dev/null 2>&1; then
-            if ! _reality_reset_public_params "$_tag"; then
-                log_warn "公共伪装参数无法就绪（候选被另一槽占满或未选到站点），已取消本次切换"
-                rm -rf "$_snap_root"; return 1
-            fi
+    # ── 2) 写 state：各槽目标 mode（公共方向先非交互备齐公共参数，失败即取消）
+    local _mode_key _tag _label
+    for _slot in "${_todo[@]}"; do
+        if [[ "$_slot" == "xray-reality" ]]; then
+            _mode_key="REALITY_SNI_MODE";       _tag="xray-reality";  _label="VLESS-Reality"
         else
-            log_warn "_reality_reset_public_params 不可用，公共伪装参数可能残留自建值"
+            _mode_key="XHTTP_REALITY_SNI_MODE"; _tag="xhttp-reality"; _label="XHTTP-Reality"
         fi
-    fi
+        local _tv2="_REALITY_TARGET_MODE_${_slot//-/_}"
+        _tgt="${!_tv2:-}"
+        if [[ "$_tgt" == "public" ]]; then
+            if declare -F _reality_reset_public_params >/dev/null 2>&1; then
+                # 备齐失败（如候选被另一槽占满）→ 直接中止，state 一个字节都不动
+                if ! _reality_reset_public_params "$_tag"; then
+                    log_warn "「${_label}」公共伪装参数无法就绪，已取消本次切换"
+                    rm -rf "$_snap_root"; return 1
+                fi
+            else
+                log_warn "_reality_reset_public_params 不可用，公共伪装参数可能残留自建值"
+            fi
+        fi
+        save_state "$_mode_key" "$_tgt"
+        log_info "已落 state：${_label} SNI 来源 = ${_tgt}"
+    done
 
-    # ── 3) 唯一的持久化写入：SNI 来源键（域名分配完全不动）
-    save_state "$_mode_key" "$_mode"
-
-    # ── 4) 级联重建（槽位词汇翻译 + 子 shell：reload_nginx 失败是 exit 1）
-    local _regen_slot="$_slot"; [[ "$_slot" == "xray-reality" ]] && _regen_slot="reality"
-    if ! ( regen_after_domain_change "$_regen_slot" ); then
+    # ── 3) 生成 xray / nginx 配置（各重启一次）+ 重建订阅；SNI 事务不碰 Unbound
+    if ! ( regen_after_domain_change --sni-only "${_regen_slots[@]}" ); then
         log_error "级联重建失败（nginx -t 未通过或下游报错）"
-        _sni_switch_rollback; rm -rf "$_snap_root"; return 1
+        _sni_changes_rollback; rm -rf "$_snap_root"; return 1
     fi
 
-    # ── 5) 产物断言（不能只看 regen 的退出码：它对 nginx 段失败也返回 0）
-    if ! _sni_switch_verify "$_slot" "$_mode"; then
-        _sni_switch_rollback; rm -rf "$_snap_root"; return 1
-    fi
+    # ── 4) 逐槽产物断言（不能只看级联退出码：它对 nginx 段失败也返回 0）
+    for _slot in "${_todo[@]}"; do
+        local _tv3="_REALITY_TARGET_MODE_${_slot//-/_}"
+        _tgt="${!_tv3:-}"
+        if ! _sni_switch_verify "$_slot" "$_tgt"; then
+            log_error "产物断言失败：${_slot} 未达到目标模式 ${_tgt}"
+            _sni_changes_rollback; rm -rf "$_snap_root"; return 1
+        fi
+    done
 
     rm -rf "$_snap_root"
-    if [[ "$_mode" == "public" ]]; then
-        log_info "已切换为「借公共大站 SNI」：SNI/dest 用公共站，${_domain:-（表里无域名，连接地址用服务器 IP）} 只作连接地址"
-    else
-        log_info "已切换为「用自有域自建」：SNI / 证书 / dest 都用 ${_domain}（配置表第 ${_row} 行）"
-    fi
+    log_info "SNI 来源切换完成（${_todo[*]}）：nginx / xray / 订阅已重建；备份已删除"
     return 0
 }
 

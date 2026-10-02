@@ -784,42 +784,6 @@ _reality_sni_conflict_check() {
     done
     return 0
 }
-# ── 调 cert.sh 的事务化 SNI 来源切换 ─────────────────────────
-# 用法: _reality_switch_slot <tag> <domain|""> [self|public]
-#   domain = 配置表分配给该槽的域（**只读**：本流程不再改域名分配）
-#   mode   = SNI 来源；省略时按老规则推（有域 = self，无域 = public）
-# 切换 = 只写 SNI 来源键 + 级联重建 nginx/xray/订阅，失败自动回滚（见 cert.sh）。
-#
-# ⚠️ 2026-10-02（规则 1）起**不再写配置表、不打/摘 reality 标签、不签证书**：
-#    域名分配的唯一来源是主菜单 5→1 的配置表；本函数只决定「SNI 用自有域还是借公共」。
-# ⚠️ 降级路径（cert 模块取不到）：只写 SNI 来源键并明说后果，不做任何域名层改动。
-_reality_switch_slot() {
-    local tag="$1" domain="${2:-}" mode="${3:-}"
-    local mode_key label
-    if [[ "$tag" == "xray-reality" ]]; then
-        mode_key="REALITY_SNI_MODE";       label="VLESS-Reality"
-    else
-        mode_key="XHTTP_REALITY_SNI_MODE"; label="XHTTP-Reality"
-    fi
-    [[ -z "$mode" ]] && { [[ -n "$domain" ]] && mode="self" || mode="public"; }
-
-    if ! declare -F apply_reality_sni_switch >/dev/null 2>&1; then
-        declare -F load_module >/dev/null 2>&1 && load_module cert >/dev/null 2>&1 || true
-    fi
-
-    if declare -F apply_reality_sni_switch >/dev/null 2>&1; then
-        if apply_reality_sni_switch "$tag" "$domain" "$mode"; then
-            return 0
-        fi
-        log_error "${label} SNI 来源切换失败（已回滚或已中止，现场与切换前一致）"
-        return 1
-    fi
-
-    log_warn "cert 模块不可用（apply_reality_sni_switch 未加载）—— 只写 SNI 来源键，不重建产物"
-    log_warn "  后果：config.json / nginx / 订阅要到下次「配置 Xray（菜单 11）」才跟上新来源"
-    save_state "$mode_key" "$mode"
-    return 0
-}
 
 # ── 「自有域自建 → 借公共大站 SNI」前，把该槽的公共伪装参数备齐并落 state ──
 # 用法: _reality_prepare_public_params <tag> [force]   tag ∈ {xray-reality, xhttp-reality}
@@ -833,7 +797,7 @@ _reality_switch_slot() {
 # ⚠️ force：本项兼作「换伪装站点」，用户按了就必须真的重选一次（不复用）。
 #
 # 为什么必须在切换**之前**单独做这一步：切换的级联
-# （cert.sh apply_reality_sni_switch → regen_after_domain_change）要用 state 里
+# （cert.sh apply_reality_sni_changes → regen_after_domain_change）要用 state 里
 # 这些值重建产物 ——
 #   · vless : REALITY_DEST / REALITY_SERVER_NAMES → generate_xray_config 的
 #             dokodemo 4431 目标与 reality serverNames；generate_sni_map 也按
@@ -911,7 +875,7 @@ _reality_prepare_public_params() {
 # 返回 0 = 参数就绪（可能是纯复用，不动 state）；1 = 地区候选被对方占满、取不到
 #   默认站 —— **不改动该槽任何值**，由调用方给出提示并保持原状。
 #
-# 供 apply_reality_sni_switch（cert.sh）公共方向在级联前调用。交互菜单的
+# 供 apply_reality_sni_changes（cert.sh）公共方向在级联前调用。交互菜单的
 # case 2/3 仍走 _reality_prepare_public_params（含复用/换站问答，交互行为不变）；
 # 本函数只兜住「事务直接切公共」的路径（矩阵/R 恢复/降级分支），保证公共参数
 # 一定干净、不含自建残留。⚠️ 若公共参数本就可用（比如菜单 case 2 刚备齐、或
@@ -1016,7 +980,7 @@ _reality_reset_public_params() {
 # 「表里该槽有没有域名」：
 #   有域 → 1 自建 / 2 借公共 / 3 换公共站
 #   无域 → 1 借公共 / 2 换公共站 / 3 自建（必被规则 3 拦下并给出冲突说明）
-# 选完交给 _reality_switch_slot → apply_reality_sni_switch（cert.sh）事务化落地。
+# 选完只**记录目标**；由 collect 在两个槽都问完后一次调用 apply_reality_sni_changes（cert.sh）落地。
 _reality_ask_slot_sni() {
     local tag="$1"
     local label own_key _sni_key row
@@ -1052,21 +1016,26 @@ _reality_ask_slot_sni() {
         case "${_choice:-$_def}" in
             1)
                 if (( _borrows )); then
-                    _reality_switch_slot "$tag" "$own" self
+                    printf -v "_REALITY_TARGET_MODE_${tag//-/_}" '%s' self
+                    log_info "${label} 已记录：将以「自有域自建」落地（两槽问完后一次执行）"
                 else
                     log_info "${label} 保持自建 ${own}"
                 fi ;;
             2)
                 if (( _borrows )); then
                     log_info "${label} 保持借公共大站 SNI ${_pub_now:-（未选）}"
-                elif _reality_prepare_public_params "$tag" && _reality_switch_slot "$tag" "$own" public; then
+                elif _reality_prepare_public_params "$tag"; then
+                    printf -v "_REALITY_TARGET_MODE_${tag//-/_}" '%s' public
                     printf -v "$_ready_var" '%s' 1
+                    log_info "${label} 已记录：将以「借公共大站 SNI」落地（两槽问完后一次执行）"
                 else
                     log_warn "未能备齐公共伪装参数，已取消本次「借公共大站 SNI」"
                 fi ;;
             3)
-                if _reality_prepare_public_params "$tag" force && _reality_switch_slot "$tag" "$own" public; then
+                if _reality_prepare_public_params "$tag" force; then
+                    printf -v "_REALITY_TARGET_MODE_${tag//-/_}" '%s' public
                     printf -v "$_ready_var" '%s' 1
+                    log_info "${label} 已记录：将以「借公共大站 SNI」落地（换站）"
                 else
                     log_warn "未能选到借用站点，保持当前 SNI 来源（${_now_desc}）"
                 fi ;;
@@ -1087,7 +1056,8 @@ _reality_ask_slot_sni() {
                     log_warn "未能选到借用站点，保持原公共 SNI"
                 fi ;;
             3)
-                _reality_switch_slot "$tag" "" self ;;
+                printf -v "_REALITY_TARGET_MODE_${tag//-/_}" '%s' self
+                log_info "${label} 已记录：将以「自有域自建」落地（表里无域名，冲突检测会拦下并说明）" ;;
             *)
                 log_info "${label} 保持借公共大站 SNI" ;;
         esac
@@ -1125,7 +1095,7 @@ collect_reality_params() {
 
     # ═══ Stage A：逐槽 SNI 来源决策 ═══
     # 每个 Reality 协议独立选「用自有域自建 / 借公共大站 SNI」。
-    # 选完由 apply_reality_sni_switch（cert.sh）事务化落地：写回配置表第 3/4 行
+    # 选完只记录目标；两槽问完后一次调用 apply_reality_sni_changes（cert.sh）落地（**不写配置表**）
     # → 自建方向先签证书 → 再级联重建 nginx/xray/订阅，任一步失败全部回滚。
     # ⚠️ 配置表仍是唯一来源：这里改的**同时**落表，故 5→1 重跑不会推翻本次选择。
     # ⚠️ tag/untag 内部 rebuild+load_domain_state 刷新了 shell 全局
@@ -1141,8 +1111,24 @@ collect_reality_params() {
     [[ "$(get_state XHTTP_REALITY_SNI_MODE "")" == "public" ]] && _xhttp_was_pub=1
 
     _REALITY_SLOT_GUIDE=0
+    _REALITY_TARGET_MODE_xray_reality=""
+    _REALITY_TARGET_MODE_xhttp_reality=""
     _reality_ask_slot_sni xray-reality
     _reality_ask_slot_sni xhttp-reality
+    # ── 两个槽都问完后，**一次**调用同一事务把两槽一起落地（正式菜单 11/x 的路径）──
+    #    逐槽调用只是测试脚本的调用方式，函数本身与这里完全相同。
+    if ! declare -F apply_reality_sni_changes >/dev/null 2>&1; then
+        declare -F load_module >/dev/null 2>&1 && load_module cert >/dev/null 2>&1 || true
+    fi
+    if declare -F apply_reality_sni_changes >/dev/null 2>&1; then
+        apply_reality_sni_changes xray-reality xhttp-reality || {
+            log_warn "SNI 来源变更未能落地（原因见上）；本次 Reality 配置处理中止"
+            return 1
+        }
+    else
+        log_error "缺少 apply_reality_sni_changes（cert 模块未加载），无法落地 SNI 来源变更"
+        return 1
+    fi
     _vless_own="${REALITY_DOMAIN:-}"
     _xhttp_own="${XHTTP_REALITY_DOMAIN:-}"
     # 该槽是不是「借公共 SNI」——判据是 SNI 来源，**不是**「有没有分配域名」。

@@ -967,8 +967,11 @@ rebuild_protocol_domains() {
 }
 
 # ── 域名分配变更 → 级联重建相关产物（通用，不含任何具体域名）────
-# 由 modules/cert.sh refresh_domain_assignments 在检测到任一槽位域变化后调用。
-# 用法: regen_after_domain_change <changed-slot>...
+# 由 modules/cert.sh refresh_domain_assignments（5→3 改表）与
+# apply_reality_sni_changes（SNI 来源切换）调用。
+# 用法: regen_after_domain_change [--sni-only] <changed-slot>...
+#   --sni-only    SNI 来源切换专用：只重建 nginx / xray / 订阅，**跳过 Unbound**
+#                 （SNI 模式不影响 DIRECT_DOMAINS/CDN_DOMAINS，已活机验证输出不变）
 #   <changed-slot> ∈ xhttp | grpc | reality | xhttp-reality | anytls | hysteria2 | naive
 # 派发规则：
 #   xhttp/reality/xhttp-reality → Xray config（无交互从 state 重建）
@@ -980,6 +983,12 @@ rebuild_protocol_domains() {
 # 全程守卫"服务已配置 + state 参数齐 → 无交互重建；缺则打印需手动跑的主菜单键"。
 # 函数自身不做 diff；是否触发由调用方决定。
 regen_after_domain_change() {
+    # --sni-only：SNI 来源切换（Reality 自建↔借公共）专用。该切换**不改**
+    # DIRECT_DOMAINS / CDN_DOMAINS（已活机验证：_build_own_domain_zones 输出逐字节不变），
+    # 故不该牵动 Unbound；本模式只重建 nginx / xray / 客户端订阅。
+    # 不带该参数（= 主菜单 5→3 改表后的级联）保持原行为，Unbound 照常刷新。
+    local _sni_only=0
+    if [[ "${1:-}" == "--sni-only" ]]; then _sni_only=1; shift; fi
     local slot
     local do_xray=0 do_singbox=0 do_naive=0 do_hyst=0
     local -a manual=()
@@ -1045,7 +1054,7 @@ regen_after_domain_change() {
     #    纯转发模式下 server 段与上游都不含域名，只有这份清单会过期——不刷新的话
     #    旧域仍被解析到本机、新域解析不到本机。refresh_unbound_generated_config
     #    自带 restart + 存活校验，失败不中断整个级联。
-    if [[ "$(get_step INST_UNBOUND)" == "1" ]]; then
+    if (( ! _sni_only )) && [[ "$(get_step INST_UNBOUND)" == "1" ]]; then
         load_module unbound
         if declare -F refresh_unbound_generated_config >/dev/null; then
             refresh_unbound_generated_config && log_info "已重建: Unbound 自有域名解析" \
