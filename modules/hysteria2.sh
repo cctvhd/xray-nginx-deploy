@@ -75,7 +75,7 @@ configure_hysteria2() {
         exit 1
     fi
 
-    save_state "HYSTERIA2_DOMAIN" "${HY2_DOMAIN}"
+    # 规则 1（2026-10-02）：此处原有 save_state "HYSTERIA2_DOMAIN" —— 原样写回，冗余，删除。
     log_info "Hysteria2 域名: ${HY2_DOMAIN}"
 
     # ── 2. 证书路径（三段式：域名 cert → 根域 cert → 手动输入）────

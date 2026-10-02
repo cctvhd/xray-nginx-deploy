@@ -23,8 +23,9 @@ load_existing_params() {
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
     SINGBOX_PASSWORD=$(get_state "SINGBOX_PASSWORD")
     XHTTP_PADDING=$(get_state "XHTTP_PADDING")
-    REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
-    XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
+    # 不覆盖非空：load_domain_state 已按 PRIMARY 兜底到内存（规则 1 的只读兜底）
+    REALITY_DOMAIN="${REALITY_DOMAIN:-$(get_state "REALITY_DOMAIN")}"
+    XHTTP_REALITY_DOMAIN="${XHTTP_REALITY_DOMAIN:-$(get_state "XHTTP_REALITY_DOMAIN")}"
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     HYSTERIA2_PASSWORD=$(get_state "HYSTERIA2_PASSWORD")
     HYSTERIA2_PH_START=$(get_state "HYSTERIA2_PH_START")
@@ -42,7 +43,7 @@ load_existing_params() {
     SUBSCRIPTION_PATH=$(get_state "SUBSCRIPTION_PATH")
     VLESS_ENC_CLIENT=$(get_state "VLESS_ENC_CLIENT")
     GRPC_SERVICE_NAME=$(get_state "GRPC_SERVICE_NAME")
-    XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
+    XHTTP_REALITY_DOMAIN="${XHTTP_REALITY_DOMAIN:-$(get_state "XHTTP_REALITY_DOMAIN")}"
 
     # 从 xray config 读取参数
     if [[ -f "$xray_config" ]]; then
@@ -258,7 +259,14 @@ print(urllib.parse.quote('${XHTTP_PATH}'))
 
     # 连接地址：自有直连域（支持双栈）优先，退到直连域/AnyTLS 域/服务器 IP；
     # 公共 SNI 从不作连接地址（它不属于本机，解析到的是别人家）。
-    reality_host="${XHTTP_REALITY_DOMAIN:-${REALITY_DOMAIN:-${ANYTLS_DOMAIN:-${SERVER_IP}}}}"
+    # 规则 2（2026-10-02）：连接地址 = 配置表分配给该槽的域名；无则回退服务器 IP。
+    # 删掉 ANYTLS_DOMAIN 这一跳：它会把 host 换成别人家的域（与规则 2 冲突）。
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+        reality_host="${XHTTP_REALITY_DOMAIN}"
+    else
+        log_warn "vless-xhttp-reality 未在配置表第 3 行分配域名；连接地址回退为服务器 IP（${SERVER_IP}）"
+        reality_host="${SERVER_IP}"
+    fi
     _hn=$(hostname -s 2>/dev/null || echo "server")
     XHTTP_REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\
 path=${path_encoded}\
@@ -298,7 +306,14 @@ print(urllib.parse.quote('${REALITY_SPIDER_X:-/api/health}'))
 " 2>/dev/null || echo "%2Fapi%2Fhealth")
 
     # 优先用自有直连域名（支持双栈），不使用公共 SNI 作连接地址
-    local reality_host="${REALITY_DOMAIN:-${ANYTLS_DOMAIN:-${SERVER_IP}}}"
+    # 规则 2：连接地址 = 配置表第 4 行分配给本槽的域名；无则回退服务器 IP
+    local reality_host
+    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+        reality_host="${REALITY_DOMAIN}"
+    else
+        log_warn "vless-reality 未在配置表第 4 行分配域名；连接地址回退为服务器 IP（${SERVER_IP}）"
+        reality_host="${SERVER_IP}"
+    fi
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
     REALITY_URL="vless://${XRAY_UUID}@${reality_host}:443?\

@@ -300,7 +300,8 @@ configure_naive() {
         return 1
     fi
 
-    save_state "NAIVE_DOMAIN" "${NAIVE_DOMAIN}"
+    # 规则 1（2026-10-02）：此处原有 save_state "NAIVE_DOMAIN" —— 从 state 读到的值
+    # 原样写回（上游空值已 log_error + return），属冗余写，删除。
     log_info "NaiveProxy 域名: ${NAIVE_DOMAIN}"
 
     # ── 2. 证书路径（三段式：域名 cert → 根域 cert → 手动输入）────

@@ -265,8 +265,12 @@ _build_own_domain_zones() {
         _direct_domains+=("$_d")
     done
 
-    echo "    # === 自有域名内部解析 ==="
     if [[ ${#_direct_domains[@]} -eq 0 && -z "$cdn_str" ]]; then
+        # ⚠️ 本函数的 stdout 被调用方捕获成配置正文（unbound.sh:462
+        #    `own_domain_zones=$(_build_own_domain_zones)`），告警必须走 stderr，
+        #    用 log_warn（裸 echo）会把告警文字写进 unbound 配置。
+        echo "[WARN] DIRECT_DOMAINS / CDN_DOMAINS 均为空：本地解析将不含自有域名的 local-zone" >&2
+        echo "[WARN]   若本机确实配了域名，请到主菜单 5→1（或 5→3）重建派生；本流程不写 state" >&2
         echo "    # 暂无自有域名配置"
         return
     fi

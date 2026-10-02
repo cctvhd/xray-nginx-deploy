@@ -1212,6 +1212,10 @@ _doh_domain_usable() {
     protos=$(get_state "DOMAIN_PROTO_${suffix}" "")
     case ",${protos}," in
         *,singbox,*|*,naiveproxy,*) return 1 ;;
+        # 借公共态的 Reality 槽域没有 nginx vhost（8321/8326 不生成、8322 也不再被
+        # generate_sni_map 指向）→ 共用落点的 include 会无处可挂，DoH 静默消失。
+        *,xray-reality,*)   _reality_slot_borrows_public xray-reality  && return 1 ;;
+        *,xhttp-reality,*)  _reality_slot_borrows_public xhttp-reality && return 1 ;;
     esac
     local root cert_path
     root=$(printf '%s' "$domain" | awk -F. '{print $(NF-1)"."$NF}')
@@ -2257,7 +2261,7 @@ CONF
     # Reality dest 伪装站（8321）：仅在使用自有域名时生成
     # xray 的 realitySettings.dest 指向此处，Reality 从本地真实证书读取指纹
     # 非 Xray 访客直接看到伪装网站，天然无外部流量可偷
-    if [[ -n "${REALITY_DOMAIN:-}" ]]; then
+    if [[ -n "${REALITY_DOMAIN:-}" ]] && ! _reality_slot_borrows_public xray-reality; then
         local reality_root reality_cert_path
         reality_root=$(get_root_domain "${REALITY_DOMAIN}")
         reality_cert_path=$(get_state "CERT_PATH_${reality_root//./_}" "")
@@ -2302,7 +2306,7 @@ CONF
     # xray 的 vless-xhttp-reality realitySettings.dest 指向此处
     # 主题 slot 3：NA 地区 3 主题时回绕到 usa（与 XHTTP_DOMAIN 相同）；
     # 如需独立主题，可在 assets/fake-site-na/ 新增第 4 个子目录
-    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]]; then
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]] && ! _reality_slot_borrows_public xhttp-reality; then
         local xhttp_reality_root xhttp_reality_cert_path
         xhttp_reality_root=$(get_root_domain "${XHTTP_REALITY_DOMAIN}")
         xhttp_reality_cert_path=$(get_state "CERT_PATH_${xhttp_reality_root//./_}" "")
@@ -2401,13 +2405,20 @@ server {
 }
 CONF
 
-    # HTTP 重定向
+    # HTTP → HTTPS 重定向
     # ⚠️ `local domain` 同上（动态作用域会污染调用方的同名局部变量）
     local all_domain_names="" domain
     for domain in "${ALL_DOMAINS[@]}"; do
         all_domain_names+=" ${domain}"
     done
 
+    # 规则 1：ALL_DOMAINS 是派生值，读路径不得当它是必然非空。
+    # 实测：`server_name ;` 会让 nginx -t 直接 emerg 失败（invalid number of arguments），
+    # 于是空列表会写出一份**起不来的** nginx.conf。空时干脆不生成这个块。
+    if [[ -z "$all_domain_names" ]]; then
+        log_warn "ALL_DOMAINS 为空：本次不生成 HTTP→HTTPS 重定向块（否则 server_name 为空会导致 nginx -t 失败）"
+        log_warn "  若本机确实配了域名，请到主菜单 5→1（或 5→3）重建派生；本次不写 state"
+    else
     cat >> "$_out" << CONF
 
 # ===================================================================
@@ -2423,6 +2434,7 @@ server {
     }
 }
 CONF
+    fi
 
     # 伪装站目录收尾：servers.conf 已定稿，此刻的引用关系才是权威
     _purge_orphan_webroots

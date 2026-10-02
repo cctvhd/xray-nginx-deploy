@@ -840,17 +840,20 @@ _migrate_xray_proto_v1_to_v2() {
     fi
 }
 
-rebuild_protocol_domains() {
-    # 启动时先做幂等迁移，确保下游按新 sub-protocol 标签运行
-    _migrate_xray_proto_v1_to_v2
-
+# ── 纯读派生：把注册表按协议标签算成各槽候选 + 三份域名清单 ──────────
+# 结果放进以下全局（**不写任何 state**）：
+#   _D_ALL _D_CDN _D_DIRECT
+#   _D_C_XHTTP _D_C_GRPC _D_C_REALITY _D_C_XHTTP_REALITY
+#   _D_C_SINGBOX _D_C_HYSTERIA2 _D_C_NAIVE        （空格分隔；无候选 = 空串）
+# 规则 1（2026-10-02）：只有主菜单 5 的子选项 1/3 能**修改**域名分配；
+#   nginx/xray/client/启动自愈一律只读。故这里只算，持久化交给 rebuild_protocol_domains。
+# ⚠️ 循环变量一律 local：bash 动态作用域会污染调用方同名变量（本文件已有先例）。
+_derive_domain_vars() {
     local registry
     local all_d="" cdn_d="" direct_d=""
-    local -a xhttp_cands=() grpc_cands=() reality_cands=() xhttp_reality_cands=()
-    local -a singbox_cands=() hyst_cands=() naive_cands=()
+    local xhttp_c="" grpc_c="" reality_c="" xhttp_reality_c="" singbox_c="" hyst_c="" naive_c=""
 
     registry=$(get_state "DOMAIN_REGISTRY" "")
-
     for domain in $registry; do
         local suffix mode protocols
         suffix=$(_domain_state_suffix "$domain")
@@ -859,41 +862,93 @@ rebuild_protocol_domains() {
         [[ -z "$protocols" ]] && continue
 
         all_d="${all_d:+$all_d }$domain"
-        if [[ "$mode" == "cdn" ]]; then
-            cdn_d="${cdn_d:+$cdn_d }$domain"
-        else
-            direct_d="${direct_d:+$direct_d }$domain"
-        fi
+        if [[ "$mode" == "cdn" ]]; then cdn_d="${cdn_d:+$cdn_d }$domain"
+        else direct_d="${direct_d:+$direct_d }$domain"; fi
 
-        # 按 sub-protocol 精确匹配（逗号分隔列表）
-        case ",${protocols}," in *,xray-xhttp,*)   xhttp_cands+=("$domain") ;; esac
-        case ",${protocols}," in *,xray-grpc,*)    grpc_cands+=("$domain") ;; esac
-        case ",${protocols}," in *,xray-reality,*) reality_cands+=("$domain") ;; esac
-        case ",${protocols}," in *,xhttp-reality,*) xhttp_reality_cands+=("$domain") ;; esac
-        case ",${protocols}," in *,singbox,*)      singbox_cands+=("$domain") ;; esac
-        case ",${protocols}," in *,hysteria2,*)    hyst_cands+=("$domain") ;; esac
-        case ",${protocols}," in *,naiveproxy,*)   naive_cands+=("$domain") ;; esac
+        case ",${protocols}," in *,xray-xhttp,*)     xhttp_c="${xhttp_c:+$xhttp_c }$domain" ;; esac
+        case ",${protocols}," in *,xray-grpc,*)      grpc_c="${grpc_c:+$grpc_c }$domain" ;; esac
+        case ",${protocols}," in *,xray-reality,*)   reality_c="${reality_c:+$reality_c }$domain" ;; esac
+        case ",${protocols}," in *,xhttp-reality,*)  xhttp_reality_c="${xhttp_reality_c:+$xhttp_reality_c }$domain" ;; esac
+        case ",${protocols}," in *,singbox,*)        singbox_c="${singbox_c:+$singbox_c }$domain" ;; esac
+        case ",${protocols}," in *,hysteria2,*)      hyst_c="${hyst_c:+$hyst_c }$domain" ;; esac
+        case ",${protocols}," in *,naiveproxy,*)     naive_c="${naive_c:+$naive_c }$domain" ;; esac
     done
 
-    local xhttp_domain grpc_domain reality_domain xhttp_reality_domain anytls_domain hyst_domain naive_domain
-    xhttp_domain=$(_resolve_protocol_primary   "XRAY_XHTTP"   "${xhttp_cands[@]}")
-    grpc_domain=$(_resolve_protocol_primary    "XRAY_GRPC"    "${grpc_cands[@]}")
-    reality_domain=$(_resolve_protocol_primary "XRAY_REALITY" "${reality_cands[@]}")
-    xhttp_reality_domain=$(_resolve_protocol_primary "XHTTP_REALITY" "${xhttp_reality_cands[@]}")
-    anytls_domain=$(_resolve_protocol_primary  "SINGBOX"      "${singbox_cands[@]}")
-    hyst_domain=$(_resolve_protocol_primary    "HYSTERIA2"    "${hyst_cands[@]}")
-    naive_domain=$(_resolve_protocol_primary   "NAIVEPROXY"   "${naive_cands[@]}")
+    _D_ALL="$all_d"; _D_CDN="$cdn_d"; _D_DIRECT="$direct_d"
+    _D_C_XHTTP="$xhttp_c"; _D_C_GRPC="$grpc_c"
+    _D_C_REALITY="$reality_c"; _D_C_XHTTP_REALITY="$xhttp_reality_c"
+    _D_C_SINGBOX="$singbox_c"; _D_C_HYSTERIA2="$hyst_c"; _D_C_NAIVE="$naive_c"
+}
 
-    save_state "ALL_DOMAINS"    "$all_d"
-    save_state "CDN_DOMAINS"    "$cdn_d"
-    save_state "DIRECT_DOMAINS" "$direct_d"
-    save_state "XHTTP_DOMAIN"     "$xhttp_domain"
-    save_state "GRPC_DOMAIN"      "$grpc_domain"
-    save_state "REALITY_DOMAIN"   "$reality_domain"
+# ── 纯函数：按「现有 PRIMARY → 最新注册」规则挑主域（**不写 state**）──
+# stdout 输出选中的域名；无候选 → 空行。有副作用的版本是 _resolve_protocol_primary。
+_pick_protocol_primary() {
+    local _slot="$1"; shift
+    local -a _cands=("$@")
+    (( ${#_cands[@]} == 0 )) && return 0
+    (( ${#_cands[@]} == 1 )) && { printf '%s\n' "${_cands[0]}"; return 0; }
+    local _cur
+    _cur=$(get_state "DOMAIN_PRIMARY_${_slot}" "")
+    if [[ -n "$_cur" ]]; then
+        local _c
+        for _c in "${_cands[@]}"; do
+            [[ "$_c" == "$_cur" ]] && { printf '%s\n' "$_cur"; return 0; }
+        done
+    fi
+    printf '%s\n' "${_cands[-1]}"
+}
+
+# ── 只读派生（非菜单 5 路径用）：算到内存 + 一次性告警，**绝不写 state** ──
+# 规则 1：状态丢失后不再自动「自愈」回 state —— 那是域名分配，只能由 5→1/5→3 做。
+_DOMAIN_READONLY_WARNED=""
+_domain_state_readonly_warn() {
+    [[ -n "$_DOMAIN_READONLY_WARNED" ]] && return 0
+    _DOMAIN_READONLY_WARNED=1
+    log_warn "域名分配以配置表为准：本次仅按注册表把派生值算到内存，**未写 state**"
+    log_warn "  如需持久化/修复派生（例如 state 缺域名），请到主菜单 5→1（或 5→3）重跑一次"
+}
+_domain_state_readonly_refresh() {
+    _derive_domain_vars
+    XHTTP_DOMAIN=$(_pick_protocol_primary         "XRAY_XHTTP"   ${_D_C_XHTTP})
+    GRPC_DOMAIN=$(_pick_protocol_primary          "XRAY_GRPC"    ${_D_C_GRPC})
+    REALITY_DOMAIN=$(_pick_protocol_primary       "XRAY_REALITY" ${_D_C_REALITY})
+    XHTTP_REALITY_DOMAIN=$(_pick_protocol_primary "XHTTP_REALITY" ${_D_C_XHTTP_REALITY})
+    ANYTLS_DOMAIN=$(_pick_protocol_primary        "SINGBOX"      ${_D_C_SINGBOX})
+    HYSTERIA2_DOMAIN=$(_pick_protocol_primary     "HYSTERIA2"    ${_D_C_HYSTERIA2})
+    NAIVE_DOMAIN=$(_pick_protocol_primary         "NAIVEPROXY"   ${_D_C_NAIVE})
+
+    ALL_DOMAINS=();    [[ -n "${_D_ALL:-}"    ]] && read -ra ALL_DOMAINS    <<< "${_D_ALL}"
+    CDN_DOMAINS=();    [[ -n "${_D_CDN:-}"    ]] && read -ra CDN_DOMAINS    <<< "${_D_CDN}"
+    DIRECT_DOMAINS=(); [[ -n "${_D_DIRECT:-}" ]] && read -ra DIRECT_DOMAINS <<< "${_D_DIRECT}"
+
+    _domain_state_readonly_warn
+}
+
+rebuild_protocol_domains() {
+    # 幂等迁移：确保下游按新 sub-protocol 标签运行（已是新格式 → 空操作，见函数注释）
+    _migrate_xray_proto_v1_to_v2
+
+    _derive_domain_vars
+
+    local xhttp_domain grpc_domain reality_domain xhttp_reality_domain anytls_domain hyst_domain naive_domain
+    xhttp_domain=$(_resolve_protocol_primary         "XRAY_XHTTP"   ${_D_C_XHTTP})
+    grpc_domain=$(_resolve_protocol_primary          "XRAY_GRPC"    ${_D_C_GRPC})
+    reality_domain=$(_resolve_protocol_primary       "XRAY_REALITY" ${_D_C_REALITY})
+    xhttp_reality_domain=$(_resolve_protocol_primary "XHTTP_REALITY" ${_D_C_XHTTP_REALITY})
+    anytls_domain=$(_resolve_protocol_primary        "SINGBOX"      ${_D_C_SINGBOX})
+    hyst_domain=$(_resolve_protocol_primary          "HYSTERIA2"    ${_D_C_HYSTERIA2})
+    naive_domain=$(_resolve_protocol_primary         "NAIVEPROXY"   ${_D_C_NAIVE})
+
+    save_state "ALL_DOMAINS"    "${_D_ALL}"
+    save_state "CDN_DOMAINS"    "${_D_CDN}"
+    save_state "DIRECT_DOMAINS" "${_D_DIRECT}"
+    save_state "XHTTP_DOMAIN"         "$xhttp_domain"
+    save_state "GRPC_DOMAIN"          "$grpc_domain"
+    save_state "REALITY_DOMAIN"       "$reality_domain"
     save_state "XHTTP_REALITY_DOMAIN" "$xhttp_reality_domain"
-    save_state "ANYTLS_DOMAIN"    "$anytls_domain"
-    save_state "HYSTERIA2_DOMAIN" "$hyst_domain"
-    save_state "NAIVE_DOMAIN"     "$naive_domain"
+    save_state "ANYTLS_DOMAIN"        "$anytls_domain"
+    save_state "HYSTERIA2_DOMAIN"     "$hyst_domain"
+    save_state "NAIVE_DOMAIN"         "$naive_domain"
 
     # 派生完成后将本地变量同步到当前 shell，preflight 才能看到最新值
     XHTTP_DOMAIN="$xhttp_domain"
@@ -903,6 +958,10 @@ rebuild_protocol_domains() {
     ANYTLS_DOMAIN="$anytls_domain"
     HYSTERIA2_DOMAIN="$hyst_domain"
     NAIVE_DOMAIN="$naive_domain"
+
+    ALL_DOMAINS=();    [[ -n "${_D_ALL:-}"    ]] && read -ra ALL_DOMAINS    <<< "${_D_ALL}"
+    CDN_DOMAINS=();    [[ -n "${_D_CDN:-}"    ]] && read -ra CDN_DOMAINS    <<< "${_D_CDN}"
+    DIRECT_DOMAINS=(); [[ -n "${_D_DIRECT:-}" ]] && read -ra DIRECT_DOMAINS <<< "${_D_DIRECT}"
     # 软诊断：rebuild 不阻塞调用方（修复流程可能正处中间状态），仅打印
     preflight_config_check "rebuild_protocol_domains" || true
 }
@@ -1091,6 +1150,16 @@ _regen_hysteria2_cert() {
     return 0
 }
 
+# state 半损告警（*_DOMAIN 空而 PRIMARY 有值）。**只告警不写 state**（规则 1）。
+# 进程级去重：load_domain_state 会被 nginx/xray/client 多条读路径反复调用。
+_DOMAIN_STATE_WARNED=""
+_domain_state_inconsistent_warn() {
+    [[ -n "$_DOMAIN_STATE_WARNED" ]] && return 0
+    _DOMAIN_STATE_WARNED=1
+    log_warn "state 与派生不一致：$1 为空，但 $2=$3 有值"
+    log_warn "  本次仅在内存里按 PRIMARY 兜底，**未写 state**；请到主菜单 5→1（或 5→3）重跑以重建派生"
+}
+
 load_domain_state() {
     ALL_DOMAINS=(); CDN_DOMAINS=(); DIRECT_DOMAINS=()
     local all_str cdn_str direct_str
@@ -1104,13 +1173,16 @@ load_domain_state() {
     XHTTP_DOMAIN=$(get_state "XHTTP_DOMAIN")
     GRPC_DOMAIN=$(get_state "GRPC_DOMAIN")
     REALITY_DOMAIN=$(get_state "REALITY_DOMAIN")
-    # 自愈：DOMAIN_PRIMARY_XRAY_REALITY 是权威来源，state 丢失时自动修复
+    # 规则 1（2026-10-02）：本函数是 nginx/xray/client 的**公共读路径 → 只读**。
+    # state 半损（*_DOMAIN 空、DOMAIN_PRIMARY_* 有值）时只把 PRIMARY 值兜到内存，
+    # **不写 state**；唯一合规写入点是主菜单 5 的子选项 1/3。若在此写回，会把 5→1
+    # 「清空某行 → 摘标签 → rebuild 清 PRIMARY」的删除结果又填回来。
     if [[ -z "${REALITY_DOMAIN:-}" ]]; then
         local _primary_reality
         _primary_reality=$(get_state "DOMAIN_PRIMARY_XRAY_REALITY" "")
         if [[ -n "${_primary_reality}" ]]; then
             REALITY_DOMAIN="${_primary_reality}"
-            save_state "REALITY_DOMAIN" "${_primary_reality}"
+            _domain_state_inconsistent_warn "REALITY_DOMAIN" "DOMAIN_PRIMARY_XRAY_REALITY" "${_primary_reality}"
         fi
     fi
     ANYTLS_DOMAIN=$(get_state "ANYTLS_DOMAIN")
@@ -1118,13 +1190,13 @@ load_domain_state() {
     HYSTERIA2_DOMAIN=$(get_state "HYSTERIA2_DOMAIN")
     XHTTP_REALITY_SNI=$(get_state "XHTTP_REALITY_SNI")
     XHTTP_REALITY_DOMAIN=$(get_state "XHTTP_REALITY_DOMAIN")
-    # 自愈：DOMAIN_PRIMARY_XHTTP_REALITY 是权威来源，state 丢失时自动修复
+    # 同上：只把 PRIMARY 兜到内存，不写 state
     if [[ -z "${XHTTP_REALITY_DOMAIN:-}" ]]; then
         local _primary_xhttp_reality
         _primary_xhttp_reality=$(get_state "DOMAIN_PRIMARY_XHTTP_REALITY" "")
         if [[ -n "${_primary_xhttp_reality}" ]]; then
             XHTTP_REALITY_DOMAIN="${_primary_xhttp_reality}"
-            save_state "XHTTP_REALITY_DOMAIN" "${_primary_xhttp_reality}"
+            _domain_state_inconsistent_warn "XHTTP_REALITY_DOMAIN" "DOMAIN_PRIMARY_XHTTP_REALITY" "${_primary_xhttp_reality}"
         fi
     fi
 }
@@ -1380,25 +1452,14 @@ _sync_cert_state() {
 
     $cert_ok || return 0
 
-    [[ -n "$xhttp"   ]] && save_state "XHTTP_DOMAIN"   "$xhttp"
-    [[ -n "$grpc"    ]] && save_state "GRPC_DOMAIN"     "$grpc"
-    [[ -n "$reality" ]] && save_state "REALITY_DOMAIN"  "$reality"
-    [[ -n "$anytls"  ]] && save_state "ANYTLS_DOMAIN"   "$anytls"
-
-    local cur_all
-    cur_all=$(get_state "ALL_DOMAINS")
-    if [[ -z "$cur_all" ]]; then
-        local all_d="" cdn_d="" direct_d=""
-        [[ -n "$xhttp"   ]] && all_d+=" $xhttp"   && cdn_d+=" $xhttp"
-        [[ -n "$grpc"    ]] && all_d+=" $grpc"     && cdn_d+=" $grpc"
-        [[ -n "$reality" ]] && all_d+=" $reality"  && direct_d+=" $reality"
-        [[ -n "$anytls"  ]] && all_d+=" $anytls"   && direct_d+=" $anytls"
-        save_state "ALL_DOMAINS"    "${all_d# }"
-        save_state "CDN_DOMAINS"    "${cdn_d# }"
-        save_state "DIRECT_DOMAINS" "${direct_d# }"
+    # 规则 1（2026-10-02）：域名分配只能由主菜单 5 的子选项 1/3 写。
+    # 这里曾把 domain_map.conf 的四个值 + 三份域名清单写回 state（= 启动自愈）；
+    # 现在只做**只读兜底**（函数末尾的赋内存），并提示去 5→1，不再写域名分配族。
+    # ⚠️ INST_CERT=1 不属于域名分配族，保留写入（否则每次启动都会重复走证书流程）。
+    if [[ -n "${xhttp}${grpc}${reality}${anytls}" ]]; then
+        log_warn "state 缺域名分配（domain_map.conf 里有: ${xhttp:-}${grpc:+ $grpc}${reality:+ $reality}${anytls:+ $anytls}）"
+        log_warn "  已只读兜底到内存，**未写 state**；请到主菜单 5→1（或 5→3）按配置表重建"
     fi
-
-    save_state "INST_CERT" "1"
     log_info "已自动同步证书状态（检测到有效的 Let's Encrypt 证书）"
 
     [[ -n "$xhttp"   ]] && XHTTP_DOMAIN="$xhttp"
@@ -1534,27 +1595,21 @@ ENV
 
     _sync_inst_state
 
-    # ── 旧格式迁移：scalar 域名变量 → DOMAIN_REGISTRY ────────
+    # ── 旧格式 state 检测（规则 1：本路径**只读** —— 不迁移、不写任何域名分配）──
+    # 协议标签 v1→v2 迁移只随 rebuild_protocol_domains（主菜单 5 的子选项 1/3）跑；
+    # 旧机器升级后手动进一次 5→1 重建即可（表在磁盘上，不会丢）。
+    # 守卫：仅当 DOMAIN_REGISTRY 为空 **且** 任一 *_DOMAIN 标量键非空时才告警 ——
+    # 菜单 u 全清之后标量键也为空，不得误报。
     if [[ -z "$(get_state "DOMAIN_REGISTRY")" ]]; then
-        local _xhttp _grpc _reality _anytls _naive _hysteria2
-        _xhttp=$(get_state "XHTTP_DOMAIN")
-        _grpc=$(get_state "GRPC_DOMAIN")
-        _reality=$(get_state "REALITY_DOMAIN")
-        _anytls=$(get_state "ANYTLS_DOMAIN")
-        _naive=$(get_state "NAIVE_DOMAIN")
-        _hysteria2=$(get_state "HYSTERIA2_DOMAIN")
-
-        [[ -n "$_xhttp" ]] && register_domain "$_xhttp" "cdn" "xray"
-        # grpc 若与 xhttp 不同则单独注册
-        [[ -n "$_grpc" && "$_grpc" != "$_xhttp" ]] && register_domain "$_grpc" "cdn" "xray"
-        [[ -n "$_reality" ]] && register_domain "$_reality" "direct" "xray"
-        [[ -n "$_anytls" ]] && register_domain "$_anytls" "direct" "singbox"
-        [[ -n "$_hysteria2" ]] && register_domain "$_hysteria2" "direct" "hysteria2"
-        [[ -n "$_naive" && "$_naive" != "$_anytls" ]] && register_domain "$_naive" "direct" "naiveproxy"
-
-        if [[ -n "$(get_state "DOMAIN_REGISTRY")" ]]; then
-            rebuild_protocol_domains
-            log_info "域名配置已自动迁移到新格式"
+        local _any_scalar=""
+        for _k in XHTTP_DOMAIN GRPC_DOMAIN REALITY_DOMAIN XHTTP_REALITY_DOMAIN \
+                  ANYTLS_DOMAIN HYSTERIA2_DOMAIN NAIVE_DOMAIN; do
+            [[ -n "$(get_state "$_k" "")" ]] && { _any_scalar="$_k"; break; }
+        done
+        if [[ -n "$_any_scalar" ]]; then
+            log_warn "检测到旧格式 state：无 DOMAIN_REGISTRY，但 ${_any_scalar} 非空"
+            log_warn "  本流程**不迁移、不写任何域名分配**（规则 1）。请到主菜单 5→1 重跑一次："
+            log_warn "  表内容会被重新注册为注册表并派生各槽域名（表在磁盘上，不会丢）"
         fi
     fi
 
@@ -2009,10 +2064,8 @@ do_inst_cert() {
     load_module cert
     run_cert
 
-    save_state "XHTTP_DOMAIN"   "${XHTTP_DOMAIN:-}"
-    save_state "GRPC_DOMAIN"    "${GRPC_DOMAIN:-}"
-    save_state "REALITY_DOMAIN" "${REALITY_DOMAIN:-}"
-    save_state "ANYTLS_DOMAIN"  "${ANYTLS_DOMAIN:-}"
+    # 规则 1（2026-10-02）：原 4 行把 *_DOMAIN 原样写回 —— 派生值只能由主菜单 5 的
+    # 子选项 1/3 写（run_cert 内部步骤 7/8 已写过，这里纯冗余）。
     save_state "ALL_DOMAINS"    "${ALL_DOMAINS[*]:-}"
     save_state "CDN_DOMAINS"    "${CDN_DOMAINS[*]:-}"
     save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
@@ -2199,12 +2252,13 @@ do_conf_nginx() {
         log_warn "CDN 协议域名 state 陈旧，自动修复中..."
         [[ -z "${XHTTP_DOMAIN:-}" ]] && log_warn "  XHTTP_DOMAIN 为空"
         [[ -z "${GRPC_DOMAIN:-}"  ]] && log_warn "  GRPC_DOMAIN  为空"
-        # rebuild_protocol_domains：纯 state 读写，幂等，无交互、无证书申请、无网络调用
-        rebuild_protocol_domains
-        # 修复后复查：若仍为空说明 DOMAIN_REGISTRY 本身未初始化，无法自愈
+        # 规则 1：本路径**只读派生**（算到内存、只告警一次、不写 state）。
+        # 持久化/修复派生只能由主菜单 5 的子选项 1/3 做。
+        _domain_state_readonly_refresh
+        # 修复后复查：若仍为空说明 DOMAIN_REGISTRY 本身未初始化
         if [[ ${#CDN_DOMAINS[@]} -gt 0 && -z "${XHTTP_DOMAIN:-}" ]]; then
             log_error "自动修复失败：CDN_DOMAINS 非空但 XHTTP_DOMAIN 仍为空。"
-            log_warn  "请先运行菜单选项 5（申请证书 / 重新收集域名）初始化域名配置。"
+            log_warn  "请到主菜单 5→1（配置域名表）重跑一次以按表重建派生"
             done_return
             return
         fi
@@ -2313,7 +2367,13 @@ do_conf_xray() {
     fi
 
     generate_xray_params
-    collect_reality_params
+    # collect 仅在规则 3 冲突（两 Reality 槽同域名）时返回 1：不写 config.json，
+    # 保持现状回主菜单，而不是带着半个 state 继续生成。
+    if ! collect_reality_params; then
+        log_error "Reality 伪装参数未就绪（见上方冲突说明），已中止本次配置"
+        done_return
+        return
+    fi
     generate_xray_config || {
         log_error "生成 Xray 配置失败（借公共 SNI 但公共参数为空），中止配置，未写 config.json"
         done_return
@@ -2331,7 +2391,7 @@ do_conf_xray() {
     save_state "REALITY_DEST"          "${REALITY_DEST:-}"
     save_state "REALITY_SNI"           "${REALITY_SERVER_NAMES[0]:-}"
     save_state "XHTTP_REALITY_SNI"     "${XHTTP_REALITY_SNI:-}"
-    save_state "XHTTP_REALITY_DOMAIN"  "${XHTTP_REALITY_DOMAIN:-}"
+    # 规则 1：此处原有 save_state "XHTTP_REALITY_DOMAIN" —— *_DOMAIN 是配置表派生值，只有 5 链能写
     # ── BUG FIX：保存完整 serverNames 数组供 nginx 生成 SNI map 使用 ──
     save_state "REALITY_SERVER_NAMES"  "${REALITY_SERVER_NAMES[*]:-}"
     save_state "REALITY_SHORT_ID"      "${REALITY_SHORT_IDS[0]:-}"
@@ -2386,7 +2446,7 @@ do_conf_singbox() {
     start_singbox
 
     save_state "SINGBOX_PASSWORD" "${SINGBOX_PASSWORD:-}"
-    save_state "ANYTLS_DOMAIN"     "${ANYTLS_DOMAIN:-}"
+    # 规则 1：此处原有 save_state "ANYTLS_DOMAIN" —— 原样写回派生值，删除
     save_state "CONF_SINGBOX"     "1"
 
     sync_refresh_nginx_routes "Sing-Box"
@@ -3830,10 +3890,8 @@ run_full_install_flow() {
 
     load_module cert
     run_cert
-    save_state "XHTTP_DOMAIN"   "${XHTTP_DOMAIN:-}"
-    save_state "GRPC_DOMAIN"    "${GRPC_DOMAIN:-}"
-    save_state "REALITY_DOMAIN" "${REALITY_DOMAIN:-}"
-    save_state "ANYTLS_DOMAIN"  "${ANYTLS_DOMAIN:-}"
+    # 规则 1（2026-10-02）：原 4 行把 *_DOMAIN 原样写回 —— 派生值只能由主菜单 5 的
+    # 子选项 1/3 写（run_cert 内部步骤 7/8 已写过，这里纯冗余）。
     save_state "ALL_DOMAINS"    "${ALL_DOMAINS[*]:-}"
     save_state "CDN_DOMAINS"    "${CDN_DOMAINS[*]:-}"
     save_state "DIRECT_DOMAINS" "${DIRECT_DOMAINS[*]:-}"
@@ -3883,7 +3941,11 @@ run_full_install_flow() {
         log_info "复用已有 XHTTP_PATH: ${XHTTP_PATH}"
     fi
     generate_xray_params
-    collect_reality_params
+    # 规则 3 冲突（两 Reality 槽同域名）→ 中止全流程，不写 config.json
+    if ! collect_reality_params; then
+        log_error "Reality 伪装参数未就绪（见上方冲突说明），全流程中止"
+        return 1
+    fi
     generate_xray_config
     start_xray
     save_state "XRAY_UUID"            "${XRAY_UUID:-}"
@@ -3896,7 +3958,7 @@ run_full_install_flow() {
     save_state "REALITY_DEST"         "${REALITY_DEST:-}"
     save_state "REALITY_SNI"          "${REALITY_SERVER_NAMES[0]:-}"
     save_state "XHTTP_REALITY_SNI"    "${XHTTP_REALITY_SNI:-}"
-    save_state "XHTTP_REALITY_DOMAIN" "${XHTTP_REALITY_DOMAIN:-}"
+    # 规则 1：XHTTP_REALITY_DOMAIN 冗余写已删
     save_state "REALITY_SERVER_NAMES" "${REALITY_SERVER_NAMES[*]:-}"
     save_state "REALITY_SHORT_IDS" "${REALITY_SHORT_IDS[*]:-}"
     save_state "REALITY_SHORT_ID"     "${REALITY_SHORT_IDS[0]:-}"
@@ -3944,7 +4006,7 @@ run_full_install_flow() {
     generate_singbox_config
     start_singbox
     save_state "SINGBOX_PASSWORD" "${SINGBOX_PASSWORD:-}"
-    save_state "ANYTLS_DOMAIN"     "${ANYTLS_DOMAIN:-}"
+    # 规则 1：此处原有 save_state "ANYTLS_DOMAIN" —— 原样写回派生值，删除
     save_state "CONF_SINGBOX"     "1"
 
     sync_refresh_nginx_routes "Sing-Box"
@@ -4035,7 +4097,7 @@ do_reconf_xray() {
 	save_state "REALITY_DEST"         ""
 	save_state "REALITY_SNI"          ""
 	save_state "XHTTP_REALITY_SNI"    ""
-	save_state "XHTTP_REALITY_DOMAIN" ""
+	# 规则 1：此处原有 save_state "XHTTP_REALITY_DOMAIN" "" —— 菜单 x 不得清空表里分配的域名
 	save_state "REALITY_SERVER_NAMES" ""
 	save_state "REALITY_SHORT_ID"     ""
 	save_state "REALITY_SHORT_IDS"    ""

@@ -92,6 +92,21 @@ reset_mosdns_state() {
 }
 
 reset_cert_state() {
+    # 二次确认（2026-10-02 规则 1 配套）：本函数清空**域名分配族**，清完即空。
+    echo ""
+    log_warn "即将清空 state 中的域名分配族（4 类）："
+    log_warn "  · DOMAIN_REGISTRY / DOMAIN_MODE_* / DOMAIN_PROTO_*（注册表与协议标签）"
+    log_warn "  · DOMAIN_PRIMARY_*（9 个主槽位键）"
+    log_warn "  · *_DOMAIN（XHTTP/GRPC/REALITY/XHTTP_REALITY/ANYTLS/HYSTERIA2/NAIVE）"
+    log_warn "  · ALL_DOMAINS / CDN_DOMAINS / DIRECT_DOMAINS"
+    log_warn "⚠️ 清空后**不会自动重建**（规则 1：脚本任何路径都不得自动改域名分配）；"
+    log_warn "   要恢复请到主菜单 5→1 重新跑一次配置表编辑器。"
+    local _uc_ok2
+    read -rp "确认清空域名分配？输 yes 继续 [y/N]: " _uc_ok2
+    if [[ "$_uc_ok2" != "yes" ]]; then
+        log_info "已取消域名分配清空（其余清理不受影响）"
+        return 0
+    fi
     save_state "XHTTP_DOMAIN" ""
     save_state "GRPC_DOMAIN" ""
     save_state "REALITY_DOMAIN" ""
@@ -295,6 +310,21 @@ cleanup_nginx_module() {
 cleanup_cert_module() {
     log_step "清理证书和 Cloudflare 配置..."
 
+    # 二次确认（2026-10-02）：本项**真删**证书与 CF 凭证，不可恢复；
+    # 且它会连带清空 state 里的域名分配族（reset_cert_state）。
+    echo ""
+    log_warn "本项将删除："
+    log_warn "  · /etc/cloudflare（含 Cloudflare API 令牌）与 certbot 的 deploy hook"
+    log_warn "  · Let's Encrypt 全部证书（certbot delete + live/archive/renewal）"
+    log_warn "  · state 里的域名分配族（DOMAIN_REGISTRY / DOMAIN_MODE_* / DOMAIN_PROTO_* /"
+    log_warn "    DOMAIN_PRIMARY_* / 7 个 *_DOMAIN / ALL|CDN|DIRECT_DOMAINS）"
+    local _uc_ok
+    read -rp "确认清理证书模块？输 yes 继续 [y/N]: " _uc_ok
+    if [[ "$_uc_ok" != "yes" ]]; then
+        log_info "已取消证书模块清理（未删除任何文件）"
+        return 0
+    fi
+
     local root_domain
     remove_path_if_exists "/etc/cloudflare"
     remove_path_if_exists "/etc/letsencrypt/renewal-hooks/deploy/reload-nginx.sh"
@@ -320,6 +350,7 @@ cleanup_cert_module() {
     save_state "CONF_SINGBOX" "0"
     reset_cert_state
     log_info "证书模块清理完成"
+    log_warn "域名分配已清空且**不会自动重建**（规则 1）：如需重新配置，请到主菜单 5→1 跑一次配置表编辑器"
 }
 
 cleanup_xray_module() {
@@ -527,4 +558,6 @@ cleanup_all_modules() {
     remove_path_if_exists "$STATE_FILE"
     rmdir "$STATE_DIR" 2>/dev/null || true
     log_info "全部模块清理完成"
+    log_warn "state 已删除：域名分配**清完即空、不会自动重建**（规则 1）"
+    log_warn "  如需重新配置，请到主菜单 5→1 跑一次配置表编辑器（表文件在 ${STATE_DIR:-/etc/xray-deploy}/.config.tsv）"
 }
