@@ -3,6 +3,8 @@
 # modules/nginx.sh
 # Nginx 安装 + 配置文件生成
 # ============================================================
+# PROXY 头开关（state 持久化；见 generate_fallback_conf / generate_servers_conf 内读取）
+
 
 # ── 安装 Nginx 官方最新稳定版 ────────────────────────────────
 install_nginx() {
@@ -1658,6 +1660,20 @@ CONF
 # ── 生成 fallback.conf ───────────────────────────────────────
 # P1修复：xhttp location 路径使用 ${XHTTP_PATH} 变量（与 xray 保持一致）
 generate_fallback_conf() {
+    # 每次生成从 state 读最新值（不覆盖用户 config.env 设置）
+    FALLBACK_PROXY_PROTOCOL=$(get_state "FALLBACK_PROXY_PROTOCOL" "0")
+    local _conf_root="${OUT_DIR:-/etc/nginx}"
+    # 根据 FALLBACK_PROXY_PROTOCOL 决定是否启用 proxy_protocol
+    local _listen_suffix=""
+    local _ip_header_var="\$final_real_ip"
+    local _proxy_suffix_text="不发送 PROXY header"
+
+    if [ "$FALLBACK_PROXY_PROTOCOL" = "1" ]; then
+        _listen_suffix=" proxy_protocol"
+        _ip_header_var="\$proxy_protocol_addr"
+        _proxy_suffix_text="发送 PROXY header"
+    fi
+
     log_step "生成 fallback 配置..."
 
     if declare -F load_latency_params &>/dev/null; then
@@ -1667,16 +1683,16 @@ generate_fallback_conf() {
         LATENCY_PROXY_TIMEOUT=7200
     fi
 
-    cat > /etc/nginx/conf.d/fallback.conf << CONF
+    cat > "${_conf_root}/conf.d/fallback.conf" << CONF
 # ============================================================
 # /etc/nginx/conf.d/fallback.conf
 # Reality Fallback 入口
 # P1修复：xhttp path 与 xray 保持一致（均使用 XHTTP_PATH 变量）
-# 注意：Xray Reality fallback xver=0，不发送 PROXY header，
-# 因此 listen 不加 proxy_protocol
+# 注意：Xray Reality fallback xver=${FALLBACK_PROXY_PROTOCOL}，${_proxy_suffix_text}，
+# 因此 listen 加 proxy_protocol
 # ============================================================
 server {
-listen 127.0.0.1:8350;
+listen 127.0.0.1:8350${_listen_suffix};
     server_name   _;
     access_log    off;
     server_tokens off;
@@ -1696,9 +1712,9 @@ listen 127.0.0.1:8350;
         # Fix: "close" disables upstream keepalive reuse; xhttp half-close causes broken-pipe with Connection ""
         proxy_set_header        Connection "close";
         proxy_set_header        Host \$host;
- # fallback 经 xver=0 转发，无 proxy_protocol，使用 \$final_real_ip 获取真实 IP
-        proxy_set_header        X-Real-IP \$final_real_ip;
-        proxy_set_header        X-Forwarded-For \$final_real_ip;
+ # fallback 经 xver=${FALLBACK_PROXY_PROTOCOL} 转发，${_proxy_suffix_text}，使用 ${_ip_header_var} 获取真实 IP
+        proxy_set_header        X-Real-IP ${_ip_header_var};
+        proxy_set_header        X-Forwarded-For ${_ip_header_var};
         proxy_buffering         off;
         proxy_request_buffering off;
         proxy_cache             off;
@@ -1776,7 +1792,7 @@ _purge_orphan_webroots() {
     local _ref
     while read -r _ref; do
         [[ -n "$_ref" ]] && _keep["${_ref##*/}"]=1
-    done < <(grep -o 'root *[^;]*;' /etc/nginx/conf.d/servers.conf 2>/dev/null \
+    done < <(grep -o 'root *[^;]*;' "${OUT_DIR:-/etc/nginx}/conf.d/servers.conf" 2>/dev/null \
              | sed 's/^root *//; s/;$//' || true)
 
     local _dir _name
@@ -1851,7 +1867,10 @@ generate_servers_conf() {
     # 临时文件名以 .new 结尾，不匹配 nginx 的 conf.d/*.conf 通配，不会被 include。
     # 刻意不预先 `: >` 建文件：首个 cat >> 自会创建，这样「首次写入前就炸」
     # 不留任何残留；写到一半才炸也只留一个不被 include 的临时文件。
-    local _out="/etc/nginx/conf.d/servers.conf.new"
+    DECOY_SELF_PROXY_PROTOCOL=$(get_state "DECOY_SELF_PROXY_PROTOCOL" "0")
+    local _decoy_suffix=""
+    [[ "$DECOY_SELF_PROXY_PROTOCOL" = "1" ]] && _decoy_suffix=" proxy_protocol"
+    local _out="${OUT_DIR:-/etc/nginx}/conf.d/servers.conf.new"
 
     get_root_domain() {
         echo "$1" | awk -F. '{print $(NF-1)"."$NF}'
@@ -2277,11 +2296,12 @@ CONF
 # 不加 proxy_protocol（Reality xver=0 直连）
 # ===================================================================
 server {
-    listen 127.0.0.1:8321 ssl;
+    listen 127.0.0.1:8321 ssl${_decoy_suffix};
     server_name ${REALITY_DOMAIN};
 
     ssl_certificate     ${reality_cert_path}/fullchain.pem;
     ssl_certificate_key ${reality_cert_path}/privkey.pem;
+    http2 on;
     include /etc/nginx/ssl/common.conf;
 
     root        /var/www/${REALITY_DOMAIN};
@@ -2321,11 +2341,12 @@ CONF
 # XHTTP-Reality dest 伪装站 ${XHTTP_REALITY_DOMAIN}（8326）
 # ===================================================================
 server {
-    listen 127.0.0.1:8326 ssl;
+    listen 127.0.0.1:8326 ssl${_decoy_suffix};
     server_name ${XHTTP_REALITY_DOMAIN};
 
     ssl_certificate     ${xhttp_reality_cert_path}/fullchain.pem;
     ssl_certificate_key ${xhttp_reality_cert_path}/privkey.pem;
+    http2 on;
     include /etc/nginx/ssl/common.conf;
 
     root        /var/www/${XHTTP_REALITY_DOMAIN};
@@ -2440,7 +2461,7 @@ CONF
     _purge_orphan_webroots
 
     # 同目录 rename，原子替换；失败则线上文件原样保留
-    if ! mv -f "$_out" /etc/nginx/conf.d/servers.conf; then
+    if ! mv -f "$_out" "${OUT_DIR:-/etc/nginx}/conf.d/servers.conf"; then
         log_error "servers.conf 原子替换失败，已保留原文件"
         rm -f "$_out"
         return 1

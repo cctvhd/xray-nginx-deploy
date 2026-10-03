@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 # ============================================================
 # modules/xray.sh
+# PROXY 头开关（state 持久化；见 generate_xray_config 内读取）：
+#   FALLBACK_PROXY_PROTOCOL    → 8350 回退链（xray xver ↔ nginx proxy_protocol）
+#   DECOY_SELF_PROXY_PROTOCOL  → 8321/8326 伪装站（xray xver ↔ nginx listen）
+
 # Xray 安装 + 三协议配置生成
 # warp 出站：内嵌 wireguard（由 warp.sh 提供凭证），不依赖本地 SOCKS5
 # ============================================================
@@ -1305,6 +1309,11 @@ WGJSON
 generate_xray_config() {
     log_step "生成 Xray 配置文件..."
 
+    # PROXY 头开关：每次生成从 state 读最新值（不覆盖用户 config.env 设置）
+    FALLBACK_PROXY_PROTOCOL=$(get_state "FALLBACK_PROXY_PROTOCOL" "0")
+    DECOY_SELF_PROXY_PROTOCOL=$(get_state "DECOY_SELF_PROXY_PROTOCOL" "0")
+    local _conf_path="${OUT_DIR:-/usr/local/etc/xray}/config.json"
+
     # 读取延迟档位参数（无 state 时使用中延迟默认值）
     if declare -F load_latency_params &>/dev/null; then
         load_latency_params
@@ -1341,11 +1350,15 @@ generate_xray_config() {
     # ── 防护：借公共 SNI 但公共参数为空 → 拒绝生成 ──────────────────
     # do_reconf_xray（菜单 x）清空参数但保留 mode=public 时，若 collect 阶段没兜住，
     # 这里也要在写 config.json 前报错中止，绝不落盘空 serverNames / 空 dest。
-    if _reality_slot_borrows_public xray-reality && [[ -z "${REALITY_SERVER_NAMES[0]:-}" ]]; then
+    # ⚠️ 两个 guard 都以「槽存在」为前提：无槽（XHTTP_REALITY_DOMAIN 空 = 组合 g）
+    # 时既无 xhttp fallback 也无 8325 入站，公共参数空是**预期**，不得拦。
+    if [[ -n "${REALITY_DOMAIN:-}" ]] && _reality_slot_borrows_public xray-reality \
+        && [[ -z "${REALITY_SERVER_NAMES[0]:-}" ]]; then
         log_error "vless-reality 借公共 SNI 但 REALITY_SERVER_NAMES 为空，拒绝生成 config.json"
         return 1
     fi
-    if _reality_slot_borrows_public xhttp-reality && [[ -z "${XHTTP_REALITY_SNI:-}" ]]; then
+    if [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]] && _reality_slot_borrows_public xhttp-reality \
+        && [[ -z "${XHTTP_REALITY_SNI:-}" ]]; then
         log_error "vless-xhttp-reality 借公共 SNI 但 XHTTP_REALITY_SNI 为空，拒绝生成 config.json"
         return 1
     fi
@@ -1359,9 +1372,11 @@ generate_xray_config() {
     # ⚠️ 判据是 **SNI 来源**，不是「域名是否非空」——分配了自有域也可以借公共 SNI，
     #    此时域名只当客户端连接地址用（见 _reality_slot_borrows_public 的长注释）。
     local _reality_direct_dest _reality_direct_sn
+    local _reality_direct_xver=0   # 默认 0，防生成 "xver": ,（修订5）
     local _dokodemo_reality_routing="" _dokodemo_reality_inbound=""
     if ! _reality_slot_borrows_public xray-reality; then
         _reality_direct_dest="127.0.0.1:8321"
+        _reality_direct_xver="${DECOY_SELF_PROXY_PROTOCOL}"   # 伪装站随 DECOY
         _reality_direct_sn="\"${REALITY_DOMAIN}\""
     else
         # dokodemo 的目标 = 借用的公共站。
@@ -1380,6 +1395,7 @@ generate_xray_config() {
             _rdest_port=443
         fi
         _reality_direct_dest="127.0.0.1:4431"
+        _reality_direct_xver="0"   # dokodemo 固定 0（不收 PROXY）
         # reality-direct 只接受真正路由到 8320 的 SNI：排除 XHTTP_REALITY_SNI/DOMAIN，
         # 它们由 nginx stream 分流到 8325（vless-xhttp-reality），与 generate_sni_map 对齐。
         # 否则 8320 会把本不该归它的 SNI（如 business.ca.gov）也当 Reality 客户端处理。
@@ -1427,11 +1443,14 @@ generate_xray_config() {
     # ⚠️ 同上，判据是 SNI 来源而非域名是否非空。
     local _dokodemo_xhttp_routing="" _dokodemo_xhttp_inbound=""
     local _xhttp_reality_dest="" _xhttp_reality_sn=""
+    local _xhttp_reality_xver=0   # 默认 0，防生成 "xver": ,（修订5）
     if ! _reality_slot_borrows_public xhttp-reality; then
         _xhttp_reality_dest="127.0.0.1:8326"
+        _xhttp_reality_xver="${DECOY_SELF_PROXY_PROTOCOL}"   # 伪装站随 DECOY
         _xhttp_reality_sn="\"${XHTTP_REALITY_DOMAIN}\""
     elif [[ -n "${XHTTP_REALITY_SNI:-}" ]]; then
         _xhttp_reality_dest="127.0.0.1:4432"
+        _xhttp_reality_xver="0"   # dokodemo 固定 0（不收 PROXY）
         _xhttp_reality_sn="\"${XHTTP_REALITY_SNI}\""
         _dokodemo_xhttp_routing='            {
                 "type":        "field",
@@ -1469,6 +1488,71 @@ generate_xray_config() {
     done
     sid_json="${sid_json%,}"
 
+    # ── 组合 g（无 xhttp-reality 槽）：跳过 fallbacks[0] 与 8325 入站 ──
+    # 判定条件：槽存在且 XHTTP_REALITY_DOMAIN 非空（不靠 SNI 模式）。
+    # 配置表空槽 → state 的 XHTTP_REALITY_DOMAIN 空 → load_domain_state 兜底后仍空。
+    # 两个函数用内层无引号 heredoc 展开变量（外层 heredoc 的 $( ) 结果不二次展开），
+    # 槽不存在时返回空 → JSON 数组相应少一个元素，全部合法（已实测）。
+    _xhttp_path_fallback_json() {
+        # fallbacks[0]：xhttp-path → 8325。xver 固定 1（8325 acceptProxyProtocol=true，必须收 PROXY）。
+        # 这是 fallbacks 数组的**首元素** → 输出含完整对象 + 尾逗号 + 换行（无前导逗号）。
+        [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]] || return 0
+        cat <<XHTTPFB
+                        {
+                            "path": "${XHTTP_PATH}",
+                            "dest": "127.0.0.1:8325",
+                            "xver": 1
+                        },
+XHTTPFB
+    }
+    _xhttp_inbound_json() {
+        # 8325 入站（vless-xhttp-reality）。8320 结束符已去尾逗号，此处带前导逗号补分隔。
+        [[ -n "${XHTTP_REALITY_DOMAIN:-}" ]] || return 0
+        cat <<XHTTPIN
+,
+        {
+            "tag":      "vless-xhttp-reality",
+            "listen":   "127.0.0.1",
+            "port":     8325,
+            "protocol": "vless",
+            "settings": {
+                "clients":    [{"id": "${XRAY_UUID}"}],
+                "decryption": "none"
+            },
+            "streamSettings": {
+                "network":  "xhttp",
+                "security": "reality",
+                "xhttpSettings": {
+                    "path": "${XHTTP_PATH}",
+                    "mode": "stream-one",
+                    "extra": {
+                        "xPaddingBytes":        "${x_padding}",
+                        "scStreamUpServerSecs": "20-80"
+                    }
+                },
+                "realitySettings": {
+                    "show":        false,
+                    "dest":        "${_xhttp_reality_dest}",
+                    "xver":        ${_xhttp_reality_xver},
+                    "serverNames": [${_xhttp_reality_sn}],
+                    "privateKey":  "${XHTTP_REALITY_PRIVATE_KEY}",
+                    "shortIds":    [${sid_json}]
+                },
+                "sockopt": {
+                    "acceptProxyProtocol": true,
+                    "tcpMptcp":            true,
+                    "tcpNoDelay":          true
+                }
+            },
+            "sniffing": {
+                "enabled":      true,
+                "destOverride": ["http", "tls", "quic"],
+                "metadataOnly": false
+            }
+        }
+XHTTPIN
+    }
+
     # CDN 入站 VLESS Encryption：TLS 在 nginx/CDN 终结，启用后 CDN 无法明文窥探；
     # reality-direct 保持 none（REALITY 已端到端加密，叠加属冗余）
     local vless_decryption="none"
@@ -1505,10 +1589,10 @@ generate_xray_config() {
                 "outboundTag": "block"
             },'
 
-    mkdir -p /usr/local/etc/xray
+    mkdir -p "$(dirname "${_conf_path}")"
 
     # Fix: grpc initial_windows_size 4194304 (4MB) prevents CDN GOAWAY on high-BDP paths; default 65536 too small
-    cat > /usr/local/etc/xray/config.json << CONF
+    cat > "${_conf_path}" << CONF
 {
     "log": {
         "loglevel": "warn",
@@ -1665,19 +1749,15 @@ ${_blocked_domains_routing}
                 ],
                 "decryption": "none",
                 "fallbacks":  [
-                    {
-                        "path": "${XHTTP_PATH}",
-                        "dest": "127.0.0.1:8325",
-                        "xver": 0
-                    },
+$(_xhttp_path_fallback_json)
                     {
                         "path": "/${GRPC_SERVICE_NAME}",
                         "dest": "127.0.0.1:8350",
-                        "xver": 0
+                        "xver": ${FALLBACK_PROXY_PROTOCOL}
                     },
                     {
                         "dest": "127.0.0.1:8350",
-                        "xver": 0
+                        "xver": ${FALLBACK_PROXY_PROTOCOL}
                     }
                 ]
             },
@@ -1687,7 +1767,7 @@ ${_blocked_domains_routing}
                 "realitySettings": {
                     "show":        false,
                     "dest":        "${_reality_direct_dest}",
-                    "xver":        0,
+                    "xver":        ${_reality_direct_xver},
                     "serverNames": [${_reality_direct_sn}],
                     "privateKey":  "${XRAY_PRIVATE_KEY}",
                     "shortIds":    [${sid_json}],
@@ -1707,48 +1787,7 @@ ${_blocked_domains_routing}
                 "destOverride": ["http", "tls", "quic"],
                 "metadataOnly": false
             }
-        },
-
-        {
-            "tag":      "vless-xhttp-reality",
-            "listen":   "127.0.0.1",
-            "port":     8325,
-            "protocol": "vless",
-            "settings": {
-                "clients":    [{"id": "${XRAY_UUID}"}],
-                "decryption": "none"
-            },
-            "streamSettings": {
-                "network":  "xhttp",
-                "security": "reality",
-                "xhttpSettings": {
-                    "path": "${XHTTP_PATH}",
-                    "mode": "stream-one",
-                    "extra": {
-                        "xPaddingBytes":        "${x_padding}",
-                        "scStreamUpServerSecs": "20-80"
-                    }
-                },
-                "realitySettings": {
-                    "show":        false,
-                    "dest":        "${_xhttp_reality_dest}",
-                    "xver":        0,
-                    "serverNames": [${_xhttp_reality_sn}],
-                    "privateKey":  "${XHTTP_REALITY_PRIVATE_KEY}",
-                    "shortIds":    [${sid_json}]
-                },
-                "sockopt": {
-                    "acceptProxyProtocol": true,
-                    "tcpMptcp":            true,
-                    "tcpNoDelay":          true
-                }
-            },
-            "sniffing": {
-                "enabled":      true,
-                "destOverride": ["http", "tls", "quic"],
-                "metadataOnly": false
-            }
-        }${_dokodemo_reality_inbound}${_dokodemo_xhttp_inbound}
+        }$(_xhttp_inbound_json)${_dokodemo_reality_inbound}${_dokodemo_xhttp_inbound}
     ],
 
     "outbounds": [
@@ -1787,7 +1826,7 @@ start_xray() {
     log_step "启动 Xray 服务..."
 
 mkdir -p /var/log/xray
-    if ! xray run -test -config /usr/local/etc/xray/config.json; then
+    if ! xray run -test -config "${_conf_path}"; then
         log_error "Xray 配置验证失败"
         exit 1
     fi
