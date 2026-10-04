@@ -1431,7 +1431,7 @@ generate_xray_config() {
             "sniffing": {
                 "enabled":      true,
                 "destOverride": ["tls"],
-                "routeOnly":    true
+                "routeOnly":    false
             }
         }'
     fi
@@ -1826,7 +1826,9 @@ start_xray() {
     log_step "启动 Xray 服务..."
 
 mkdir -p /var/log/xray
-    if ! xray run -test -config "${_conf_path}"; then
+    # ⚠️ 用真实路径，不用 generate_xray_config 的 local _conf_path：
+    # start_xray 启动活机服务，与测试用 OUT_DIR 隔离无关。
+    if ! xray run -test -config /usr/local/etc/xray/config.json; then
         log_error "Xray 配置验证失败"
         exit 1
     fi

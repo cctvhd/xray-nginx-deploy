@@ -164,6 +164,9 @@ generate_trap_cert() {
 generate_fake_site() {
     local dir="$1"
     local _slot="${2:-0}"
+    # ⚠️ 防 set -u unbound：本函数可能由 sync（菜单 x 后置）路径调用，
+    # 那时 HW_REGION 未必经 load_os_info 赋值；从 state 兜底，默认 eu。
+    local HW_REGION="${HW_REGION:-$(get_state HW_REGION eu)}"
 
     local _mod_dir
     _mod_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
