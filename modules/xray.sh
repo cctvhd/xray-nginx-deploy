@@ -1291,6 +1291,7 @@ _build_warp_outbound_json() {
             "settings": {
                 "secretKey": "${WGCF_PRIVATE_KEY}",
                 "address":   [${addr_json}],
+                "noKernelTun": true,
                 "peers": [
                     {
                         "publicKey":  "${WGCF_PEER_PUBKEY}",

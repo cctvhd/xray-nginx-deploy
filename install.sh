@@ -2774,6 +2774,14 @@ for inbound in config.get("inbounds", []):
             fb["path"] = new_xhttp_path
             changed += 1
 
+# wireguard 出站用 gVisor（noKernelTun=true），避免内核 TUN 占 IPv6 路由表 10230：
+# 否则带 IPv6 地址的 warp 出站在第二个实例（run -test）下报
+# "failed to find available ipv6 table index"。没有 wireguard 出站则跳过（不报错）。
+for outbound in config.get("outbounds", []):
+    if outbound.get("protocol") == "wireguard":
+        outbound.setdefault("settings", {})["noKernelTun"] = True
+        break
+
 if changed == 0:
     sys.exit("no Xray client or Reality credential fields matched")
 
