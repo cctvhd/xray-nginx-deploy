@@ -1842,6 +1842,53 @@ _resolve_cert_dir_checked() {
     return 1
 }
 
+# ── 生成 http_redirect.conf（HTTP→HTTPS 重定向，独立文件）──
+# 单一事实源：80 跳转收口到独立文件，servers.conf 只留 SSL vhost，
+# 与旧内嵌块行为一致（ALL_DOMAINS 为空保护 + 原子替换）。
+# 被 generate_servers_conf 调用 → 所有生成 servers.conf 的路径自动覆盖。
+generate_http_redirect_conf() {
+    log_step "生成 http_redirect.conf..."
+    local _out="${OUT_DIR:-/etc/nginx}/conf.d/http_redirect.conf.new"
+    local _all_domain_names="" _d
+    for _d in "${ALL_DOMAINS[@]:-}"; do
+        _all_domain_names+=" ${_d}"
+    done
+
+    # ALL_DOMAINS 为空保护：空列表写 `server_name ;` 会让 nginx -t 直接 emerg 失败。
+    # 空时**不写新文件**；旧 http_redirect.conf 若已存在则**保留**——它描述的仍是
+    # 上一轮生效的域名，删除它会让 80 端口退回 nginx 默认的 404，比留着旧跳转更糟。
+    # 何时清：等域名表重建后重跑本函数，会用新列表原子覆盖。
+    if [[ -z "$_all_domain_names" ]]; then
+        log_warn "ALL_DOMAINS 为空：本次不生成 http_redirect.conf（否则 server_name 为空会导致 nginx -t 失败）"
+        log_warn "  若本机确实配了域名，请到主菜单 5→1（或 5→3）重建派生；旧 http_redirect.conf 原样保留"
+        return 0
+    fi
+
+    cat > "$_out" << CONF
+
+# ===================================================================
+# HTTP → HTTPS 重定向（证书用 DNS-Cloudflare，无需 webroot 验证）
+# ===================================================================
+server {
+    listen 80;
+    listen [::]:80;
+    server_name ${_all_domain_names};
+
+    location / {
+        return 301 https://\$host\$request_uri;
+    }
+}
+CONF
+
+    # 同目录 rename，原子替换；失败则线上文件原样保留
+    if ! mv -f "$_out" "${OUT_DIR:-/etc/nginx}/conf.d/http_redirect.conf"; then
+        log_error "http_redirect.conf 原子替换失败，已保留原文件"
+        rm -f "$_out"
+        return 1
+    fi
+    log_info "http_redirect.conf 生成完成"
+}
+
 # ── 生成 servers.conf ────────────────────────────────────────
 generate_servers_conf() {
     log_step "生成 servers.conf..."
@@ -2433,36 +2480,8 @@ server {
 }
 CONF
 
-    # HTTP → HTTPS 重定向
-    # ⚠️ `local domain` 同上（动态作用域会污染调用方的同名局部变量）
-    local all_domain_names="" domain
-    for domain in "${ALL_DOMAINS[@]}"; do
-        all_domain_names+=" ${domain}"
-    done
-
-    # 规则 1：ALL_DOMAINS 是派生值，读路径不得当它是必然非空。
-    # 实测：`server_name ;` 会让 nginx -t 直接 emerg 失败（invalid number of arguments），
-    # 于是空列表会写出一份**起不来的** nginx.conf。空时干脆不生成这个块。
-    if [[ -z "$all_domain_names" ]]; then
-        log_warn "ALL_DOMAINS 为空：本次不生成 HTTP→HTTPS 重定向块（否则 server_name 为空会导致 nginx -t 失败）"
-        log_warn "  若本机确实配了域名，请到主菜单 5→1（或 5→3）重建派生；本次不写 state"
-    else
-    cat >> "$_out" << CONF
-
-# ===================================================================
-# HTTP → HTTPS 重定向（证书用 DNS-Cloudflare，无需 webroot 验证）
-# ===================================================================
-server {
-    listen 80;
-    listen [::]:80;
-    server_name ${all_domain_names};
-
-    location / {
-        return 301 https://\$host\$request_uri;
-    }
-}
-CONF
-    fi
+    # HTTP→HTTPS 重定向独立文件：与 servers.conf 同批生成（含 ALL_DOMAINS 空保护）
+    generate_http_redirect_conf
 
     # 伪装站目录收尾：servers.conf 已定稿，此刻的引用关系才是权威
     _purge_orphan_webroots
