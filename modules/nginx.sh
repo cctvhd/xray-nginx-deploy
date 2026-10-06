@@ -2120,6 +2120,25 @@ ${_doh_inc_xhttp}
         access_log off;
     }
 
+    # 订阅文件 no-cache：同 URL 重配后客户端/CDN 不得命中旧缓存
+    # 订阅文件落在 XHTTP_DOMAIN webroot（/var/www/${XHTTP_DOMAIN}/sub-cctv-*）
+    # ^~ 前缀匹配优先于正则，避免被下方扩展名正则 location 抢先
+    # location 内出现 add_header 后 server 级不再继承，安全头在此重写
+    location ^~ /sub- {
+        root  /var/www/${XHTTP_DOMAIN};
+        index index.html;
+        try_files \$uri =404;
+        add_header Strict-Transport-Security "max-age=63072000; includeSubDomains; preload" always;
+        add_header X-Content-Type-Options nosniff always;
+        add_header X-Frame-Options DENY always;
+        add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+        add_header Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=(), usb=()" always;
+        add_header Content-Security-Policy "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; font-src 'self'; connect-src 'self'; frame-ancestors 'none'; upgrade-insecure-requests;" always;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        add_header Pragma "no-cache" always;
+        expires -1;
+    }
+
     location / {
         root  /var/www/${XHTTP_DOMAIN};
         index index.html;
