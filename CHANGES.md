@@ -110,3 +110,19 @@
 - **文件**: `modules/nginx.sh` 行 827-843, 914-920, 946-951, 961-980, 1063-1106
 - **改动**: 各 location 内显式添加 `Strict-Transport-Security`、`X-Content-Type-Options`、`X-Frame-Options`、`Referrer-Policy`、`Permissions-Policy`；伪装页 location 添加 CSP；xhttp location 添加 CORS
 - **原因**: Nginx `add_header` 在 location 内会覆盖上层继承，全局设置后 location 级无法追加不同值。逐 location 显式设置确保每个响应头正确生效。
+
+## 第四批：订阅路径 no-cache 修复
+
+### S1 — 8380 xhttp vhost 新增订阅路径 location ^~ /sub-
+- **文件**: `modules/nginx.sh`（xhttp server 块，`location /` 之前）
+- **改动**: 新增 `location ^~ /sub- { root /var/www/${XHTTP_DOMAIN}; index index.html; try_files $uri =404; ... }`，内含 no-cache 头（`Cache-Control: no-cache, no-store, must-revalidate` + `Pragma: no-cache` + `expires -1`）与安全头重写（HSTS / X-Content-Type-Options / X-Frame-Options / Referrer-Policy / Permissions-Policy / CSP，均为 DENY/严格值）
+- **原因**:
+  - 订阅文件落在 xhttp 域 webroot 的 `sub-*` 路径，同 URL 重配后客户端/CDN 不得命中旧缓存 → 需 no-cache 响应头
+  - `try_files $uri =404`：订阅文件不存在时直接 404，不再回退伪装页 index.html
+  - `^~` 前缀匹配优先于扩展名正则 location，避免被 `location ~* \.(css|js|...)$` 抢先
+  - location 内出现 add_header 后 server 级不再继承安全头，需在此重写
+
+### S2 — 模块同步修复（防止被重置流程冲掉）
+- **文件**: `/etc/xray-deploy/modules/nginx.sh`（运行时模块缓存）
+- **改动**: 与仓库 `modules/nginx.sh` 对齐（本地优先复制），`grep -c "location ^~ /sub-"` = 1
+- **原因**: 此前缓存是旧副本（无 sub- 块），一次重置/重配流程走旧缓存重新生成 servers.conf，把修复冲掉（线上订阅响应无 no-cache、回退 index.html）。同步后重置流程会生成带 sub- 块的配置。
