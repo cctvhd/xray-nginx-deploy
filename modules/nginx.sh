@@ -2249,6 +2249,7 @@ CONF
 # ===================================================================
 server {
     listen 127.0.0.1:8322 ssl proxy_protocol;
+    http2  on;
     server_name ${_dom};
 
     ssl_certificate     ${_cert}/fullchain.pem;
@@ -2378,11 +2379,13 @@ CONF
 # ===================================================================
 server {
     listen 127.0.0.1:8380 ssl default_server proxy_protocol;
+    http2  on;
     ssl_reject_handshake on;
 }
 
 server {
     listen 127.0.0.1:8390 ssl default_server proxy_protocol;
+    http2  on;
     ssl_reject_handshake on;
 }
 CONF
@@ -2397,6 +2400,7 @@ CONF
 # ===================================================================
 server {
     listen 127.0.0.1:8400 ssl proxy_protocol;
+    http2  on;
     ssl_certificate     /etc/nginx/certs/trap.crt;
     ssl_certificate_key /etc/nginx/certs/trap.key;
     ssl_protocols       TLSv1.2 TLSv1.3;
