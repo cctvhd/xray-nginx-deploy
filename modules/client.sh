@@ -193,6 +193,9 @@ print(urllib.parse.quote('${XHTTP_PATH}'))
 
     local _hn
     _hn=$(hostname -s 2>/dev/null || echo "server")
+    # 客户端 xhttp 优化参数（仅客户端生效，服务端无需配置）：
+    #   mode=auto：跟随 CDN 回落方式自动切换 stream-up / stream-one / packet-up
+    #   extra={"xmux":{...}}：XHTTP 多路复用，高延迟线路按需调整并发/复用窗口
     XHTTP_URL="vless://${XRAY_UUID}@${XHTTP_DOMAIN}:443?\
 encryption=${VLESS_ENC_PARAM:-none}\
 &security=tls\
@@ -201,6 +204,8 @@ encryption=${VLESS_ENC_PARAM:-none}\
 &type=xhttp\
 &path=${path_encoded}\
 &host=${XHTTP_DOMAIN}\
+&mode=auto\
+&extra=%7B%22xmux%22%3A%20%7B%22maxConcurrency%22%3A%20%2216-32%22%2C%20%22cMaxReuseTimes%22%3A%200%2C%20%22hMaxRequestTimes%22%3A%20%22600-900%22%2C%20%22hMaxReusableSecs%22%3A%20%221800-3000%22%2C%20%22hKeepAlivePeriod%22%3A%2030%7D%7D\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-xhttp-${_hn}'))" 2>/dev/null)"
 }
 
