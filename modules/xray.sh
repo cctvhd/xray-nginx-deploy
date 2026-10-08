@@ -1456,7 +1456,7 @@ generate_xray_config() {
         _dokodemo_xhttp_routing='            {
                 "type":        "field",
                 "inboundTag":  ["dokodemo-xhttp-reality"],
-                "domain":      ["'"${XHTTP_REALITY_SNI}"'"],
+                "domain":      ["full:'"${XHTTP_REALITY_SNI}"'"],
                 "outboundTag": "direct"
             },
             {
@@ -1527,8 +1527,7 @@ XHTTPFB
                     "path": "${XHTTP_PATH}",
                     "mode": "stream-one",
                     "extra": {
-                        "xPaddingBytes":        "${x_padding}",
-                        "scStreamUpServerSecs": "20-80"
+                        "xPaddingBytes":        "${x_padding}"
                     }
                 },
                 "realitySettings": {
@@ -1540,9 +1539,7 @@ XHTTPFB
                     "shortIds":    [${sid_json}]
                 },
                 "sockopt": {
-                    "acceptProxyProtocol": true,
-                    "tcpMptcp":            true,
-                    "tcpNoDelay":          true
+                    "acceptProxyProtocol": true
                 }
             },
             "sniffing": {
@@ -1616,7 +1613,9 @@ XHTTPIN
                     "geosite:openai"
                 ],
                 "expectIPs":    ["geoip:!cn"],
-                "skipFallback": true
+                "skipFallback": true,
+                "serveStale":    true,
+                "serveExpiredTTL": 3600
             },
             {
                 "tag":      "warp-dns",
@@ -1626,7 +1625,9 @@ XHTTPIN
                     "geosite:tld-cn"
                 ],
                 "expectIPs": ["geoip:cn"],
-                "proxyTag":  "warp"
+                "proxyTag":  "warp",
+                "serveStale":    true,
+                "serveExpiredTTL": 3600
             }
         ],
         "disableCache":    false,
@@ -1683,16 +1684,7 @@ ${_blocked_domains_routing}
                     "mode": "auto",
                     "extra": {
                         "xPaddingBytes":          "${x_padding}",
-                        "scStreamUpServerSecs":   "20-80",
-                        "headers":                {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/149.0.0.0 Safari/537.36"},
-                        "xmux": {
-                            "maxConcurrency":   "${LATENCY_XMUX_CONCURRENCY}",
-                            "maxConnections":   0,
-                            "cMaxReuseTimes":   0,
-                            "hMaxRequestTimes": "${LATENCY_XMUX_REQUEST_TIMES}",
-                            "hMaxReusableSecs": "${LATENCY_XMUX_REUSABLE_SECS}",
-                            "hKeepAlivePeriod": 60
-                        }
+                        "scStreamUpServerSecs":   "20-80"
                     }
                 },
                 "sockopt": {
@@ -1722,8 +1714,7 @@ ${_blocked_domains_routing}
                     "serviceName":           "${GRPC_SERVICE_NAME}",
                     "multiMode":             false,
                     "idle_timeout":          60,
-                    "health_check_timeout":  20,
-                    "permit_without_stream": false
+                    "health_check_timeout":  20
                 },
                 "sockopt": {
                     "trustedXForwardedFor": ["127.0.0.1", "::1"]
@@ -1771,16 +1762,10 @@ $(_xhttp_path_fallback_json)
                     "xver":        ${_reality_direct_xver},
                     "serverNames": [${_reality_direct_sn}],
                     "privateKey":  "${XRAY_PRIVATE_KEY}",
-                    "shortIds":    [${sid_json}],
-                    "spiderX":     "${REALITY_SPIDER_X}"
+                    "shortIds":    [${sid_json}]
                 },
                 "sockopt": {
-                    "acceptProxyProtocol": true,
-                    "tcpUserTimeout":       ${user_timeout},
-                    "tcpKeepAliveIdle":     300,
-                    "tcpKeepAliveInterval": 30,
-                    "tcpMptcp":             true,
-                    "tcpNoDelay":           true
+                    "acceptProxyProtocol": true
                 }
             },
             "sniffing": {
@@ -1796,17 +1781,20 @@ $(_xhttp_path_fallback_json)
             "tag":      "direct",
             "protocol": "freedom",
             "settings": {
-                "domainStrategy": "UseIPv6v4"
             },
             "streamSettings": {
                 "sockopt": {
                     "tcpUserTimeout":       ${user_timeout},
                     "tcpKeepAliveIdle":     300,
                     "tcpKeepAliveInterval": 30,
-                    "tcpFastOpen":          true,
-                    "tcpcongestion":        "bbr",
-                    "tcpMptcp":             true,
-                    "tcpNoDelay":           true
+                    "tcpCongestion":        "bbr",
+                    "domainStrategy":       "UseIP",
+                    "happyEyeballs": {
+                        "prioritizeIPv6":   false,
+                        "interleave":       1,
+                        "tryDelayMs":       250,
+                        "maxConcurrentTry": 4
+                    }
                 }
             }
         },

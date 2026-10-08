@@ -54,6 +54,11 @@ load_existing_params() {
         [[ -n "${XHTTP_DOMAIN:-}" ]] || \
             XHTTP_DOMAIN=$(grep -oP '"host":\s*"\K[^"]+' "$xray_config" | head -1)
         XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1 || true)
+        # ── 可选：CDN 节点 xhttp 的 xmux（默认不启用，高延迟线路可按需手动填入客户端 XHTTP Extra）──
+        #    规则：五项必须写全；hKeepAlivePeriod 是整数，不能写范围；不能与 maxConnections 同用
+        #    A 组: {"xmux":{"maxConcurrency":"16-32","cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":30}}
+        #    B 组: {"xmux":{"maxConcurrency":"8-16","cMaxReuseTimes":0,"hMaxRequestTimes":"300-600","hMaxReusableSecs":"900-1800","hKeepAlivePeriod":30}}
+        #    vless-xhttp-reality 节点不需要填 Extra
         XHTTP_EXTRA_JSON=$(python3 -c "
 import json
 # 仅导出客户端有意义的字段：enc / xPaddingBytes / xmux

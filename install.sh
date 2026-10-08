@@ -1237,7 +1237,9 @@ load_latency_params() {
             # shellcheck disable=SC2034
             LATENCY_XMUX_REUSABLE_SECS="3000-5400"
             # shellcheck disable=SC2034
-            LATENCY_GRPC_TIMEOUT=300
+            # 该值只影响空闲或对端已死的连接占用时间，不影响速度；
+            # 高延迟档设为 3600 以避免 CDN 链路空闲时被 nginx 提前切断。
+            LATENCY_GRPC_TIMEOUT=3600
             # shellcheck disable=SC2034
             LATENCY_PROXY_TIMEOUT=7200
             ;;
