@@ -56,8 +56,26 @@ load_existing_params() {
         XHTTP_PADDING=$(grep -oP '"xPaddingBytes":\s*"\K[^"]+' "$xray_config" | head -1 || true)
         # ── 可选：CDN 节点 xhttp 的 xmux（默认不启用，高延迟线路可按需手动填入客户端 XHTTP Extra）──
         #    规则：五项必须写全；hKeepAlivePeriod 是整数，不能写范围；不能与 maxConnections 同用
-        #    A 组: {"xmux":{"maxConcurrency":"16-32","cMaxReuseTimes":0,"hMaxRequestTimes":"600-900","hMaxReusableSecs":"1800-3000","hKeepAlivePeriod":30}}
-        #    B 组: {"xmux":{"maxConcurrency":"8-16","cMaxReuseTimes":0,"hMaxRequestTimes":"300-600","hMaxReusableSecs":"900-1800","hKeepAlivePeriod":30}}
+        #    A 组:
+        #    {
+        #      "xmux": {
+        #        "maxConcurrency": "16-32",
+        #        "cMaxReuseTimes": 0,
+        #        "hMaxRequestTimes": "600-900",
+        #        "hMaxReusableSecs": "1800-3000",
+        #        "hKeepAlivePeriod": 30
+        #      }
+        #    }
+        #    B 组:
+        #    {
+        #      "xmux": {
+        #        "maxConcurrency": "8-16",
+        #        "cMaxReuseTimes": 0,
+        #        "hMaxRequestTimes": "300-600",
+        #        "hMaxReusableSecs": "900-1800",
+        #        "hKeepAlivePeriod": 30
+        #      }
+        #    }
         #    vless-xhttp-reality 节点不需要填 Extra
         XHTTP_EXTRA_JSON=$(python3 -c "
 import json
@@ -205,7 +223,7 @@ encryption=${VLESS_ENC_PARAM:-none}\
 &path=${path_encoded}\
 &host=${XHTTP_DOMAIN}\
 &mode=auto\
-&extra=%7B%22xmux%22%3A%20%7B%22maxConcurrency%22%3A%20%2216-32%22%2C%20%22cMaxReuseTimes%22%3A%200%2C%20%22hMaxRequestTimes%22%3A%20%22600-900%22%2C%20%22hMaxReusableSecs%22%3A%20%221800-3000%22%2C%20%22hKeepAlivePeriod%22%3A%2030%7D%7D\
+&extra=%7B%0A%20%20%22xmux%22%3A%20%7B%0A%20%20%20%20%22maxConcurrency%22%3A%20%2216-32%22%2C%0A%20%20%20%20%22cMaxReuseTimes%22%3A%200%2C%0A%20%20%20%20%22hMaxRequestTimes%22%3A%20%22600-900%22%2C%0A%20%20%20%20%22hMaxReusableSecs%22%3A%20%221800-3000%22%2C%0A%20%20%20%20%22hKeepAlivePeriod%22%3A%2030%0A%20%20%7D%0A%7D\
 #$(python3 -c "import urllib.parse; print(urllib.parse.quote('vless-xhttp-${_hn}'))" 2>/dev/null)"
 }
 
